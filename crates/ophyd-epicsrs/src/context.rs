@@ -9,7 +9,11 @@ use epics_base_rs::client::CaClient;
 use crate::pv::EpicsRsPV;
 
 /// Shared EPICS CA context — holds a tokio Runtime and CaClient.
-/// All PVs created from this context share the same runtime and client.
+///
+/// The runtime is kept alive for the lifetime of this context.
+/// CaClient's background tasks (coordinator, transport, search) run
+/// as spawned tasks on this runtime and must stay alive between
+/// Python calls.
 #[pyclass(name = "EpicsRsContext")]
 pub struct EpicsRsContext {
     pub(crate) runtime: Arc<Runtime>,
@@ -20,11 +24,30 @@ pub struct EpicsRsContext {
 impl EpicsRsContext {
     #[new]
     fn new() -> PyResult<Self> {
-        let runtime = Runtime::new()
-            .map_err(|e| PyRuntimeError::new_err(format!("failed to create tokio runtime: {e}")))?;
-        let client = runtime
-            .block_on(async { CaClient::new().await })
-            .map_err(|e| PyRuntimeError::new_err(format!("failed to create CA client: {e}")))?;
+        // Build a multi-threaded runtime that stays alive.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("failed to create tokio runtime: {e}"))
+            })?;
+
+        // Create CaClient inside a spawned task so background tasks
+        // are properly rooted in the runtime's thread pool,
+        // not in a block_on context that may interfere with IO polling.
+        let client = {
+            let (tx, rx) = std::sync::mpsc::channel();
+            runtime.spawn(async move {
+                let result = CaClient::new().await;
+                let _ = tx.send(result);
+            });
+            rx.recv()
+                .map_err(|_| PyRuntimeError::new_err("runtime channel closed"))?
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!("failed to create CA client: {e}"))
+                })?
+        };
+
         Ok(Self {
             runtime: Arc::new(runtime),
             client: Arc::new(client),

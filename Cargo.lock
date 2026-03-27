@@ -190,8 +190,6 @@ checksum = "c34f04666d835ff5d62e058c3995147c06f42fe86ff053337632bca83e42702d"
 [[package]]
 name = "epics-base-rs"
 version = "0.4.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e85273f112e9d91537fb849c3f11ed500fb014a80ce895ec812b9e03c913fa45"
 dependencies = [
  "bytes",
  "chrono",
@@ -207,8 +205,6 @@ dependencies = [
 [[package]]
 name = "epics-macros"
 version = "0.4.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85b14a375e03af9d744ae3fc278e5ec2d7aa54574f471679ca742344b8df54fb"
 dependencies = [
  "proc-macro2",
  "quote",

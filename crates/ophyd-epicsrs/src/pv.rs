@@ -16,16 +16,21 @@ use crate::convert::{epics_value_to_py, py_to_epics_value, snapshot_to_pydict};
 /// Rust-backed PV object for ophyd's control layer.
 ///
 /// Wraps an epics-rs CaChannel and provides sync methods that release the GIL.
+///
+/// All async operations are dispatched via `runtime.spawn()` instead of
+/// `runtime.block_on()` to avoid interfering with the runtime's IO driver.
+/// Results are collected via `std::sync::mpsc` channels.
 #[pyclass(name = "EpicsRsPV")]
 pub struct EpicsRsPV {
     runtime: Arc<Runtime>,
-    channel: CaChannel,
+    channel: Arc<CaChannel>,
     #[pyo3(get)]
     pvname: String,
     native_type: Mutex<Option<DbFieldType>>,
     monitor_task: Mutex<Option<JoinHandle<()>>>,
     py_monitor_callback: Arc<Mutex<Option<PyObject>>>,
     connection_callback: Arc<Mutex<Option<PyObject>>>,
+    access_callback: Arc<Mutex<Option<PyObject>>>,
     connection_task: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -33,14 +38,31 @@ impl EpicsRsPV {
     pub fn new(runtime: Arc<Runtime>, channel: CaChannel, pvname: String) -> Self {
         Self {
             runtime,
-            channel,
+            channel: Arc::new(channel),
             pvname,
             native_type: Mutex::new(None),
             monitor_task: Mutex::new(None),
             py_monitor_callback: Arc::new(Mutex::new(None)),
             connection_callback: Arc::new(Mutex::new(None)),
+            access_callback: Arc::new(Mutex::new(None)),
             connection_task: Mutex::new(None),
         }
+    }
+
+    /// Spawn an async task on the runtime and block the current thread
+    /// waiting for its result. This avoids `block_on` which can interfere
+    /// with the runtime's IO driver.
+    fn spawn_wait<F, T>(&self, fut: F) -> T
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.runtime.spawn(async move {
+            let result = fut.await;
+            let _ = tx.send(result);
+        });
+        rx.recv().expect("runtime task panicked")
     }
 }
 
@@ -52,15 +74,13 @@ impl EpicsRsPV {
         let channel = self.channel.clone();
         let dur = Duration::from_secs_f64(timeout);
         py.allow_threads(|| {
-            self.runtime.block_on(async {
+            self.spawn_wait(async move {
                 channel.wait_connected(dur).await.is_ok()
             })
         })
     }
 
     /// Get PV value with full metadata (timestamp, alarm, units, limits).
-    /// Uses DBR_CTRL to get all metadata. Releases GIL during CA read.
-    /// Returns a dict with ophyd-compatible keys, or None on timeout.
     #[pyo3(signature = (timeout=2.0, form="time"))]
     fn get_with_metadata(
         &self,
@@ -76,18 +96,24 @@ impl EpicsRsPV {
         };
 
         let result = py.allow_threads(|| {
-            self.runtime.block_on(async {
+            self.spawn_wait(async move {
                 tokio::time::timeout(dur, channel.get_with_metadata(class)).await
             })
         });
 
         match result {
             Ok(Ok(snapshot)) => {
-                // Cache the native type for put operations
                 *self.native_type.lock() = Some(snapshot.value.dbr_type());
                 Ok(Some(snapshot_to_pydict(py, &snapshot)))
             }
-            Ok(Err(_)) | Err(_) => Ok(None),
+            Ok(Err(e)) => {
+                eprintln!("get_with_metadata({}) failed: {e}", self.pvname);
+                Ok(None)
+            }
+            Err(_) => {
+                eprintln!("get_with_metadata({}) timed out", self.pvname);
+                Ok(None)
+            }
         }
     }
 
@@ -113,18 +139,16 @@ impl EpicsRsPV {
         timeout: f64,
         callback: Option<PyObject>,
     ) -> PyResult<()> {
-        // Determine the native type (cached from previous get, or query now)
         let native = {
             let cached = self.native_type.lock();
             match *cached {
                 Some(t) => t,
                 None => {
-                    // Need to discover the type first
                     drop(cached);
                     let channel = self.channel.clone();
                     let dur = Duration::from_secs_f64(timeout.min(5.0));
                     let snap = py.allow_threads(|| {
-                        self.runtime.block_on(async {
+                        self.spawn_wait(async move {
                             tokio::time::timeout(dur, channel.get_with_metadata(DbrClass::Plain))
                                 .await
                         })
@@ -150,13 +174,8 @@ impl EpicsRsPV {
         let dur = Duration::from_secs_f64(timeout);
 
         let result = py.allow_threads(|| {
-            self.runtime.block_on(async {
-                if wait {
-                    tokio::time::timeout(dur, channel.put(&epics_val)).await
-                } else {
-                    // Fire and forget — still send, just don't wait for completion
-                    tokio::time::timeout(dur, channel.put(&epics_val)).await
-                }
+            self.spawn_wait(async move {
+                tokio::time::timeout(dur, channel.put(&epics_val)).await
             })
         });
 
@@ -174,13 +193,10 @@ impl EpicsRsPV {
         Ok(())
     }
 
-    /// Register a monitor callback. The callback is called from a background
-    /// tokio task whenever the PV value changes.
+    /// Register a monitor callback.
     fn add_monitor_callback(&self, py: Python<'_>, callback: PyObject) {
-        // Store the callback
         *self.py_monitor_callback.lock() = Some(callback.clone_ref(py));
 
-        // If already monitoring, don't start another task
         if self.monitor_task.lock().is_some() {
             return;
         }
@@ -233,34 +249,64 @@ impl EpicsRsPV {
         *self.monitor_task.lock() = Some(handle);
     }
 
-    /// Set a connection callback. Called when connection state changes.
+    /// Set a connection callback. Called with (connected: bool).
     fn set_connection_callback(&self, py: Python<'_>, callback: PyObject) {
         *self.connection_callback.lock() = Some(callback.clone_ref(py));
+        self._start_event_task();
+    }
 
-        // If already watching, don't start another task
+    /// Set an access rights callback. Called with (read_access: bool, write_access: bool).
+    fn set_access_callback(&self, py: Python<'_>, callback: PyObject) {
+        *self.access_callback.lock() = Some(callback.clone_ref(py));
+        self._start_event_task();
+    }
+
+    /// Start the background task that dispatches connection and access events.
+    fn _start_event_task(&self) {
         if self.connection_task.lock().is_some() {
             return;
         }
 
         let mut rx = self.channel.connection_events();
-        let cb_ref = self.connection_callback.clone();
+        let conn_cb_ref = self.connection_callback.clone();
+        let access_cb_ref = self.access_callback.clone();
         let pvname = self.pvname.clone();
 
         let handle = self.runtime.spawn(async move {
             while let Ok(event) = rx.recv().await {
-                let connected = matches!(
-                    event,
-                    epics_base_rs::client::ConnectionEvent::Connected
-                );
-                Python::with_gil(|py| {
-                    let guard = cb_ref.lock();
-                    if let Some(cb) = &*guard {
-                        let callback = cb.clone_ref(py);
-                        drop(guard);
-                        let _ = callback.call1(py, (connected,));
+                use epics_base_rs::client::ConnectionEvent;
+                match event {
+                    ConnectionEvent::Connected => {
+                        Python::with_gil(|py| {
+                            let guard = conn_cb_ref.lock();
+                            if let Some(cb) = &*guard {
+                                let callback = cb.clone_ref(py);
+                                drop(guard);
+                                let _ = callback.call1(py, (true,));
+                            }
+                        });
                     }
-                });
-                // Log for debugging
+                    ConnectionEvent::Disconnected => {
+                        Python::with_gil(|py| {
+                            let guard = conn_cb_ref.lock();
+                            if let Some(cb) = &*guard {
+                                let callback = cb.clone_ref(py);
+                                drop(guard);
+                                let _ = callback.call1(py, (false,));
+                            }
+                        });
+                    }
+                    ConnectionEvent::AccessRightsChanged { read, write } => {
+                        Python::with_gil(|py| {
+                            let guard = access_cb_ref.lock();
+                            if let Some(cb) = &*guard {
+                                let callback = cb.clone_ref(py);
+                                drop(guard);
+                                let _ = callback.call1(py, (read, write));
+                            }
+                        });
+                    }
+                }
                 tracing::debug!("{pvname}: connection event: {event:?}");
             }
         });
@@ -268,7 +314,6 @@ impl EpicsRsPV {
         *self.connection_task.lock() = Some(handle);
     }
 
-    /// Remove all monitor callbacks and stop the monitor task.
     fn clear_monitors(&self) {
         *self.py_monitor_callback.lock() = None;
         if let Some(handle) = self.monitor_task.lock().take() {
@@ -276,7 +321,6 @@ impl EpicsRsPV {
         }
     }
 
-    /// Disconnect the PV (stop monitoring and clear state).
     fn disconnect(&self) {
         self.clear_monitors();
         *self.connection_callback.lock() = None;

@@ -1,0 +1,17 @@
+[package]
+name = "ophyd-epicsrs"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "ophyd_epicsrs"
+crate-type = ["cdylib"]
+
+[dependencies]
+epics-base-rs = { path = "/Users/stevek/codes/epics-rs/crates/epics-base" }
+pyo3 = { version = "0.24", features = ["extension-module", "abi3-py310"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
+parking_lot = "0.12"
+tracing = "0.1"

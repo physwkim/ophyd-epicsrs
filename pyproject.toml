@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "ophyd-epicsrs"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["ophyd>=1.7"]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "ophyd_epicsrs._native"
+manifest-path = "crates/ophyd-epicsrs/Cargo.toml"
+python-source = "python"

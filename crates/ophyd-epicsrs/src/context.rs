@@ -1,11 +1,15 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use tokio::runtime::Runtime;
 
 use epics_base_rs::client::CaClient;
 
+use crate::convert::epics_value_to_py;
 use crate::pv::EpicsRsPV;
 
 /// Shared EPICS CA context — holds a tokio Runtime and CaClient.
@@ -58,6 +62,83 @@ impl EpicsRsContext {
     fn create_pv(&self, pvname: &str) -> EpicsRsPV {
         let channel = self.client.create_channel(pvname);
         EpicsRsPV::new(self.runtime.clone(), channel, pvname.to_string())
+    }
+
+    /// Read multiple PVs in parallel. Returns a dict of {pvname: value}.
+    ///
+    /// All PVs are connected and read concurrently using tokio::join_all.
+    /// This is much faster than reading PVs one by one.
+    ///
+    /// Parameters
+    /// ----------
+    /// pvnames : list[str]
+    ///     List of PV names to read.
+    /// timeout : float, optional
+    ///     Timeout in seconds (default: 5.0).
+    ///
+    /// Returns
+    /// -------
+    /// dict
+    ///     {pvname: value} for all successfully read PVs.
+    ///
+    /// Example
+    /// -------
+    ///     ctx = EpicsRsContext()
+    ///     data = ctx.bulk_caget(["PV:enc_wf", "PV:I0_wf", "PV:ROI1", ...])
+    ///     # All PVs read in parallel — ~1 round-trip time instead of N
+    #[pyo3(signature = (pvnames, timeout=5.0))]
+    fn bulk_caget(
+        &self,
+        py: Python<'_>,
+        pvnames: Vec<String>,
+        timeout: f64,
+    ) -> PyResult<PyObject> {
+        let client = self.client.clone();
+        let dur = Duration::from_secs_f64(timeout);
+
+        // Spawn all reads in parallel, collect results
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.runtime.spawn(async move {
+            let mut handles = Vec::with_capacity(pvnames.len());
+            for name in &pvnames {
+                let ch = client.create_channel(name);
+                let pvname = name.clone();
+                handles.push(tokio::spawn(async move {
+                    if ch.wait_connected(dur).await.is_err() {
+                        return (pvname, None);
+                    }
+                    match ch.get().await {
+                        Ok((_dbr, val)) => (pvname, Some(val)),
+                        Err(_) => (pvname, None),
+                    }
+                }));
+            }
+
+            let mut results = Vec::with_capacity(handles.len());
+            for handle in handles {
+                if let Ok(result) = handle.await {
+                    results.push(result);
+                }
+            }
+            let _ = tx.send(results);
+        });
+
+        // Wait for all results (GIL released)
+        let rx = parking_lot::Mutex::new(rx);
+        let results = py.allow_threads(|| {
+            rx.lock()
+                .recv()
+                .map_err(|_| PyRuntimeError::new_err("bulk_caget failed"))
+        })?;
+
+        // Convert to Python dict
+        let dict = PyDict::new(py);
+        for (pvname, maybe_val) in results {
+            if let Some(val) = maybe_val {
+                dict.set_item(&pvname, epics_value_to_py(py, &val))?;
+            }
+        }
+        Ok(dict.into_any().unbind())
     }
 
     fn __repr__(&self) -> String {

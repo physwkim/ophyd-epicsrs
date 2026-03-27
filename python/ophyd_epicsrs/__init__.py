@@ -8,4 +8,5 @@ __all__ = ["EpicsRsContext", "EpicsRsPV", "use_epicsrs_backend"]
 def use_epicsrs_backend():
     """Switch ophyd's control layer to use the epics-rs Rust backend."""
     import ophyd
+
     ophyd.set_cl("epicsrs")

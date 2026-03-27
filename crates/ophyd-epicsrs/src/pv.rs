@@ -204,8 +204,7 @@ impl EpicsRsPV {
         }
 
         if let Some(cb) = callback {
-            let pvname = self.pvname.clone();
-            cb.call1(py, (pvname,))?;
+            cb.call0(py)?;
         }
 
         Ok(())

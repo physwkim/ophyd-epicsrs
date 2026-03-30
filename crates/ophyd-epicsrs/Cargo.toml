@@ -10,7 +10,8 @@ name = "ophyd_epicsrs"
 crate-type = ["cdylib"]
 
 [dependencies]
-epics-base-rs = { git = "https://github.com/epics-rs/epics-rs", package = "epics-base-rs" }
+epics-base-rs = { git = "https://github.com/epics-rs/epics-rs", tag = "v0.7.2", package = "epics-base-rs" }
+epics-ca-rs = { git = "https://github.com/epics-rs/epics-rs", tag = "v0.7.2", package = "epics-ca-rs" }
 pyo3 = { version = "0.24", features = ["extension-module", "abi3-py38"] }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
 parking_lot = "0.12"

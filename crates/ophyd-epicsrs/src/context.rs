@@ -7,7 +7,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use tokio::runtime::Runtime;
 
-use epics_base_rs::client::CaClient;
+use epics_ca_rs::client::CaClient;
 
 use crate::convert::epics_value_to_py;
 use crate::pv::EpicsRsPV;

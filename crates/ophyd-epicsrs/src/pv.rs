@@ -7,7 +7,7 @@ use pyo3::prelude::*;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
-use epics_base_rs::client::CaChannel;
+use epics_ca_rs::client::CaChannel;
 use epics_base_rs::server::snapshot::DbrClass;
 use epics_base_rs::types::EpicsValue;
 use epics_base_rs::types::DbFieldType;
@@ -311,7 +311,7 @@ impl EpicsRsPV {
 
         let handle = self.runtime.spawn(async move {
             while let Ok(event) = rx.recv().await {
-                use epics_base_rs::client::ConnectionEvent;
+                use epics_ca_rs::client::ConnectionEvent;
                 match event {
                     ConnectionEvent::Connected => {
                         Python::with_gil(|py| {

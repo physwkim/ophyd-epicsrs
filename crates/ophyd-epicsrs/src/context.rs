@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -131,11 +130,13 @@ impl EpicsRsContext {
                 .map_err(|_| PyRuntimeError::new_err("bulk_caget failed"))
         })?;
 
-        // Convert to Python dict
+        // Convert to Python dict — failed PVs are included as None
+        // so callers can distinguish "missing key" from "read failed".
         let dict = PyDict::new(py);
         for (pvname, maybe_val) in results {
-            if let Some(val) = maybe_val {
-                dict.set_item(&pvname, epics_value_to_py(py, &val))?;
+            match maybe_val {
+                Some(val) => dict.set_item(&pvname, epics_value_to_py(py, &val))?,
+                None => dict.set_item(&pvname, py.None())?,
             }
         }
         Ok(dict.into_any().unbind())

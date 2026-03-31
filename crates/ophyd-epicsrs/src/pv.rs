@@ -61,7 +61,7 @@ impl EpicsRsPV {
     }
 
     /// Spawn an async task and block the current OS thread waiting for result.
-    fn spawn_wait<F, T>(&self, fut: F) -> T
+    fn spawn_wait<F, T>(&self, fut: F) -> PyResult<T>
     where
         F: std::future::Future<Output = T> + Send + 'static,
         T: Send + 'static,
@@ -71,14 +71,14 @@ impl EpicsRsPV {
             let result = fut.await;
             let _ = tx.send(result);
         });
-        rx.recv().expect("runtime task panicked")
+        rx.recv().map_err(|_| PyRuntimeError::new_err("runtime task failed"))
     }
 }
 
 #[pymethods]
 impl EpicsRsPV {
     /// Block until the PV is connected, releasing the GIL while waiting.
-    fn wait_for_connection(&self, py: Python<'_>, timeout: f64) -> bool {
+    fn wait_for_connection(&self, py: Python<'_>, timeout: f64) -> PyResult<bool> {
         let channel = self.channel.clone();
         let dur = Duration::from_secs_f64(timeout);
         py.allow_threads(|| {
@@ -107,7 +107,7 @@ impl EpicsRsPV {
             self.spawn_wait(async move {
                 tokio::time::timeout(dur, channel.get_with_metadata(class)).await
             })
-        });
+        })?;
 
         match result {
             Ok(Ok(snapshot)) => {
@@ -158,7 +158,7 @@ impl EpicsRsPV {
                             tokio::time::timeout(dur, channel.get_with_metadata(DbrClass::Plain))
                                 .await
                         })
-                    });
+                    })?;
                     match snap {
                         Ok(Ok(s)) => {
                             let t = s.value.dbr_type();
@@ -185,26 +185,34 @@ impl EpicsRsPV {
                 self.spawn_wait(async move {
                     tokio::time::timeout(dur, channel.put(&epics_val)).await
                 })
-            });
+            })?;
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => return Err(PyRuntimeError::new_err(format!("put failed: {e}"))),
                 Err(_) => return Err(PyRuntimeError::new_err("put timed out")),
             }
+            // Completion callback after write confirmed
+            if let Some(cb) = callback {
+                cb.call0(py)?;
+            }
         } else {
-            // Non-blocking put — fire and forget, don't block the runtime
+            // Non-blocking put — callback fires after write completes, not immediately
             let pvname = self.pvname.clone();
+            let cb_opt = callback;
             self.runtime.spawn(async move {
                 match tokio::time::timeout(dur, channel.put(&epics_val)).await {
+                    Ok(Ok(())) => {
+                        // Write succeeded — fire completion callback
+                        if let Some(cb) = cb_opt {
+                            Python::with_gil(|py| {
+                                let _ = cb.call0(py);
+                            });
+                        }
+                    }
                     Ok(Err(e)) => eprintln!("[put] {pvname} error: {e}"),
                     Err(_) => eprintln!("[put] {pvname} timed out"),
-                    _ => {}
                 }
             });
-        }
-
-        if let Some(cb) = callback {
-            cb.call0(py)?;
         }
 
         Ok(())
@@ -240,11 +248,13 @@ impl EpicsRsPV {
                     drop(guard);
 
                     let kwargs = pyo3::types::PyDict::new(py);
-                    kwargs.set_item("pvname", &event.pvname).unwrap();
-                    kwargs
-                        .set_item("value", epics_value_to_py(py, &event.value))
-                        .unwrap();
-                    kwargs.set_item("timestamp", event.timestamp).unwrap();
+                    if kwargs.set_item("pvname", &event.pvname).is_err()
+                        || kwargs.set_item("value", epics_value_to_py(py, &event.value)).is_err()
+                        || kwargs.set_item("timestamp", event.timestamp).is_err()
+                    {
+                        eprintln!("[dispatch] {} failed to build callback kwargs", event.pvname);
+                        return;
+                    }
                     let _ = callback.call(py, (), Some(&kwargs));
                 });
             }

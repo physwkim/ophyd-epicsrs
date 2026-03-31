@@ -118,6 +118,36 @@ yield 1 EventPage → AsyncMongoWriter.enqueue → 0.1ms
 Total: ~2ms (Python free), MongoDB insert continues in background
 ```
 
+## Advantages over pyepics backend
+
+### Zero-latency monitor callbacks
+
+In the pyepics backend, all monitor callbacks are queued through ophyd's dispatcher thread:
+
+```
+EPICS event → C libca → pyepics callback → dispatcher queue → ophyd callback
+```
+
+This queuing introduces latency. When a motor moves fast, the DMOV (done-moving) signal transitions 0→1 quickly, but the callback is stuck behind hundreds of RBV position updates in the queue. This causes `EpicsMotor.move(wait=True)` to return before the motor actually stops — the well-known **"another set call is still running"** problem.
+
+The epicsrs backend eliminates this by firing monitor callbacks **directly from the Rust thread**, bypassing the dispatcher queue entirely:
+
+```
+EPICS event → Rust tokio → ophyd callback (direct)
+```
+
+Rust's thread safety guarantees (Send/Sync traits, GIL-aware PyO3) make this safe without additional locking. The result: DMOV transitions are never missed, regardless of motor speed.
+
+### No PV cache — safe Device re-creation
+
+The pyepics backend caches PV objects by name. Creating a second ophyd Device with the same PV prefix (e.g. switching xspress3 detector channels) causes subscription conflicts because two Devices share one PV object.
+
+The epicsrs backend creates a fresh PV object per `get_pv()` call. The Rust runtime handles TCP connection sharing (virtual circuits) at the transport layer, so there is no performance penalty. Multiple Devices with the same PV prefix work independently.
+
+### GIL-released bulk operations
+
+`bulk_caget` reads multiple PVs concurrently using tokio `join_all`, completing in a single network round-trip with the GIL released. See the [Parallel PV Read](#parallel-pv-read-bulk_caget) section above.
+
 ## Architecture
 
 ```

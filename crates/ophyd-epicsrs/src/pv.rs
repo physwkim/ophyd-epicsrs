@@ -236,9 +236,7 @@ impl EpicsRsPV {
         // Start Python dispatch thread — reads from queue, calls Python callback
         let cb_ref = self.py_monitor_callback.clone();
         let dispatch = std::thread::spawn(move || {
-            eprintln!("[dispatch] thread started");
             while let Ok(event) = rx.recv() {
-                eprintln!("[dispatch] {} value={:?}", event.pvname, event.value);
                 Python::with_gil(|py| {
                     let guard = cb_ref.lock();
                     let callback = match &*guard {
@@ -269,7 +267,7 @@ impl EpicsRsPV {
             let monitor = match channel.subscribe().await {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!("[monitor] {pvname}: subscribe FAILED: {e}");
+                    // silently ignore subscribe failures for missing PVs
                     return;
                 }
             };

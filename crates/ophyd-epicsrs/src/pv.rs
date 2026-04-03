@@ -7,18 +7,17 @@ use pyo3::prelude::*;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
-use epics_ca_rs::client::CaChannel;
-use epics_base_rs::server::snapshot::DbrClass;
-use epics_base_rs::types::EpicsValue;
-use epics_base_rs::types::DbFieldType;
+use epics_rs::ca::client::CaChannel;
+use epics_rs::base::server::snapshot::{DbrClass, Snapshot};
+use epics_rs::base::types::EpicsValue;
+use epics_rs::base::types::DbFieldType;
 
 use crate::convert::{epics_value_to_py, py_to_epics_value, snapshot_to_pydict};
 
 /// Monitor event queued from tokio task → Python thread.
 struct MonitorEvent {
     pvname: String,
-    value: EpicsValue,
-    timestamp: f64,
+    snapshot: Snapshot,
 }
 
 /// Rust-backed PV object for ophyd's control layer.
@@ -88,13 +87,36 @@ impl EpicsRsPV {
         })
     }
 
+    /// Get channel-level metadata without performing a CA read.
+    fn get_channel_info(&self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        let channel = self.channel.clone();
+        let result = py.allow_threads(|| {
+            self.spawn_wait(async move { channel.info().await })
+        })?;
+        match result {
+            Ok(info) => {
+                *self.native_type.lock() = Some(info.native_type);
+                let dict = pyo3::types::PyDict::new(py);
+                let _ = dict.set_item("ftype", info.native_type as u16);
+                let _ = dict.set_item("type", format!("{:?}", info.native_type).to_lowercase());
+                let _ = dict.set_item("count", info.element_count);
+                let _ = dict.set_item("host", info.server_addr.to_string());
+                let _ = dict.set_item("read_access", info.access_rights.read);
+                let _ = dict.set_item("write_access", info.access_rights.write);
+                Ok(Some(dict.into_any().unbind()))
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
     /// Get PV value with full metadata.
-    #[pyo3(signature = (timeout=2.0, form="time"))]
+    #[pyo3(signature = (timeout=2.0, form="time", count=0))]
     fn get_with_metadata(
         &self,
         py: Python<'_>,
         timeout: f64,
         form: &str,
+        count: u32,
     ) -> PyResult<Option<PyObject>> {
         let channel = self.channel.clone();
         let dur = Duration::from_secs_f64(timeout);
@@ -105,7 +127,7 @@ impl EpicsRsPV {
 
         let result = py.allow_threads(|| {
             self.spawn_wait(async move {
-                tokio::time::timeout(dur, channel.get_with_metadata(class)).await
+                tokio::time::timeout(dur, channel.get_with_metadata_count(class, count)).await
             })
         })?;
 
@@ -127,12 +149,12 @@ impl EpicsRsPV {
 
     #[pyo3(signature = (timeout=1.0))]
     fn get_timevars(&self, py: Python<'_>, timeout: f64) -> PyResult<Option<PyObject>> {
-        self.get_with_metadata(py, timeout, "time")
+        self.get_with_metadata(py, timeout, "time", 0)
     }
 
     #[pyo3(signature = (timeout=1.0))]
     fn get_ctrlvars(&self, py: Python<'_>, timeout: f64) -> PyResult<Option<PyObject>> {
-        self.get_with_metadata(py, timeout, "ctrl")
+        self.get_with_metadata(py, timeout, "ctrl", 0)
     }
 
     /// Write a value to the PV.
@@ -245,14 +267,42 @@ impl EpicsRsPV {
                     };
                     drop(guard);
 
+                    let snap = &event.snapshot;
                     let kwargs = pyo3::types::PyDict::new(py);
-                    if kwargs.set_item("pvname", &event.pvname).is_err()
-                        || kwargs.set_item("value", epics_value_to_py(py, &event.value)).is_err()
-                        || kwargs.set_item("timestamp", event.timestamp).is_err()
-                    {
-                        eprintln!("[dispatch] {} failed to build callback kwargs", event.pvname);
-                        return;
+
+                    // Core fields
+                    let _ = kwargs.set_item("pvname", &event.pvname);
+                    let _ = kwargs.set_item("value", epics_value_to_py(py, &snap.value));
+
+                    // EPICS timestamp
+                    let ts = snap.timestamp
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs_f64();
+                    let _ = kwargs.set_item("timestamp", ts);
+
+                    // Alarm status/severity
+                    let _ = kwargs.set_item("status", snap.alarm.status);
+                    let _ = kwargs.set_item("severity", snap.alarm.severity);
+
+                    // char_value: string representation.
+                    // For enum PVs, resolve via snapshot enum_strs if present.
+                    // DBR_TIME_ENUM lacks enum_strs, so enum values are sent
+                    // without char_value — the Python shim resolves from cache.
+                    match &snap.value {
+                        EpicsValue::Enum(idx) => {
+                            if let Some(ref ei) = snap.enums {
+                                if let Some(label) = ei.strings.get(*idx as usize) {
+                                    let _ = kwargs.set_item("char_value", label.as_str());
+                                }
+                            }
+                            // else: omit char_value, Python shim uses cached enum_strs
+                        }
+                        other => {
+                            let _ = kwargs.set_item("char_value", format!("{other}"));
+                        }
                     }
+
                     let _ = callback.call(py, (), Some(&kwargs));
                 });
             }
@@ -266,7 +316,7 @@ impl EpicsRsPV {
         let handle = self.runtime.spawn(async move {
             let monitor = match channel.subscribe().await {
                 Ok(m) => m,
-                Err(e) => {
+                Err(_) => {
                     // silently ignore subscribe failures for missing PVs
                     return;
                 }
@@ -274,14 +324,10 @@ impl EpicsRsPV {
 
             let mut monitor = monitor;
             while let Some(result) = monitor.recv().await {
-                if let Ok(value) = result {
+                if let Ok(snapshot) = result {
                     let event = MonitorEvent {
                         pvname: pvname.clone(),
-                        value,
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs_f64(),
+                        snapshot,
                     };
                     if tx.send(event).is_err() {
                         break; // dispatch thread gone
@@ -319,7 +365,7 @@ impl EpicsRsPV {
 
         let handle = self.runtime.spawn(async move {
             while let Ok(event) = rx.recv().await {
-                use epics_ca_rs::client::ConnectionEvent;
+                use epics_rs::ca::client::ConnectionEvent;
                 match event {
                     ConnectionEvent::Connected => {
                         Python::with_gil(|py| {

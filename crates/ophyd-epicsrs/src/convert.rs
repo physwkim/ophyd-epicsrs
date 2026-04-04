@@ -37,11 +37,26 @@ pub fn epics_value_to_py(py: Python<'_>, val: &EpicsValue) -> PyObject {
 }
 
 /// Convert a Python value to an EpicsValue, given the native DbFieldType.
+/// Handles both scalar and array (list/numpy) inputs.
 pub fn py_to_epics_value(
     obj: &Bound<'_, pyo3::PyAny>,
     native_type: epics_rs::base::types::DbFieldType,
 ) -> PyResult<EpicsValue> {
     use epics_rs::base::types::DbFieldType;
+
+    // Try array extraction first: list, tuple, or numpy array
+    if let Ok(seq) = obj.downcast::<pyo3::types::PyList>() {
+        return py_sequence_to_epics_array(seq.as_any(), native_type);
+    }
+    if let Ok(seq) = obj.downcast::<pyo3::types::PyTuple>() {
+        return py_sequence_to_epics_array(seq.as_any(), native_type);
+    }
+    // numpy arrays have __len__ and are iterable but aren't PyList/PyTuple
+    if obj.hasattr("__array__").unwrap_or(false) || obj.hasattr("dtype").unwrap_or(false) {
+        return py_sequence_to_epics_array(obj, native_type);
+    }
+
+    // Scalar path
     match native_type {
         DbFieldType::Double => {
             let v: f64 = obj.extract()?;
@@ -60,6 +75,10 @@ pub fn py_to_epics_value(
             Ok(EpicsValue::Short(v))
         }
         DbFieldType::Char => {
+            // String → CharArray (for waveform FTVL=CHAR path PVs)
+            if let Ok(s) = obj.extract::<String>() {
+                return Ok(EpicsValue::CharArray(s.into_bytes()));
+            }
             let v: u8 = obj.extract()?;
             Ok(EpicsValue::Char(v))
         }
@@ -88,6 +107,49 @@ pub fn py_to_epics_value(
     }
 }
 
+/// Convert a Python sequence (list/tuple/ndarray) to an EpicsValue array.
+fn py_sequence_to_epics_array(
+    obj: &Bound<'_, pyo3::PyAny>,
+    native_type: epics_rs::base::types::DbFieldType,
+) -> PyResult<EpicsValue> {
+    use epics_rs::base::types::DbFieldType;
+    match native_type {
+        DbFieldType::Double => {
+            let v: Vec<f64> = obj.extract()?;
+            Ok(EpicsValue::DoubleArray(v))
+        }
+        DbFieldType::Float => {
+            let v: Vec<f32> = obj.extract()?;
+            Ok(EpicsValue::FloatArray(v))
+        }
+        DbFieldType::Long => {
+            let v: Vec<i32> = obj.extract()?;
+            Ok(EpicsValue::LongArray(v))
+        }
+        DbFieldType::Short => {
+            let v: Vec<i16> = obj.extract()?;
+            Ok(EpicsValue::ShortArray(v))
+        }
+        DbFieldType::Char => {
+            // Accept string → bytes for char waveforms
+            if let Ok(s) = obj.extract::<String>() {
+                return Ok(EpicsValue::CharArray(s.into_bytes()));
+            }
+            let v: Vec<u8> = obj.extract()?;
+            Ok(EpicsValue::CharArray(v))
+        }
+        DbFieldType::Enum => {
+            let v: Vec<u16> = obj.extract()?;
+            Ok(EpicsValue::EnumArray(v))
+        }
+        DbFieldType::String => {
+            // Single string from sequence — shouldn't happen, but handle gracefully
+            let v: String = obj.extract()?;
+            Ok(EpicsValue::String(v))
+        }
+    }
+}
+
 fn system_time_to_epoch(t: SystemTime) -> f64 {
     t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64()
 }
@@ -101,7 +163,14 @@ pub fn snapshot_to_pydict(py: Python<'_>, snapshot: &Snapshot) -> PyObject {
     dict.set_item("value", epics_value_to_py(py, &snapshot.value)).unwrap();
     dict.set_item("status", snapshot.alarm.status).unwrap();
     dict.set_item("severity", snapshot.alarm.severity).unwrap();
-    dict.set_item("timestamp", system_time_to_epoch(snapshot.timestamp)).unwrap();
+    let ts = system_time_to_epoch(snapshot.timestamp);
+    dict.set_item("timestamp", ts).unwrap();
+    dict.set_item("posixseconds", ts as u64).unwrap();
+    let nanos = snapshot.timestamp
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    dict.set_item("nanoseconds", nanos).unwrap();
 
     // char_value: string representation matching pyepics behavior.
     // For enums, resolve to label via enum_strs; for others, format the value.

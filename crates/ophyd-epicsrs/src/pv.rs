@@ -217,22 +217,26 @@ impl EpicsRsPV {
             if let Some(cb) = callback {
                 cb.call0(py)?;
             }
-        } else {
-            // Non-blocking put — callback fires after write completes, not immediately
+        } else if let Some(cb) = callback {
+            // Non-blocking put with callback — use write_notify, fire callback on ack
             let pvname = self.pvname.clone();
-            let cb_opt = callback;
             self.runtime.spawn(async move {
                 match tokio::time::timeout(dur, channel.put(&epics_val)).await {
                     Ok(Ok(())) => {
-                        // Write succeeded — fire completion callback
-                        if let Some(cb) = cb_opt {
-                            Python::with_gil(|py| {
-                                let _ = cb.call0(py);
-                            });
-                        }
+                        Python::with_gil(|py| {
+                            let _ = cb.call0(py);
+                        });
                     }
                     Ok(Err(e)) => eprintln!("[put] {pvname} error: {e}"),
                     Err(_) => eprintln!("[put] {pvname} timed out"),
+                }
+            });
+        } else {
+            // Fire-and-forget put (CA_PROTO_WRITE) — matches pyepics non-blocking put
+            let pvname = self.pvname.clone();
+            self.runtime.spawn(async move {
+                if let Err(e) = channel.put_nowait(&epics_val).await {
+                    eprintln!("[put] {pvname} error: {e}");
                 }
             });
         }

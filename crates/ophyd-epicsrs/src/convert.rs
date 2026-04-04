@@ -51,9 +51,17 @@ pub fn py_to_epics_value(
     if let Ok(seq) = obj.downcast::<pyo3::types::PyTuple>() {
         return py_sequence_to_epics_array(seq.as_any(), native_type);
     }
-    // numpy arrays have __len__ and are iterable but aren't PyList/PyTuple
-    if obj.hasattr("__array__").unwrap_or(false) || obj.hasattr("dtype").unwrap_or(false) {
-        return py_sequence_to_epics_array(obj, native_type);
+    // numpy arrays (not scalars): have dtype AND ndim > 0
+    if obj.hasattr("dtype").unwrap_or(false) && obj.hasattr("ndim").unwrap_or(false) {
+        let ndim: i32 = obj.getattr("ndim").and_then(|v| v.extract()).unwrap_or(0);
+        if ndim > 0 {
+            return py_sequence_to_epics_array(obj, native_type);
+        }
+        // ndim == 0: numpy scalar — fall through to scalar path
+        // .item() converts np.float64(6.5) → Python float 6.5
+        if let Ok(native) = obj.call_method0("item") {
+            return py_to_epics_value(&native, native_type);
+        }
     }
 
     // Scalar path

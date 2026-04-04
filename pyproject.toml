@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "ophyd-epicsrs"
 version = "0.3.0"
 requires-python = ">=3.8"
-dependencies = ["ophyd>=1.7"]
+dependencies = ["ophyd @ git+https://github.com/physwkim/ophyd.git@feature/epicsrs-backend"]
 
 [tool.maturin]
 features = ["pyo3/extension-module"]

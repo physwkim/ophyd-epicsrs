@@ -72,8 +72,10 @@ impl EpicsRsPV {
                 Ok(i) => i,
                 Err(_) => return None,
             };
-            // DBR_CTRL read: value + alarm + timestamp + all metadata
-            let snapshot = match prefetch_ch.get_with_metadata(DbrClass::Ctrl).await {
+            // DBR_TIME read: value + alarm + timestamp (lightweight).
+            // CTRL metadata (enum_strs, limits, units) is fetched lazily
+            // by ophyd's get_ctrlvars() only when needed.
+            let snapshot = match prefetch_ch.get_with_metadata(DbrClass::Time).await {
                 Ok(s) => s,
                 Err(_) => return None,
             };
@@ -214,7 +216,7 @@ impl EpicsRsPV {
             self.spawn_wait(async move {
                 channel.wait_connected(dur).await?;
                 let info = channel.info().await?;
-                let snapshot = tokio::time::timeout(dur, channel.get_with_metadata(DbrClass::Ctrl))
+                let snapshot = tokio::time::timeout(dur, channel.get_with_metadata(DbrClass::Time))
                     .await
                     .map_err(|_| epics_rs::base::error::CaError::Timeout)??;
                 Ok::<_, epics_rs::base::error::CaError>((info, snapshot))

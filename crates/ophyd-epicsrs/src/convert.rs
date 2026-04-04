@@ -76,8 +76,11 @@ pub fn py_to_epics_value(
         }
         DbFieldType::Char => {
             // String → CharArray (for waveform FTVL=CHAR path PVs)
+            // Must include null terminator so IOC doesn't read stale bytes.
             if let Ok(s) = obj.extract::<String>() {
-                return Ok(EpicsValue::CharArray(s.into_bytes()));
+                let mut bytes = s.into_bytes();
+                bytes.push(0);
+                return Ok(EpicsValue::CharArray(bytes));
             }
             let v: u8 = obj.extract()?;
             Ok(EpicsValue::Char(v))
@@ -131,9 +134,11 @@ fn py_sequence_to_epics_array(
             Ok(EpicsValue::ShortArray(v))
         }
         DbFieldType::Char => {
-            // Accept string → bytes for char waveforms
+            // Accept string → bytes for char waveforms (null terminated)
             if let Ok(s) = obj.extract::<String>() {
-                return Ok(EpicsValue::CharArray(s.into_bytes()));
+                let mut bytes = s.into_bytes();
+                bytes.push(0);
+                return Ok(EpicsValue::CharArray(bytes));
             }
             let v: Vec<u8> = obj.extract()?;
             Ok(EpicsValue::CharArray(v))

@@ -20,6 +20,17 @@ struct MonitorEvent {
     snapshot: Snapshot,
 }
 
+/// Background prefetch result: channel info + full CTRL metadata.
+struct PrefetchResult {
+    native_type: DbFieldType,
+    type_name: String,
+    element_count: u32,
+    host: String,
+    read_access: bool,
+    write_access: bool,
+    snapshot: Snapshot,
+}
+
 /// Rust-backed PV object for ophyd's control layer.
 ///
 /// Monitor events are queued via std::sync::mpsc (no GIL needed in tokio)
@@ -40,13 +51,46 @@ pub struct EpicsRsPV {
     monitor_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<MonitorEvent>>>>,
     /// Python dispatch thread handle
     dispatch_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Background prefetch: starts on PV creation, completes before Python asks
+    prefetch_handle: Mutex<Option<JoinHandle<Option<PrefetchResult>>>>,
 }
 
 impl EpicsRsPV {
     pub fn new(runtime: Arc<Runtime>, channel: CaChannel, pvname: String) -> Self {
+        let ch = Arc::new(channel);
+
+        // Start background prefetch immediately — runs concurrently with
+        // all other PVs' prefetches in the tokio runtime (no GIL needed).
+        let prefetch_ch = ch.clone();
+        let prefetch_handle = runtime.spawn(async move {
+            // Wait for connection (up to 30s)
+            if prefetch_ch.wait_connected(Duration::from_secs(30)).await.is_err() {
+                return None;
+            }
+            // Channel info (coordinator, no CA read)
+            let info = match prefetch_ch.info().await {
+                Ok(i) => i,
+                Err(_) => return None,
+            };
+            // DBR_CTRL read: value + alarm + timestamp + all metadata
+            let snapshot = match prefetch_ch.get_with_metadata(DbrClass::Ctrl).await {
+                Ok(s) => s,
+                Err(_) => return None,
+            };
+            Some(PrefetchResult {
+                native_type: info.native_type,
+                type_name: format!("{:?}", info.native_type).to_lowercase(),
+                element_count: info.element_count,
+                host: info.server_addr.to_string(),
+                read_access: info.access_rights.read,
+                write_access: info.access_rights.write,
+                snapshot,
+            })
+        });
+
         Self {
             runtime,
-            channel: Arc::new(channel),
+            channel: ch,
             pvname,
             native_type: Mutex::new(None),
             monitor_task: Mutex::new(None),
@@ -56,6 +100,7 @@ impl EpicsRsPV {
             connection_task: Mutex::new(None),
             monitor_tx: Arc::new(Mutex::new(None)),
             dispatch_thread: Mutex::new(None),
+            prefetch_handle: Mutex::new(Some(prefetch_handle)),
         }
     }
 
@@ -72,6 +117,49 @@ impl EpicsRsPV {
         });
         rx.recv().map_err(|_| PyRuntimeError::new_err("runtime task failed"))
     }
+
+    /// Best-effort injection of the current connection state for a newly
+    /// registered callback. This avoids blocking Python startup while still
+    /// covering the race where prefetch connected the channel before callback
+    /// registration completed.
+    fn emit_current_connection_state(&self) {
+        let channel = self.channel.clone();
+        let conn_cb_ref = self.connection_callback.clone();
+
+        self.runtime.spawn(async move {
+            if channel.info().await.is_ok() {
+                Python::with_gil(|py| {
+                    let guard = conn_cb_ref.lock();
+                    if let Some(cb) = &*guard {
+                        let callback = cb.clone_ref(py);
+                        drop(guard);
+                        let _ = callback.call1(py, (true,));
+                    }
+                });
+            }
+        });
+    }
+
+    /// Best-effort injection of the current access-rights state for a newly
+    /// registered callback. This is separate from connection injection because
+    /// ophyd registers the two callbacks sequentially.
+    fn emit_current_access_state(&self) {
+        let channel = self.channel.clone();
+        let access_cb_ref = self.access_callback.clone();
+
+        self.runtime.spawn(async move {
+            if let Ok(info) = channel.info().await {
+                Python::with_gil(|py| {
+                    let guard = access_cb_ref.lock();
+                    if let Some(cb) = &*guard {
+                        let callback = cb.clone_ref(py);
+                        drop(guard);
+                        let _ = callback.call1(py, (info.access_rights.read, info.access_rights.write));
+                    }
+                });
+            }
+        });
+    }
 }
 
 #[pymethods]
@@ -85,6 +173,69 @@ impl EpicsRsPV {
                 channel.wait_connected(dur).await.is_ok()
             })
         })
+    }
+
+    /// Wait for the background prefetch (started at PV creation) to complete.
+    /// Returns all metadata in a single dict, or falls back to synchronous fetch.
+    #[pyo3(signature = (timeout=5.0))]
+    fn connect_and_prefetch(
+        &self,
+        py: Python<'_>,
+        timeout: f64,
+    ) -> PyResult<Option<PyObject>> {
+        let dur = Duration::from_secs_f64(timeout);
+
+        // Take the background prefetch handle (if still pending)
+        let handle = self.prefetch_handle.lock().take();
+        if let Some(handle) = handle {
+            // Await the background task — just waiting, no new CA reads
+            let result = py.allow_threads(|| {
+                self.spawn_wait(async move {
+                    tokio::time::timeout(dur, handle).await
+                })
+            })?;
+            if let Ok(Ok(Some(prefetch))) = result {
+                *self.native_type.lock() = Some(prefetch.native_type);
+                let dict = snapshot_to_pydict(py, &prefetch.snapshot);
+                let dict_ref = dict.downcast_bound::<pyo3::types::PyDict>(py).unwrap();
+                let _ = dict_ref.set_item("ftype", prefetch.native_type as u16);
+                let _ = dict_ref.set_item("type", &prefetch.type_name);
+                let _ = dict_ref.set_item("count", prefetch.element_count);
+                let _ = dict_ref.set_item("host", &prefetch.host);
+                let _ = dict_ref.set_item("read_access", prefetch.read_access);
+                let _ = dict_ref.set_item("write_access", prefetch.write_access);
+                return Ok(Some(dict));
+            }
+        }
+
+        // Fallback: synchronous fetch (prefetch failed or already consumed)
+        let channel = self.channel.clone();
+        let result = py.allow_threads(|| {
+            self.spawn_wait(async move {
+                channel.wait_connected(dur).await?;
+                let info = channel.info().await?;
+                let snapshot = tokio::time::timeout(dur, channel.get_with_metadata(DbrClass::Ctrl))
+                    .await
+                    .map_err(|_| epics_rs::base::error::CaError::Timeout)??;
+                Ok::<_, epics_rs::base::error::CaError>((info, snapshot))
+            })
+        })?;
+
+        match result {
+            Ok((info, snapshot)) => {
+                *self.native_type.lock() = Some(info.native_type);
+                let dict = snapshot_to_pydict(py, &snapshot);
+                let dict_ref = dict.downcast_bound::<pyo3::types::PyDict>(py).unwrap();
+                let _ = dict_ref.set_item("ftype", info.native_type as u16);
+                let _ = dict_ref.set_item("type", format!("{:?}", info.native_type).to_lowercase());
+                let _ = dict_ref.set_item("count", info.element_count);
+                let _ = dict_ref.set_item("host", info.server_addr.to_string());
+                let _ = dict_ref.set_item("read_access", info.access_rights.read);
+                let _ = dict_ref.set_item("write_access", info.access_rights.write);
+                Ok(Some(dict))
+            }
+            Err(_) => Ok(None),
+        }
     }
 
     /// Get channel-level metadata without performing a CA read.
@@ -232,7 +383,11 @@ impl EpicsRsPV {
                 }
             });
         } else {
-            // Fire-and-forget put (CA_PROTO_WRITE) — matches pyepics non-blocking put
+            // Fire-and-forget put (CA_PROTO_WRITE) — spawn and return immediately.
+            // Must NOT release the GIL here: areaDetector trigger() does
+            // _status = Status(); put(1, wait=False); return _status
+            // If we release the GIL, monitor thread can fire _acquire_changed
+            // and set _status=None before put returns → trigger() returns None.
             let pvname = self.pvname.clone();
             self.runtime.spawn(async move {
                 if let Err(e) = channel.put_nowait(&epics_val).await {
@@ -347,12 +502,14 @@ impl EpicsRsPV {
     fn set_connection_callback(&self, py: Python<'_>, callback: PyObject) {
         *self.connection_callback.lock() = Some(callback.clone_ref(py));
         self._start_event_task();
+        self.emit_current_connection_state();
     }
 
     /// Set an access rights callback.
     fn set_access_callback(&self, py: Python<'_>, callback: PyObject) {
         *self.access_callback.lock() = Some(callback.clone_ref(py));
         self._start_event_task();
+        self.emit_current_access_state();
     }
 
     /// Start the background task for connection/access events.
@@ -366,7 +523,6 @@ impl EpicsRsPV {
         let conn_cb_ref = self.connection_callback.clone();
         let access_cb_ref = self.access_callback.clone();
         let pvname = self.pvname.clone();
-
         let handle = self.runtime.spawn(async move {
             while let Ok(event) = rx.recv().await {
                 use epics_rs::ca::client::ConnectionEvent;

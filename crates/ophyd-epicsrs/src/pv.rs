@@ -371,18 +371,27 @@ impl EpicsRsPV {
                 cb.call0(py)?;
             }
         } else if let Some(cb) = callback {
-            // Non-blocking put with callback — use write_notify, fire callback on ack
+            // Non-blocking put with callback — use write_notify, fire callback on ack.
+            // Always fire the callback to unblock ophyd's set() state machine,
+            // even on failure/timeout — otherwise ophyd thinks set() is still
+            // in progress and the next set() raises RuntimeError.
+            // Pass success=True/False so the shim can propagate failure.
             let pvname = self.pvname.clone();
             self.runtime.spawn(async move {
-                match tokio::time::timeout(dur, channel.put(&epics_val)).await {
-                    Ok(Ok(())) => {
-                        Python::with_gil(|py| {
-                            let _ = cb.call0(py);
-                        });
+                let success = match tokio::time::timeout(dur, channel.put(&epics_val)).await {
+                    Ok(Ok(())) => true,
+                    Ok(Err(e)) => {
+                        eprintln!("[put] {pvname} error: {e}");
+                        false
                     }
-                    Ok(Err(e)) => eprintln!("[put] {pvname} error: {e}"),
-                    Err(_) => eprintln!("[put] {pvname} timed out"),
-                }
+                    Err(_) => {
+                        eprintln!("[put] {pvname} timed out");
+                        false
+                    }
+                };
+                Python::with_gil(|py| {
+                    let _ = cb.call1(py, (success,));
+                });
             });
         } else {
             // Fire-and-forget put (CA_PROTO_WRITE) — spawn and return immediately.
@@ -408,8 +417,14 @@ impl EpicsRsPV {
     fn add_monitor_callback(&self, py: Python<'_>, callback: PyObject) {
         *self.py_monitor_callback.lock() = Some(callback.clone_ref(py));
 
-        if self.monitor_task.lock().is_some() {
-            return;
+        {
+            let guard = self.monitor_task.lock();
+            if let Some(ref handle) = *guard {
+                if !handle.is_finished() {
+                    return; // still running
+                }
+                // task died — will restart below
+            }
         }
 
         // Create the event queue
@@ -470,30 +485,38 @@ impl EpicsRsPV {
         });
         *self.dispatch_thread.lock() = Some(dispatch);
 
-        // Start tokio monitor task — reads from CA, sends to queue (no GIL)
+        // Start tokio monitor task with auto-resubscribe.
+        // If the subscription ends (IOC restart, network blip), the task
+        // resubscribes instead of dying permanently.
         let channel = self.channel.clone();
         let pvname = self.pvname.clone();
 
         let handle = self.runtime.spawn(async move {
-            let monitor = match channel.subscribe().await {
-                Ok(m) => m,
-                Err(_) => {
-                    // silently ignore subscribe failures for missing PVs
-                    return;
-                }
-            };
+            loop {
+                let monitor = match channel.subscribe().await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::debug!("{pvname}: subscribe failed ({e}), retrying...");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
 
-            let mut monitor = monitor;
-            while let Some(result) = monitor.recv().await {
-                if let Ok(snapshot) = result {
-                    let event = MonitorEvent {
-                        pvname: pvname.clone(),
-                        snapshot,
-                    };
-                    if tx.send(event).is_err() {
-                        break; // dispatch thread gone
+                let mut monitor = monitor;
+                while let Some(result) = monitor.recv().await {
+                    if let Ok(snapshot) = result {
+                        let event = MonitorEvent {
+                            pvname: pvname.clone(),
+                            snapshot,
+                        };
+                        if tx.send(event).is_err() {
+                            return; // dispatch thread gone — exit permanently
+                        }
                     }
                 }
+                // Subscription ended (IOC restart, network blip) — resubscribe
+                tracing::debug!("{pvname}: monitor stream ended, resubscribing");
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         });
 
@@ -515,56 +538,67 @@ impl EpicsRsPV {
     }
 
     /// Start the background task for connection/access events.
-    /// These are infrequent, so Python::with_gil is acceptable here.
+    /// Self-healing: if the broadcast channel closes (e.g. epics-rs
+    /// reconnection cycle), the task resubscribes automatically.
     fn _start_event_task(&self) {
-        if self.connection_task.lock().is_some() {
-            return;
+        let mut guard = self.connection_task.lock();
+        if let Some(ref handle) = *guard {
+            if !handle.is_finished() {
+                return; // still running
+            }
+            // task died — will restart below
         }
 
-        let mut rx = self.channel.connection_events();
+        let channel = self.channel.clone();
         let conn_cb_ref = self.connection_callback.clone();
         let access_cb_ref = self.access_callback.clone();
         let pvname = self.pvname.clone();
         let handle = self.runtime.spawn(async move {
-            while let Ok(event) = rx.recv().await {
-                use epics_rs::ca::client::ConnectionEvent;
-                match event {
-                    ConnectionEvent::Connected => {
-                        Python::with_gil(|py| {
-                            let guard = conn_cb_ref.lock();
-                            if let Some(cb) = &*guard {
-                                let callback = cb.clone_ref(py);
-                                drop(guard);
-                                let _ = callback.call1(py, (true,));
-                            }
-                        });
+            loop {
+                let mut rx = channel.connection_events();
+                while let Ok(event) = rx.recv().await {
+                    use epics_rs::ca::client::ConnectionEvent;
+                    match event {
+                        ConnectionEvent::Connected => {
+                            Python::with_gil(|py| {
+                                let guard = conn_cb_ref.lock();
+                                if let Some(cb) = &*guard {
+                                    let callback = cb.clone_ref(py);
+                                    drop(guard);
+                                    let _ = callback.call1(py, (true,));
+                                }
+                            });
+                        }
+                        ConnectionEvent::Disconnected => {
+                            Python::with_gil(|py| {
+                                let guard = conn_cb_ref.lock();
+                                if let Some(cb) = &*guard {
+                                    let callback = cb.clone_ref(py);
+                                    drop(guard);
+                                    let _ = callback.call1(py, (false,));
+                                }
+                            });
+                        }
+                        ConnectionEvent::AccessRightsChanged { read, write } => {
+                            Python::with_gil(|py| {
+                                let guard = access_cb_ref.lock();
+                                if let Some(cb) = &*guard {
+                                    let callback = cb.clone_ref(py);
+                                    drop(guard);
+                                    let _ = callback.call1(py, (read, write));
+                                }
+                            });
+                        }
                     }
-                    ConnectionEvent::Disconnected => {
-                        Python::with_gil(|py| {
-                            let guard = conn_cb_ref.lock();
-                            if let Some(cb) = &*guard {
-                                let callback = cb.clone_ref(py);
-                                drop(guard);
-                                let _ = callback.call1(py, (false,));
-                            }
-                        });
-                    }
-                    ConnectionEvent::AccessRightsChanged { read, write } => {
-                        Python::with_gil(|py| {
-                            let guard = access_cb_ref.lock();
-                            if let Some(cb) = &*guard {
-                                let callback = cb.clone_ref(py);
-                                drop(guard);
-                                let _ = callback.call1(py, (read, write));
-                            }
-                        });
-                    }
+                    tracing::debug!("{pvname}: connection event: {event:?}");
                 }
-                tracing::debug!("{pvname}: connection event: {event:?}");
+                // Broadcast channel closed — resubscribe after brief pause
+                tracing::debug!("{pvname}: connection event stream ended, resubscribing");
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         });
 
-        *self.connection_task.lock() = Some(handle);
+        *guard = Some(handle);
     }
 
     fn clear_monitors(&self) {

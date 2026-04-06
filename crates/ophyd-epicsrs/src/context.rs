@@ -144,12 +144,10 @@ impl EpicsRsContext {
 
     /// Connect and fetch initial metadata for multiple PVs in parallel.
     ///
-    /// Operates on the actual PV channels (not temporary ones) so that
-    /// connection state, monitors, and subscriptions all use the same
-    /// underlying CA channel.
-    ///
-    /// Phase 1: all PVs wait_connected concurrently.
-    /// Phase 2: connected PVs fetch channel_info + DBR_TIME concurrently.
+    /// Awaits each PV's already-running background prefetch task instead of
+    /// starting new CA searches, avoiding UDP search congestion.
+    /// Falls back to manual connect+fetch for PVs whose prefetch was
+    /// already consumed.
     ///
     /// Returns a dict: {pvname: {metadata...} or None for failed PVs}.
     /// One GIL release for ALL PVs instead of one per PV.
@@ -160,13 +158,22 @@ impl EpicsRsContext {
         pvs: Vec<Py<EpicsRsPV>>,
         timeout: f64,
     ) -> PyResult<PyObject> {
+        use crate::pv::PrefetchResult;
         use epics_rs::ca::client::CaChannel;
 
-        // Extract (pvname, channel) from actual PV objects while holding GIL
-        let pv_channels: Vec<(String, Arc<CaChannel>)> = pvs.iter()
+        // Extract prefetch handles + fallback channels while holding GIL
+        type PvTask = (
+            String,
+            Option<tokio::task::JoinHandle<Option<PrefetchResult>>>,
+            Arc<CaChannel>,
+        );
+        let tasks: Vec<PvTask> = pvs.iter()
             .map(|pv| {
                 let pv_ref = pv.borrow(py);
-                (pv_ref.pvname.clone(), pv_ref.channel.clone())
+                let pvname = pv_ref.pvname.clone();
+                let channel = pv_ref.channel.clone();
+                let handle = pv_ref.prefetch_handle.lock().take();
+                (pvname, handle, channel)
             })
             .collect();
         drop(pvs);
@@ -175,43 +182,43 @@ impl EpicsRsContext {
 
         let (tx, rx) = std::sync::mpsc::channel();
         self.runtime.spawn(async move {
-            // Phase 1: connect all PVs in parallel (using their actual channels)
-            let mut connect_handles: Vec<(String, Arc<CaChannel>, tokio::task::JoinHandle<bool>)> =
-                Vec::with_capacity(pv_channels.len());
-            for (pvname, ch) in pv_channels {
-                let ch_clone = ch.clone();
-                connect_handles.push((pvname, ch, tokio::spawn(async move {
-                    ch_clone.wait_connected(dur).await.is_ok()
-                })));
-            }
-
-            let mut connected: Vec<(String, Arc<CaChannel>)> = Vec::new();
-            for (pvname, ch, handle) in connect_handles {
-                if handle.await.unwrap_or(false) {
-                    connected.push((pvname, ch));
-                }
-            }
-
-            // Phase 2: fetch info + DBR_TIME for connected PVs in parallel
-            let mut fetch_handles = Vec::with_capacity(connected.len());
-            for (pvname, ch) in connected {
-                fetch_handles.push(tokio::spawn(async move {
-                    let info = match ch.info().await {
+            let mut handles = Vec::with_capacity(tasks.len());
+            for (pvname, prefetch, channel) in tasks {
+                handles.push(tokio::spawn(async move {
+                    // Fast path: await the already-running prefetch (no new CA traffic)
+                    if let Some(handle) = prefetch {
+                        if let Ok(Ok(Some(result))) = tokio::time::timeout(dur, handle).await {
+                            return (pvname, Some(result));
+                        }
+                    }
+                    // Fallback: prefetch already consumed or failed — connect manually
+                    if channel.wait_connected(dur).await.is_err() {
+                        return (pvname, None);
+                    }
+                    let info = match channel.info().await {
                         Ok(i) => i,
                         Err(_) => return (pvname, None),
                     };
                     let snapshot = match tokio::time::timeout(
-                        dur, ch.get_with_metadata(epics_rs::base::server::snapshot::DbrClass::Time)
+                        dur, channel.get_with_metadata(epics_rs::base::server::snapshot::DbrClass::Time)
                     ).await {
                         Ok(Ok(s)) => s,
                         _ => return (pvname, None),
                     };
-                    (pvname, Some((info, snapshot)))
+                    (pvname, Some(PrefetchResult {
+                        native_type: info.native_type,
+                        type_name: format!("{:?}", info.native_type).to_lowercase(),
+                        element_count: info.element_count,
+                        host: info.server_addr.to_string(),
+                        read_access: info.access_rights.read,
+                        write_access: info.access_rights.write,
+                        snapshot,
+                    }))
                 }));
             }
 
             let mut results = Vec::new();
-            for handle in fetch_handles {
+            for handle in handles {
                 if let Ok(result) = handle.await {
                     results.push(result);
                 }
@@ -230,15 +237,15 @@ impl EpicsRsContext {
         let dict = PyDict::new(py);
         for (pvname, maybe_result) in results {
             match maybe_result {
-                Some((info, snapshot)) => {
-                    let md = crate::convert::snapshot_to_pydict(py, &snapshot);
+                Some(result) => {
+                    let md = crate::convert::snapshot_to_pydict(py, &result.snapshot);
                     let md_ref = md.downcast_bound::<PyDict>(py).unwrap();
-                    let _ = md_ref.set_item("ftype", info.native_type as u16);
-                    let _ = md_ref.set_item("type", format!("{:?}", info.native_type).to_lowercase());
-                    let _ = md_ref.set_item("count", info.element_count);
-                    let _ = md_ref.set_item("host", info.server_addr.to_string());
-                    let _ = md_ref.set_item("read_access", info.access_rights.read);
-                    let _ = md_ref.set_item("write_access", info.access_rights.write);
+                    let _ = md_ref.set_item("ftype", result.native_type as u16);
+                    let _ = md_ref.set_item("type", &result.type_name);
+                    let _ = md_ref.set_item("count", result.element_count);
+                    let _ = md_ref.set_item("host", &result.host);
+                    let _ = md_ref.set_item("read_access", result.read_access);
+                    let _ = md_ref.set_item("write_access", result.write_access);
                     dict.set_item(&pvname, md)?;
                 }
                 None => {

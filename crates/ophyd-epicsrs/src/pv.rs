@@ -21,14 +21,14 @@ struct MonitorEvent {
 }
 
 /// Background prefetch result: channel info + full CTRL metadata.
-struct PrefetchResult {
-    native_type: DbFieldType,
-    type_name: String,
-    element_count: u32,
-    host: String,
-    read_access: bool,
-    write_access: bool,
-    snapshot: Snapshot,
+pub(crate) struct PrefetchResult {
+    pub(crate) native_type: DbFieldType,
+    pub(crate) type_name: String,
+    pub(crate) element_count: u32,
+    pub(crate) host: String,
+    pub(crate) read_access: bool,
+    pub(crate) write_access: bool,
+    pub(crate) snapshot: Snapshot,
 }
 
 /// Rust-backed PV object for ophyd's control layer.
@@ -52,7 +52,7 @@ pub struct EpicsRsPV {
     /// Python dispatch thread handle
     dispatch_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Background prefetch: starts on PV creation, completes before Python asks
-    prefetch_handle: Mutex<Option<JoinHandle<Option<PrefetchResult>>>>,
+    pub(crate) prefetch_handle: Mutex<Option<JoinHandle<Option<PrefetchResult>>>>,
 }
 
 impl EpicsRsPV {

@@ -118,6 +118,20 @@ yield 1 EventPage → AsyncMongoWriter.enqueue → 0.1ms
 Total: ~2ms (Python free), MongoDB insert continues in background
 ```
 
+## Performance
+
+Measured against pyepics on the same IOC (EPICS motor record, LAN):
+
+| Operation | pyepics | epicsrs | Speedup |
+|-----------|---------|---------|---------|
+| CA get (no monitor) | 0.33 ms | **0.09 ms** | 3.7x |
+| CA get (with monitor) | 0.01 ms | **0.00 ms** | — |
+| CA put → immediate get | 0.85 ms | **0.44 ms** | 1.9x |
+| bulk_caget (50 PVs) | ~1500 ms | **~1 ms** | 1500x |
+| Device connect (200 PVs) | ~2 s | **~0.16 s** | 12x |
+
+The put→get improvement comes from the single-owner writer task architecture in epics-rs, which pipelines write and read requests on the same TCP connection without mutex contention. Combined with `TCP_NODELAY`, this eliminates the ~45ms head-of-line blocking that occurred when reads waited for writes to flush.
+
 ## Advantages over pyepics backend
 
 ### Zero-latency monitor callbacks

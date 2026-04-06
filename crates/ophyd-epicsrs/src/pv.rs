@@ -70,11 +70,14 @@ impl EpicsRsPV {
         // the IOC with simultaneous searches, TCP connections, and reads.
         let prefetch_ch = ch.clone();
         let prefetch_handle = runtime.spawn(async move {
-            let _permit = prefetch_semaphore.acquire().await.ok()?;
-            // Wait for connection (up to 30s)
+            // Wait for connection (up to 30s) — no permit needed.
+            // CA search is already throttled by the search engine's AIMD.
             if prefetch_ch.wait_connected(Duration::from_secs(30)).await.is_err() {
                 return None;
             }
+            // Acquire permit only for the heavy CA read phase
+            // to avoid overwhelming the IOC with concurrent reads.
+            let _permit = prefetch_semaphore.acquire().await.ok()?;
             // Channel info (coordinator, no CA read)
             let info = match prefetch_ch.info().await {
                 Ok(i) => i,

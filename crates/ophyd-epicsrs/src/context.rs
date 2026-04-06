@@ -17,10 +17,15 @@ use crate::pv::EpicsRsPV;
 /// CaClient's background tasks (coordinator, transport, search) run
 /// as spawned tasks on this runtime and must stay alive between
 /// Python calls.
+/// Max concurrent prefetch tasks (connect + info + read).
+/// Limits IOC load when many PVs are created simultaneously.
+const MAX_CONCURRENT_PREFETCH: usize = 16;
+
 #[pyclass(name = "EpicsRsContext")]
 pub struct EpicsRsContext {
     pub(crate) runtime: Arc<Runtime>,
     pub(crate) client: Arc<CaClient>,
+    pub(crate) prefetch_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 #[pymethods]
@@ -54,13 +59,19 @@ impl EpicsRsContext {
         Ok(Self {
             runtime: Arc::new(runtime),
             client: Arc::new(client),
+            prefetch_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PREFETCH)),
         })
     }
 
     /// Create a PV channel for the given name.
     fn create_pv(&self, pvname: &str) -> EpicsRsPV {
         let channel = self.client.create_channel(pvname);
-        EpicsRsPV::new(self.runtime.clone(), channel, pvname.to_string())
+        EpicsRsPV::new(
+            self.runtime.clone(),
+            channel,
+            pvname.to_string(),
+            self.prefetch_semaphore.clone(),
+        )
     }
 
     /// Read multiple PVs in parallel. Returns a dict of {pvname: value}.

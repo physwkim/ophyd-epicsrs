@@ -56,13 +56,21 @@ pub struct EpicsRsPV {
 }
 
 impl EpicsRsPV {
-    pub fn new(runtime: Arc<Runtime>, channel: CaChannel, pvname: String) -> Self {
+    pub fn new(
+        runtime: Arc<Runtime>,
+        channel: CaChannel,
+        pvname: String,
+        prefetch_semaphore: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
         let ch = Arc::new(channel);
 
         // Start background prefetch immediately — runs concurrently with
         // all other PVs' prefetches in the tokio runtime (no GIL needed).
+        // Semaphore limits concurrent prefetch tasks to avoid overwhelming
+        // the IOC with simultaneous searches, TCP connections, and reads.
         let prefetch_ch = ch.clone();
         let prefetch_handle = runtime.spawn(async move {
+            let _permit = prefetch_semaphore.acquire().await.ok()?;
             // Wait for connection (up to 30s)
             if prefetch_ch.wait_connected(Duration::from_secs(30)).await.is_err() {
                 return None;

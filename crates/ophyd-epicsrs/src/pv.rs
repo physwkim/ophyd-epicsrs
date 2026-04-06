@@ -38,9 +38,9 @@ struct PrefetchResult {
 #[pyclass(name = "EpicsRsPV")]
 pub struct EpicsRsPV {
     runtime: Arc<Runtime>,
-    channel: Arc<CaChannel>,
+    pub(crate) channel: Arc<CaChannel>,
     #[pyo3(get)]
-    pvname: String,
+    pub(crate) pvname: String,
     native_type: Mutex<Option<DbFieldType>>,
     monitor_task: Mutex<Option<JoinHandle<()>>>,
     py_monitor_callback: Arc<Mutex<Option<PyObject>>>,

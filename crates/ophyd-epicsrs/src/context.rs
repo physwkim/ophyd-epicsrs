@@ -144,44 +144,57 @@ impl EpicsRsContext {
 
     /// Connect and fetch initial metadata for multiple PVs in parallel.
     ///
+    /// Operates on the actual PV channels (not temporary ones) so that
+    /// connection state, monitors, and subscriptions all use the same
+    /// underlying CA channel.
+    ///
     /// Phase 1: all PVs wait_connected concurrently.
     /// Phase 2: connected PVs fetch channel_info + DBR_TIME concurrently.
     ///
     /// Returns a dict: {pvname: {metadata...} or None for failed PVs}.
     /// One GIL release for ALL PVs instead of one per PV.
-    #[pyo3(signature = (pvnames, timeout=5.0))]
+    #[pyo3(signature = (pvs, timeout=5.0))]
     fn bulk_connect_and_prefetch(
         &self,
         py: Python<'_>,
-        pvnames: Vec<String>,
+        pvs: Vec<Py<EpicsRsPV>>,
         timeout: f64,
     ) -> PyResult<PyObject> {
-        let client = self.client.clone();
+        use epics_rs::ca::client::CaChannel;
+
+        // Extract (pvname, channel) from actual PV objects while holding GIL
+        let pv_channels: Vec<(String, Arc<CaChannel>)> = pvs.iter()
+            .map(|pv| {
+                let pv_ref = pv.borrow(py);
+                (pv_ref.pvname.clone(), pv_ref.channel.clone())
+            })
+            .collect();
+        drop(pvs);
+
         let dur = Duration::from_secs_f64(timeout);
 
         let (tx, rx) = std::sync::mpsc::channel();
         self.runtime.spawn(async move {
-            // Phase 1: connect all PVs in parallel
-            let mut channels: Vec<(String, epics_rs::ca::client::CaChannel)> = Vec::with_capacity(pvnames.len());
-            let mut connect_handles = Vec::with_capacity(pvnames.len());
-            for name in &pvnames {
-                let ch = client.create_channel(name);
-                let pvname = name.clone();
+            // Phase 1: connect all PVs in parallel (using their actual channels)
+            let mut connect_handles: Vec<(String, Arc<CaChannel>, tokio::task::JoinHandle<bool>)> =
+                Vec::with_capacity(pv_channels.len());
+            for (pvname, ch) in pv_channels {
                 let ch_clone = ch.clone();
                 connect_handles.push((pvname, ch, tokio::spawn(async move {
                     ch_clone.wait_connected(dur).await.is_ok()
                 })));
             }
+
+            let mut connected: Vec<(String, Arc<CaChannel>)> = Vec::new();
             for (pvname, ch, handle) in connect_handles {
-                let connected = handle.await.unwrap_or(false);
-                if connected {
-                    channels.push((pvname, ch));
+                if handle.await.unwrap_or(false) {
+                    connected.push((pvname, ch));
                 }
             }
 
             // Phase 2: fetch info + DBR_TIME for connected PVs in parallel
-            let mut fetch_handles = Vec::with_capacity(channels.len());
-            for (pvname, ch) in channels {
+            let mut fetch_handles = Vec::with_capacity(connected.len());
+            for (pvname, ch) in connected {
                 fetch_handles.push(tokio::spawn(async move {
                     let info = match ch.info().await {
                         Ok(i) => i,
@@ -197,7 +210,7 @@ impl EpicsRsContext {
                 }));
             }
 
-            let mut results = Vec::with_capacity(pvnames.len());
+            let mut results = Vec::new();
             for handle in fetch_handles {
                 if let Ok(result) = handle.await {
                     results.push(result);

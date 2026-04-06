@@ -76,10 +76,11 @@ impl EpicsRsPV {
                 Ok(Ok(i)) => i,
                 _ => return None,
             };
-            // DBR_TIME read: value + alarm + timestamp (lightweight).
-            // 2s timeout — if slow, metadata is fetched lazily by ophyd.
+            // DBR_CTRL read: value + alarm + timestamp + units/precision/limits.
+            // Fetching CTRL upfront eliminates the race where describe() runs
+            // before the lazy CTRL fetch completes (EpicsSignalRO after copy()).
             let snapshot = match tokio::time::timeout(
-                Duration::from_secs(2), prefetch_ch.get_with_metadata(DbrClass::Time)
+                Duration::from_secs(2), prefetch_ch.get_with_metadata(DbrClass::Ctrl)
             ).await {
                 Ok(Ok(s)) => s,
                 _ => return None,
@@ -221,7 +222,7 @@ impl EpicsRsPV {
             self.spawn_wait(async move {
                 channel.wait_connected(dur).await?;
                 let info = channel.info().await?;
-                let snapshot = tokio::time::timeout(dur, channel.get_with_metadata(DbrClass::Time))
+                let snapshot = tokio::time::timeout(dur, channel.get_with_metadata(DbrClass::Ctrl))
                     .await
                     .map_err(|_| epics_rs::base::error::CaError::Timeout)??;
                 Ok::<_, epics_rs::base::error::CaError>((info, snapshot))
@@ -276,6 +277,27 @@ impl EpicsRsPV {
         form: &str,
         count: u32,
     ) -> PyResult<Option<PyObject>> {
+        // If background prefetch is still pending, await it first.
+        // Prefetch uses DBR_CTRL (superset of TIME), so it satisfies any form.
+        // This avoids starting a fresh CA read when the prefetch is about to
+        // complete — critical for copy() where get_ctrlvars(timeout=1) races
+        // against channel connection.
+        if count == 0 {
+            let handle = self.prefetch_handle.lock().take();
+            if let Some(handle) = handle {
+                let dur = Duration::from_secs_f64(timeout);
+                let result = py.allow_threads(|| {
+                    self.spawn_wait(async move {
+                        tokio::time::timeout(dur, handle).await
+                    })
+                })?;
+                if let Ok(Ok(Some(prefetch))) = result {
+                    *self.native_type.lock() = Some(prefetch.native_type);
+                    return Ok(Some(snapshot_to_pydict(py, &prefetch.snapshot)));
+                }
+            }
+        }
+
         let channel = self.channel.clone();
         let dur = Duration::from_secs_f64(timeout);
         let class = match form {
@@ -478,6 +500,12 @@ impl EpicsRsPV {
                                 }
                             }
                             // else: omit char_value, Python shim uses cached enum_strs
+                        }
+                        EpicsValue::CharArray(v) => {
+                            // Char waveform → null-terminated string
+                            let end = v.iter().position(|&b| b == 0).unwrap_or(v.len());
+                            let s = String::from_utf8_lossy(&v[..end]);
+                            let _ = kwargs.set_item("char_value", s.as_ref());
                         }
                         other => {
                             let _ = kwargs.set_item("char_value", format!("{other}"));

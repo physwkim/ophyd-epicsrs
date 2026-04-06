@@ -195,6 +195,10 @@ pub fn snapshot_to_pydict(py: Python<'_>, snapshot: &Snapshot) -> PyObject {
                 idx.to_string()
             }
         }
+        EpicsValue::CharArray(v) => {
+            let end = v.iter().position(|&b| b == 0).unwrap_or(v.len());
+            String::from_utf8_lossy(&v[..end]).into_owned()
+        }
         other => format!("{other}"),
     };
     dict.set_item("char_value", char_value).unwrap();

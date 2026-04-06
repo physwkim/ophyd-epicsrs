@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4.2 (2026-04-06)
+
+### Improvements
+- **epics-rs transport rewrite**: Update to epics-rs v0.7.11 — single-owner writer task replaces shared Mutex, TCP_NODELAY eliminates ~45ms put→get stall, batch frame coalescing reduces TCP segments under load.
+
 ## v0.4.1 (2026-04-06)
 
 ### Bug Fixes

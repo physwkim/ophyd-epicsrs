@@ -17,15 +17,10 @@ use crate::pv::EpicsRsPV;
 /// CaClient's background tasks (coordinator, transport, search) run
 /// as spawned tasks on this runtime and must stay alive between
 /// Python calls.
-/// Max concurrent prefetch tasks (connect + info + read).
-/// Limits IOC load when many PVs are created simultaneously.
-const MAX_CONCURRENT_PREFETCH: usize = 16;
-
 #[pyclass(name = "EpicsRsContext")]
 pub struct EpicsRsContext {
     pub(crate) runtime: Arc<Runtime>,
     pub(crate) client: Arc<CaClient>,
-    pub(crate) prefetch_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 #[pymethods]
@@ -59,19 +54,13 @@ impl EpicsRsContext {
         Ok(Self {
             runtime: Arc::new(runtime),
             client: Arc::new(client),
-            prefetch_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PREFETCH)),
         })
     }
 
     /// Create a PV channel for the given name.
     fn create_pv(&self, pvname: &str) -> EpicsRsPV {
         let channel = self.client.create_channel(pvname);
-        EpicsRsPV::new(
-            self.runtime.clone(),
-            channel,
-            pvname.to_string(),
-            self.prefetch_semaphore.clone(),
-        )
+        EpicsRsPV::new(self.runtime.clone(), channel, pvname.to_string())
     }
 
     /// Read multiple PVs in parallel. Returns a dict of {pvname: value}.
@@ -153,15 +142,16 @@ impl EpicsRsContext {
         Ok(dict.into_any().unbind())
     }
 
-    /// Connect and fetch initial metadata for multiple PVs in parallel.
+    /// Connect multiple PVs in parallel and collect available metadata.
     ///
-    /// Awaits each PV's already-running background prefetch task instead of
-    /// starting new CA searches, avoiding UDP search congestion.
-    /// Falls back to manual connect+fetch for PVs whose prefetch was
-    /// already consumed.
+    /// Priority: connection first, metadata second.
+    /// 1. Wait for all channels to be connected (fast, all in parallel)
+    /// 2. For connected channels, grab prefetch result if already done
+    /// 3. If prefetch not ready, return connection-only result (metadata
+    ///    fetched lazily by ophyd when needed)
     ///
-    /// Returns a dict: {pvname: {metadata...} or None for failed PVs}.
-    /// One GIL release for ALL PVs instead of one per PV.
+    /// Returns a dict: {pvname: {metadata...} or True (connected, no metadata)
+    ///                  or None (not connected)}.
     #[pyo3(signature = (pvs, timeout=5.0))]
     fn bulk_connect_and_prefetch(
         &self,
@@ -172,19 +162,20 @@ impl EpicsRsContext {
         use crate::pv::PrefetchResult;
         use epics_rs::ca::client::CaChannel;
 
-        // Extract prefetch handles + fallback channels while holding GIL
+        // Extract channels + prefetch handles while holding GIL
         type PvTask = (
             String,
-            Option<tokio::task::JoinHandle<Option<PrefetchResult>>>,
             Arc<CaChannel>,
+            Option<tokio::task::JoinHandle<Option<PrefetchResult>>>,
         );
         let tasks: Vec<PvTask> = pvs.iter()
             .map(|pv| {
                 let pv_ref = pv.borrow(py);
-                let pvname = pv_ref.pvname.clone();
-                let channel = pv_ref.channel.clone();
-                let handle = pv_ref.prefetch_handle.lock().take();
-                (pvname, handle, channel)
+                (
+                    pv_ref.pvname.clone(),
+                    pv_ref.channel.clone(),
+                    pv_ref.prefetch_handle.lock().take(),
+                )
             })
             .collect();
         drop(pvs);
@@ -193,46 +184,43 @@ impl EpicsRsContext {
 
         let (tx, rx) = std::sync::mpsc::channel();
         self.runtime.spawn(async move {
-            let mut handles = Vec::with_capacity(tasks.len());
-            for (pvname, prefetch, channel) in tasks {
-                handles.push(tokio::spawn(async move {
-                    // Fast path: await the already-running prefetch (no new CA traffic)
-                    if let Some(handle) = prefetch {
-                        if let Ok(Ok(Some(result))) = tokio::time::timeout(dur, handle).await {
-                            return (pvname, Some(result));
-                        }
-                    }
-                    // Fallback: prefetch already consumed or failed — connect manually
-                    if channel.wait_connected(dur).await.is_err() {
-                        return (pvname, None);
-                    }
-                    let info = match channel.info().await {
-                        Ok(i) => i,
-                        Err(_) => return (pvname, None),
-                    };
-                    let snapshot = match tokio::time::timeout(
-                        dur, channel.get_with_metadata(epics_rs::base::server::snapshot::DbrClass::Time)
-                    ).await {
-                        Ok(Ok(s)) => s,
-                        _ => return (pvname, None),
-                    };
-                    (pvname, Some(PrefetchResult {
-                        native_type: info.native_type,
-                        type_name: format!("{:?}", info.native_type).to_lowercase(),
-                        element_count: info.element_count,
-                        host: info.server_addr.to_string(),
-                        read_access: info.access_rights.read,
-                        write_access: info.access_rights.write,
-                        snapshot,
-                    }))
-                }));
+            // Phase 1: wait_connected for ALL channels in parallel (fast)
+            type ConnectHandle = (
+                String,
+                Arc<CaChannel>,
+                Option<tokio::task::JoinHandle<Option<PrefetchResult>>>,
+                tokio::task::JoinHandle<bool>,
+            );
+            let mut connect_handles: Vec<ConnectHandle> =
+                Vec::with_capacity(tasks.len());
+            for (pvname, ch, prefetch) in tasks {
+                let ch_clone = ch.clone();
+                let handle = tokio::spawn(async move {
+                    ch_clone.wait_connected(dur).await.is_ok()
+                });
+                connect_handles.push((pvname, ch, prefetch, handle));
             }
 
-            let mut results = Vec::new();
-            for handle in handles {
-                if let Ok(result) = handle.await {
-                    results.push(result);
+            // Phase 2: collect results — grab prefetch metadata if ready
+            let mut results = Vec::with_capacity(connect_handles.len());
+            for (pvname, ch, prefetch, conn_handle) in connect_handles {
+                let connected = conn_handle.await.unwrap_or(false);
+                if !connected {
+                    results.push((pvname, None));
+                    continue;
                 }
+                // Try to get prefetch result (non-blocking or very short wait)
+                let md = if let Some(handle) = prefetch {
+                    // Give prefetch 100ms to finish — it's been running since
+                    // PV creation, so it's likely done or nearly done.
+                    match tokio::time::timeout(Duration::from_millis(100), handle).await {
+                        Ok(Ok(result)) => result,
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                results.push((pvname, Some((ch, md))));
             }
             let _ = tx.send(results);
         });
@@ -248,7 +236,8 @@ impl EpicsRsContext {
         let dict = PyDict::new(py);
         for (pvname, maybe_result) in results {
             match maybe_result {
-                Some(result) => {
+                Some((_ch, Some(result))) => {
+                    // Connected + metadata available
                     let md = crate::convert::snapshot_to_pydict(py, &result.snapshot);
                     let md_ref = md.downcast_bound::<PyDict>(py).unwrap();
                     let _ = md_ref.set_item("ftype", result.native_type as u16);
@@ -259,7 +248,13 @@ impl EpicsRsContext {
                     let _ = md_ref.set_item("write_access", result.write_access);
                     dict.set_item(&pvname, md)?;
                 }
+                Some((_ch, None)) => {
+                    // Connected but no metadata yet — return True so Python
+                    // knows it's connected and can fire the callback
+                    dict.set_item(&pvname, true)?;
+                }
                 None => {
+                    // Not connected
                     dict.set_item(&pvname, py.None())?;
                 }
             }

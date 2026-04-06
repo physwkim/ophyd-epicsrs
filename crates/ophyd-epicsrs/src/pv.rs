@@ -56,39 +56,33 @@ pub struct EpicsRsPV {
 }
 
 impl EpicsRsPV {
-    pub fn new(
-        runtime: Arc<Runtime>,
-        channel: CaChannel,
-        pvname: String,
-        prefetch_semaphore: Arc<tokio::sync::Semaphore>,
-    ) -> Self {
+    pub fn new(runtime: Arc<Runtime>, channel: CaChannel, pvname: String) -> Self {
         let ch = Arc::new(channel);
 
         // Start background prefetch immediately — runs concurrently with
         // all other PVs' prefetches in the tokio runtime (no GIL needed).
-        // Semaphore limits concurrent prefetch tasks to avoid overwhelming
-        // the IOC with simultaneous searches, TCP connections, and reads.
+        // Short timeouts on CA reads so slow PVs fail fast and don't
+        // block bulk_connect_and_prefetch from returning promptly.
         let prefetch_ch = ch.clone();
         let prefetch_handle = runtime.spawn(async move {
-            // Wait for connection (up to 30s) — no permit needed.
-            // CA search is already throttled by the search engine's AIMD.
+            // Wait for connection (up to 30s)
             if prefetch_ch.wait_connected(Duration::from_secs(30)).await.is_err() {
                 return None;
             }
-            // Acquire permit only for the heavy CA read phase
-            // to avoid overwhelming the IOC with concurrent reads.
-            let _permit = prefetch_semaphore.acquire().await.ok()?;
-            // Channel info (coordinator, no CA read)
-            let info = match prefetch_ch.info().await {
-                Ok(i) => i,
-                Err(_) => return None,
+            // Channel info (coordinator query, not a CA read)
+            let info = match tokio::time::timeout(
+                Duration::from_secs(2), prefetch_ch.info()
+            ).await {
+                Ok(Ok(i)) => i,
+                _ => return None,
             };
             // DBR_TIME read: value + alarm + timestamp (lightweight).
-            // CTRL metadata (enum_strs, limits, units) is fetched lazily
-            // by ophyd's get_ctrlvars() only when needed.
-            let snapshot = match prefetch_ch.get_with_metadata(DbrClass::Time).await {
-                Ok(s) => s,
-                Err(_) => return None,
+            // 2s timeout — if slow, metadata is fetched lazily by ophyd.
+            let snapshot = match tokio::time::timeout(
+                Duration::from_secs(2), prefetch_ch.get_with_metadata(DbrClass::Time)
+            ).await {
+                Ok(Ok(s)) => s,
+                _ => return None,
             };
             Some(PrefetchResult {
                 native_type: info.native_type,

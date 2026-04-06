@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.4.1 (2026-04-06)
+
+### Bug Fixes
+
+- **Put failure callback**: Non-blocking put with callback now always fires the completion callback on success AND failure/timeout, passing a `success` bool. Previously, failure silently dropped the callback, leaving ophyd's `set()` permanently locked ("Another set() call is still in progress").
+- **Self-healing connection task**: Connection event task uses a loop that resubscribes automatically when the broadcast channel closes (e.g. during epics-rs reconnection cycle). Previously, the task died silently and reconnection events were never delivered to ophyd, causing permanent `DisconnectedError`.
+- **Self-healing monitor task**: Monitor task resubscribes automatically when the subscription ends (IOC restart, network blip). Previously, value updates stopped permanently after any disruption.
+- **Task liveness check**: `is_finished()` replaces `is_some()` for detecting dead task handles, allowing restart of silently-exited background tasks.
+
 ## v0.4.0 (2026-04-05)
 
 ### New Features

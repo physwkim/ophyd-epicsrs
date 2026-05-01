@@ -19,25 +19,22 @@ maturin develop
 
 ## Usage
 
-```python
-import ophyd
-ophyd.set_cl("epicsrs")
+Call `install()` once at startup, before constructing any ophyd Signals or Devices:
 
-# Or via environment variable
-# OPHYD_CONTROL_LAYER=epicsrs
+```python
+from ophyd_epicsrs import install
+install()
 
 # All ophyd devices now use the Rust CA backend
+import ophyd
 motor = ophyd.EpicsMotor("IOC:m1", name="motor1")
 motor.wait_for_connection(timeout=5)
 print(motor.read())
 ```
 
-Or with the convenience function:
-
-```python
-from ophyd_epicsrs import use_epicsrs_backend
-use_epicsrs_backend()
-```
+`install()` assigns `ophyd.cl` directly. It must be called before any
+`Signal` or `Device` is constructed, since they capture `ophyd.cl.get_pv`
+at construction time.
 
 ## Parallel PV Read (bulk_caget)
 
@@ -206,7 +203,7 @@ ophyd (Python)
 ## Requirements
 
 - Python >= 3.8
-- ophyd >= 1.7
+- ophyd >= 1.9 (vanilla PyPI — no fork required)
 - [epics-rs](https://github.com/epics-rs/epics-rs) (bundled at build time)
 
 ## Related

@@ -5,10 +5,10 @@ import types
 
 from ophyd_epicsrs._native import EpicsRsContext, EpicsRsPV
 
-__all__ = ["EpicsRsContext", "EpicsRsPV", "install"]
+__all__ = ["EpicsRsContext", "EpicsRsPV", "use_epicsrs"]
 
 
-def install(*, logger=None):
+def use_epicsrs(*, logger=None):
     """Install the epics-rs control layer into ophyd.
 
     Replaces ``ophyd.cl`` with the Rust-backed shim. Must be called

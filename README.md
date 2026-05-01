@@ -19,11 +19,11 @@ maturin develop
 
 ## Usage
 
-Call `install()` once at startup, before constructing any ophyd Signals or Devices:
+Call `use_epicsrs()` once at startup, before constructing any ophyd Signals or Devices:
 
 ```python
-from ophyd_epicsrs import install
-install()
+from ophyd_epicsrs import use_epicsrs
+use_epicsrs()
 
 # All ophyd devices now use the Rust CA backend
 import ophyd
@@ -32,7 +32,7 @@ motor.wait_for_connection(timeout=5)
 print(motor.read())
 ```
 
-`install()` assigns `ophyd.cl` directly. It must be called before any
+`use_epicsrs()` assigns `ophyd.cl` directly. It must be called before any
 `Signal` or `Device` is constructed, since they capture `ophyd.cl.get_pv`
 at construction time.
 

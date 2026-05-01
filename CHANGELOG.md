@@ -7,13 +7,13 @@
 - **No more ophyd fork required**: dependency switched from
   `ophyd @ git+https://github.com/physwkim/ophyd.git@feature/epicsrs-backend`
   to vanilla `ophyd>=1.9` from PyPI. Existing users of the fork must
-  call `ophyd_epicsrs.install()` once at startup before constructing any
+  call `ophyd_epicsrs.use_epicsrs()` once at startup before constructing any
   Signals/Devices; previously the fork auto-registered via
   `ophyd.set_cl("epicsrs")`.
 
 ### New features
 
-- **`ophyd_epicsrs.install()`**: explicit one-call registration of the
+- **`ophyd_epicsrs.use_epicsrs()`**: explicit one-call registration of the
   epics-rs control layer. Bypasses `ophyd.set_cl` (vanilla ophyd has no
   "epicsrs" branch) and assigns `ophyd.cl` directly.
 - **In-package shim** (`ophyd_epicsrs._shim`): the full `EpicsRsShimPV`,

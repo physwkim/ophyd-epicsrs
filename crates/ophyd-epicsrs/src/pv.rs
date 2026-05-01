@@ -622,6 +622,9 @@ impl EpicsRsPV {
                                 }
                             });
                         }
+                        ConnectionEvent::Unresponsive => {
+                            // Echo timed out — TCP still up, no callback emitted
+                        }
                     }
                     tracing::debug!("{pvname}: connection event: {event:?}");
                 }

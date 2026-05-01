@@ -33,6 +33,9 @@ pub fn epics_value_to_py(py: Python<'_>, val: &EpicsValue) -> PyObject {
         EpicsValue::EnumArray(v) => {
             PyList::new(py, v.iter()).unwrap().into_any().unbind()
         }
+        EpicsValue::StringArray(v) => {
+            PyList::new(py, v.iter()).unwrap().into_any().unbind()
+        }
     }
 }
 
@@ -156,9 +159,8 @@ fn py_sequence_to_epics_array(
             Ok(EpicsValue::EnumArray(v))
         }
         DbFieldType::String => {
-            // Single string from sequence — shouldn't happen, but handle gracefully
-            let v: String = obj.extract()?;
-            Ok(EpicsValue::String(v))
+            let v: Vec<String> = obj.extract()?;
+            Ok(EpicsValue::StringArray(v))
         }
     }
 }

@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.4.3 (2026-05-01)
+
+### Improvements
+
+- **epics-rs 0.13.0**: switch from git pin to crates.io release. New transitive variants `EpicsValue::StringArray(Vec<String>)` (DBR_STRING with `count > 1` — used by mbbo/mbbi choice arrays, NTNDArray dim labels) and `ConnectionEvent::Unresponsive` (echo timeout while TCP is up) are now handled.
+- **DBR_CTRL prefetch**: background prefetch upgraded from `DBR_TIME` to `DBR_CTRL` so units, precision, limits, and `enum_strs` are available immediately after connection.
+- **`get_with_metadata` race fix**: awaits the pending prefetch handle before starting a fresh CA read, eliminating a copy-on-clone metadata race.
+
+### Behavior notes
+
+- `ConnectionEvent::Unresponsive` is logged but does NOT fire the Python connection callback. The state is reversible (`Connected ↔ Unresponsive`) per the epics-rs state machine; a real disconnect still fires `Disconnected` separately.
+- `py_to_epics_value` for `DbFieldType::String` now accepts `list[str]` and produces `StringArray` (previously dead path that always raised `TypeError` on sequence input).
+
 ## v0.4.2 (2026-04-06)
 
 ### Improvements

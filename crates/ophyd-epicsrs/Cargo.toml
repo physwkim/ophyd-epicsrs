@@ -1,6 +1,6 @@
 [package]
 name = "ophyd-epicsrs"
-version = "0.4.1"
+version = "0.4.3"
 edition = "2024"
 rust-version = "1.85"
 license = "BSD-3-Clause"
@@ -10,7 +10,7 @@ name = "ophyd_epicsrs"
 crate-type = ["cdylib"]
 
 [dependencies]
-epics-rs = { git = "https://github.com/epics-rs/epics-rs", features = ["ca"] }
+epics-rs = { version = "0.13.0", features = ["ca"] }
 pyo3 = { version = "0.24", features = ["extension-module", "abi3-py38"] }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
 parking_lot = "0.12"

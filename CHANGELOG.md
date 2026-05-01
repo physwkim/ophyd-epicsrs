@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.5.2 (2026-05-01)
+
+### Fixes
+
+- Add `readme = "README.md"` to `pyproject.toml` so PyPI displays the project description.
+
 ## v0.5.1 (2026-05-01)
 
 ### Breaking changes

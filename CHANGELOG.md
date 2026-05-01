@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.5.0 (2026-05-01)
+
+### Breaking changes
+
+- **No more ophyd fork required**: dependency switched from
+  `ophyd @ git+https://github.com/physwkim/ophyd.git@feature/epicsrs-backend`
+  to vanilla `ophyd>=1.9` from PyPI. Existing users of the fork must
+  call `ophyd_epicsrs.install()` once at startup before constructing any
+  Signals/Devices; previously the fork auto-registered via
+  `ophyd.set_cl("epicsrs")`.
+
+### New features
+
+- **`ophyd_epicsrs.install()`**: explicit one-call registration of the
+  epics-rs control layer. Bypasses `ophyd.set_cl` (vanilla ophyd has no
+  "epicsrs" branch) and assigns `ophyd.cl` directly.
+- **In-package shim** (`ophyd_epicsrs._shim`): the full `EpicsRsShimPV`,
+  `get_pv`, `caget`, `caput`, `setup`, `release_pvs`, `get_dispatcher`
+  surface now ships with this package instead of living inside an ophyd
+  fork. Backend changes (e.g. epics-rs version bumps) and shim changes
+  are co-located.
+- **Vanilla-ophyd `process_pending` fallback**: shim's
+  `wait_for_connection` flushes the dispatcher queue using
+  `EventDispatcher.process_pending` when present (forks) and a sentinel
+  insertion against the documented `_threads` / `_utility_threads`
+  layout otherwise.
+
 ## v0.4.3 (2026-05-01)
 
 ### Improvements

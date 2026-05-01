@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.5.1 (2026-05-01)
+
+### Breaking changes
+
+- **`install()` renamed to `use_epicsrs()`**: the entry-point introduced in
+  v0.5.0 has been renamed for clarity. Replace `from ophyd_epicsrs import install; install()`
+  with `from ophyd_epicsrs import use_epicsrs; use_epicsrs()`.
+
 ## v0.5.0 (2026-05-01)
 
 ### Breaking changes

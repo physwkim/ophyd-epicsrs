@@ -24,10 +24,7 @@ from ophyd_async.epics.core._util import EpicsOptions, EpicsSignalBackend
 
 _logger = logging.getLogger(__name__)
 
-from ophyd_epicsrs._native import (
-    EpicsRsContext,
-    EpicsRsPvaContext,
-)
+from ophyd_epicsrs._contexts import get_ca_context, get_pva_context
 
 from ._converter import Converter, _is_typed_pvfield_payload, make_converter
 
@@ -37,26 +34,6 @@ class EpicsRsProtocol(Enum):
 
     CA = "ca"
     PVA = "pva"
-
-
-# Module-level lazy singletons. Both share the same Rust shared_runtime,
-# so the second one to construct does NOT spin up a separate executor.
-_ca_context: EpicsRsContext | None = None
-_pva_context: EpicsRsPvaContext | None = None
-
-
-def _get_ca_context() -> EpicsRsContext:
-    global _ca_context
-    if _ca_context is None:
-        _ca_context = EpicsRsContext()
-    return _ca_context
-
-
-def _get_pva_context() -> EpicsRsPvaContext:
-    global _pva_context
-    if _pva_context is None:
-        _pva_context = EpicsRsPvaContext()
-    return _pva_context
 
 
 class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
@@ -82,8 +59,8 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
 
     def _make_native_pv(self, pv_name: str):
         if self.protocol is EpicsRsProtocol.PVA:
-            return _get_pva_context().create_pv(pv_name)
-        return _get_ca_context().create_pv(pv_name)
+            return get_pva_context().create_pv(pv_name)
+        return get_ca_context().create_pv(pv_name)
 
     # ----- SignalBackend ABC -----
 

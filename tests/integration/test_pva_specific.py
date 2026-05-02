@@ -65,9 +65,9 @@ async def test_pva_async_pipelining_multiple_in_flight(pva_ctx):
     """Three independent put_async calls on different PVs should
     overlap when launched via asyncio.gather — the shared tokio
     runtime must not serialize them."""
-    from ophyd_epicsrs._native import EpicsRsPvaContext
+    from ophyd_epicsrs._contexts import get_pva_context
 
-    ctx = EpicsRsPvaContext()
+    ctx = get_pva_context()
     targets = [
         ("mini:ph:ExposureTime", 0.111, "mini:ph:ExposureTime_RBV"),
         ("mini:edge:ExposureTime", 0.222, "mini:edge:ExposureTime_RBV"),

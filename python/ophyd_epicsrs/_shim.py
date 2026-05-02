@@ -12,15 +12,13 @@ import threading
 
 from ophyd._dispatch import EventDispatcher, _CallbackThread, wrap_callback
 
-from ophyd_epicsrs._native import EpicsRsContext, EpicsRsPvaContext
+from ophyd_epicsrs._contexts import get_ca_context, get_pva_context
 
 name = "epicsrs"
 thread_class = threading.Thread
 
 module_logger = logging.getLogger(__name__)
 
-_context = None
-_pva_context = None
 _dispatcher = None
 
 
@@ -42,12 +40,14 @@ def _split_protocol(pvname):
 
 
 def _cleanup():
-    global _context, _pva_context, _dispatcher
+    global _dispatcher
     if _dispatcher is not None and _dispatcher.is_alive():
         _dispatcher.stop()
     _dispatcher = None
-    _context = None
-    _pva_context = None
+    # Don't drop the shared CA/PVA singletons here — other consumers
+    # (ophyd-async backend, user code) may still hold PVs whose Drop
+    # implementations need the runtime alive. The Rust contexts are
+    # cleaned up by the process tearing down.
 
 
 def get_dispatcher():
@@ -55,16 +55,17 @@ def get_dispatcher():
 
 
 def setup(logger):
-    global _context, _dispatcher
+    global _dispatcher
 
     if _dispatcher is not None:
         if logger:
             logger.debug("epicsrs already setup")
         return _dispatcher
 
-    _context = EpicsRsContext()
-    # PVA context is created lazily on first use to avoid spawning a
-    # second runtime when the user only uses CA.
+    # Eagerly warm the CA singleton so the dispatcher exists alongside
+    # a live context. PVA stays lazy — only constructed on first
+    # `pva://` PV creation.
+    get_ca_context()
 
     if logger:
         logger.debug("Installing epicsrs event dispatcher")
@@ -76,14 +77,6 @@ def setup(logger):
     )
     atexit.register(_cleanup)
     return _dispatcher
-
-
-def _get_pva_context():
-    """Lazily construct the PVA context on first use."""
-    global _pva_context
-    if _pva_context is None:
-        _pva_context = EpicsRsPvaContext()
-    return _pva_context
 
 
 def _process_pending(dispatcher, timeout=2.0):
@@ -129,7 +122,7 @@ class EpicsRsShimPV:
     ):
         # _native_pv lets get_pv() inject a pre-created PVA channel so this
         # class can wrap either CA or PVA backends with the same surface.
-        self._pv = _native_pv if _native_pv is not None else _context.create_pv(pvname)
+        self._pv = _native_pv if _native_pv is not None else get_ca_context().create_pv(pvname)
         self.pvname = pvname
         self.form = form
         self.auto_monitor = auto_monitor
@@ -366,7 +359,7 @@ def get_pv(
     protocol, bare_name = _split_protocol(pvname)
     native_pv = None
     if protocol == "pva":
-        native_pv = _get_pva_context().create_pv(bare_name)
+        native_pv = get_pva_context().create_pv(bare_name)
 
     # Keep the ORIGINAL pvname (with `pva://` / `ca://` prefix) on the
     # shim wrapper. ophyd indexes per-pv state (``_received_first_metadata``,

@@ -159,6 +159,30 @@ impl EpicsRsPV {
         }
     }
 
+    /// Async variant of `resolve_native_type_sync` — does NOT block the
+    /// asyncio event loop. Used inside `future_into_py` blocks so the
+    /// caller's `await pv.put_async(...)` actually yields while we
+    /// fetch channel info.
+    async fn resolve_native_type(
+        cache: Arc<Mutex<Option<DbFieldType>>>,
+        channel: Arc<CaChannel>,
+        timeout_secs: f64,
+    ) -> Result<DbFieldType, PyErr> {
+        if let Some(t) = *cache.lock() {
+            return Ok(t);
+        }
+        let dur = Duration::from_secs_f64(timeout_secs.min(5.0));
+        match tokio::time::timeout(dur, channel.info()).await {
+            Ok(Ok(i)) => {
+                *cache.lock() = Some(i.native_type);
+                Ok(i.native_type)
+            }
+            _ => Err(PyRuntimeError::new_err(
+                "cannot determine PV native type for put (channel.info() failed)",
+            )),
+        }
+    }
+
     /// Best-effort injection of the current connection state for a newly
     /// registered callback. This avoids blocking Python startup while still
     /// covering the race where prefetch connected the channel before callback
@@ -718,9 +742,12 @@ impl EpicsRsPV {
         })
     }
 
-    /// Async: read the PV value (no metadata). Returns the converted
-    /// Python value, or None on failure/timeout.
-    #[pyo3(signature = (timeout=2.0))]
+    /// Async: read the PV value. Raises `TimeoutError` on timeout and
+    /// `RuntimeError` on protocol error — never returns silently with
+    /// a None that the caller might mistake for a successful read.
+    /// Also caches the discovered native_type so subsequent puts can
+    /// skip the channel.info() step.
+    #[pyo3(signature = (timeout=10.0))]
     fn get_value_async<'py>(
         &self,
         py: Python<'py>,
@@ -728,20 +755,29 @@ impl EpicsRsPV {
     ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
         let channel = self.channel.clone();
         let dur = Duration::from_secs_f64(timeout);
+        let cache = self.native_type.clone();
+        let pvname = self.pvname.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let result = tokio::time::timeout(dur, channel.get()).await;
-            match result {
+            match tokio::time::timeout(dur, channel.get()).await {
                 Ok(Ok((_dbr, val))) => {
-                    Python::with_gil(|py| Ok(crate::convert::epics_value_to_py(py, &val)))
+                    *cache.lock() = Some(val.dbr_type());
+                    Python::with_gil(|py| {
+                        Ok::<PyObject, PyErr>(crate::convert::epics_value_to_py(py, &val))
+                    })
                 }
-                _ => Python::with_gil(|py| Ok(py.None())),
+                Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
+                    "get on {pvname} failed: {e}"
+                ))),
+                Err(_) => Err(pyo3::exceptions::PyTimeoutError::new_err(format!(
+                    "get on {pvname} timed out after {timeout}s"
+                ))),
             }
         })
     }
 
-    /// Async: read value + metadata. Returns the same dict shape as
-    /// the sync `get_with_metadata`.
-    #[pyo3(signature = (timeout=2.0, form="time"))]
+    /// Async: read value + metadata. Raises on timeout / error rather
+    /// than returning None silently.
+    #[pyo3(signature = (timeout=10.0, form="time"))]
     fn get_reading_async<'py>(
         &self,
         py: Python<'py>,
@@ -754,13 +790,22 @@ impl EpicsRsPV {
             "ctrl" | "control" => DbrClass::Ctrl,
             _ => DbrClass::Time,
         };
+        let cache = self.native_type.clone();
+        let pvname = self.pvname.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let result = tokio::time::timeout(dur, channel.get_with_metadata(class)).await;
-            match result {
+            match tokio::time::timeout(dur, channel.get_with_metadata(class)).await {
                 Ok(Ok(snapshot)) => {
-                    Python::with_gil(|py| Ok(crate::convert::snapshot_to_pydict(py, &snapshot)))
+                    *cache.lock() = Some(snapshot.value.dbr_type());
+                    Python::with_gil(|py| {
+                        Ok::<PyObject, PyErr>(crate::convert::snapshot_to_pydict(py, &snapshot))
+                    })
                 }
-                _ => Python::with_gil(|py| Ok(py.None())),
+                Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
+                    "get_reading on {pvname} failed: {e}"
+                ))),
+                Err(_) => Err(pyo3::exceptions::PyTimeoutError::new_err(format!(
+                    "get_reading on {pvname} timed out after {timeout}s"
+                ))),
             }
         })
     }
@@ -774,13 +819,20 @@ impl EpicsRsPV {
         value: &Bound<'_, pyo3::PyAny>,
         timeout: f64,
     ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
-        // Resolve native type via channel.info() (no CA read) — works
-        // for write-only PVs and avoids any get latency on the put path.
-        let native = self.resolve_native_type_sync(py, timeout)?;
-        let epics_val = crate::convert::py_to_epics_value(value, native)?;
+        // Hold an owned ref to the Python value so we can re-bind it
+        // inside the future without holding the GIL across await points.
+        let value_owned: Py<pyo3::PyAny> = value.clone().unbind();
+        let cache = self.native_type.clone();
         let channel = self.channel.clone();
         let dur = Duration::from_secs_f64(timeout);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            // resolve_native_type now lives inside the future — no more
+            // sync block on the asyncio loop while we fetch channel.info().
+            let native = Self::resolve_native_type(cache, channel.clone(), 5.0).await?;
+            let epics_val = Python::with_gil(|py| {
+                let v = value_owned.bind(py);
+                crate::convert::py_to_epics_value(v, native)
+            })?;
             let result = tokio::time::timeout(dur, channel.put(&epics_val)).await;
             Ok(matches!(result, Ok(Ok(()))))
         })
@@ -797,18 +849,21 @@ impl EpicsRsPV {
         py: Python<'py>,
         value: &Bound<'_, pyo3::PyAny>,
     ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
-        // Resolve native type via channel.info() — coordinator query, no
-        // CA read. Critical for write-only PVs and busy records where
-        // a synchronous get would defeat wait=False semantics.
-        let native = self.resolve_native_type_sync(py, 5.0)?;
-        let epics_val = crate::convert::py_to_epics_value(value, native)?;
+        let value_owned: Py<pyo3::PyAny> = value.clone().unbind();
+        let cache = self.native_type.clone();
         let channel = self.channel.clone();
         let pvname = self.pvname.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            // Async info() resolution — does NOT block the asyncio loop.
+            let native = Self::resolve_native_type(cache, channel.clone(), 5.0).await?;
+            let epics_val = Python::with_gil(|py| {
+                let v = value_owned.bind(py);
+                crate::convert::py_to_epics_value(v, native)
+            })?;
             match channel.put_nowait(&epics_val).await {
                 Ok(()) => Ok(true),
                 Err(e) => {
-                    eprintln!("[put_nowait_async] {pvname} error: {e}");
+                    tracing::warn!(target: "ophyd_epicsrs::put_nowait", pv = %pvname, "put failed: {e}");
                     Ok(false)
                 }
             }

@@ -587,8 +587,13 @@ impl EpicsRsPvaPV {
     }
 
     /// Async: read the PV value (NTScalar value field, or whole PvField).
-    /// Returns Python value, or None on failure/timeout.
-    #[pyo3(signature = (timeout=2.0))]
+    /// Raises on timeout / error rather than returning None silently —
+    /// callers (e.g. EpicsRsSignalBackend) must not see a `None` that
+    /// looks like a successful read.
+    ///
+    /// For NTEnum the returned dict is unwrapped to the integer index
+    /// for parity with the monitor callback path (extract_ntenum).
+    #[pyo3(signature = (timeout=10.0))]
     fn get_value_async<'py>(
         &self,
         py: Python<'py>,
@@ -596,12 +601,22 @@ impl EpicsRsPvaPV {
     ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
         let client = self.client.clone();
         let name = self.pvname.clone();
+        let pvname = name.clone();
         let dur = Duration::from_secs_f64(timeout);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let result = tokio::time::timeout(dur, client.pvget(&name)).await;
-            match result {
+            match tokio::time::timeout(dur, client.pvget(&name)).await {
                 Ok(Ok(field)) => Python::with_gil(|py| {
-                    // Extract `.value` for NTScalar; fall back to whole field.
+                    // NTEnum handling: top-level Structure with a
+                    // `value` substructure containing {index, choices}.
+                    // Surface the int index (consistent with monitor).
+                    if let epics_rs::pva::pvdata::PvField::Structure(s) = &field {
+                        if let Some((idx, _choices)) = crate::pva_convert::try_extract_ntenum(s) {
+                            return Ok::<PyObject, PyErr>(
+                                idx.into_pyobject(py).unwrap().into_any().unbind(),
+                            );
+                        }
+                    }
+                    // NTScalar: extract `value`; otherwise the whole field.
                     let value_field = match &field {
                         epics_rs::pva::pvdata::PvField::Structure(s) => s
                             .get_field("value")
@@ -609,15 +624,21 @@ impl EpicsRsPvaPV {
                             .unwrap_or_else(|| field.clone()),
                         _ => field.clone(),
                     };
-                    Ok(pvfield_to_py(py, &value_field))
+                    Ok::<PyObject, PyErr>(pvfield_to_py(py, &value_field))
                 }),
-                _ => Python::with_gil(|py| Ok(py.None())),
+                Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
+                    "pvget on {pvname} failed: {e}"
+                ))),
+                Err(_) => Err(pyo3::exceptions::PyTimeoutError::new_err(format!(
+                    "pvget on {pvname} timed out after {timeout}s"
+                ))),
             }
         })
     }
 
     /// Async: read value + metadata as ophyd-compatible dict.
-    #[pyo3(signature = (timeout=2.0, form="time"))]
+    /// Raises on timeout / error.
+    #[pyo3(signature = (timeout=10.0, form="time"))]
     fn get_reading_async<'py>(
         &self,
         py: Python<'py>,
@@ -627,14 +648,19 @@ impl EpicsRsPvaPV {
         let _ = form;
         let client = self.client.clone();
         let name = self.pvname.clone();
+        let pvname = name.clone();
         let dur = Duration::from_secs_f64(timeout);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let result = tokio::time::timeout(dur, client.pvget(&name)).await;
-            match result {
-                Ok(Ok(field)) => {
-                    Python::with_gil(|py| Ok(crate::pva_convert::pvfield_to_metadata(py, &field)))
-                }
-                _ => Python::with_gil(|py| Ok(py.None())),
+            match tokio::time::timeout(dur, client.pvget(&name)).await {
+                Ok(Ok(field)) => Python::with_gil(|py| {
+                    Ok::<PyObject, PyErr>(crate::pva_convert::pvfield_to_metadata(py, &field))
+                }),
+                Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
+                    "pvget on {pvname} failed: {e}"
+                ))),
+                Err(_) => Err(pyo3::exceptions::PyTimeoutError::new_err(format!(
+                    "pvget on {pvname} timed out after {timeout}s"
+                ))),
             }
         })
     }
@@ -657,10 +683,19 @@ impl EpicsRsPvaPV {
         })
     }
 
-    /// Async: fire-and-forget pvput. PVA has no wire-level
-    /// fire-and-forget primitive (every PUT expects a PUT_RESPONSE),
-    /// so we spawn the operation and return immediately. Use for busy
-    /// records / acquire PVs where waiting for ack causes deadlock.
+    /// Async: short-bounded pvput for `wait=False` semantics.
+    ///
+    /// PVA has no wire-level fire-and-forget primitive (every PUT
+    /// expects a PUT_RESPONSE), so the closest we can offer is a put
+    /// with a tight default timeout (5 s) that surfaces the real
+    /// outcome to the caller — `True` on server ack, `False` on
+    /// timeout / error. This is the trade-off for busy / acquire PVs
+    /// where waiting forever for ack causes deadlock: bounded wait,
+    /// honest result.
+    ///
+    /// (The earlier spawn-and-return approach was changed because it
+    /// silently swallowed value/type/permission errors — the user's
+    /// plan would proceed as if the write succeeded.)
     #[pyo3(signature = (value))]
     fn put_nowait_async<'py>(
         &self,
@@ -670,15 +705,22 @@ impl EpicsRsPvaPV {
         let value_str = python_value_to_pvput_string(value)?;
         let client = self.client.clone();
         let name = self.pvname.clone();
-        // Spawn the put on the runtime so the future returned to Python
-        // resolves immediately. Errors are logged from the background task.
         let pvname = name.clone();
-        self.runtime.spawn(async move {
-            if let Err(e) = client.pvput(&pvname, &value_str).await {
-                eprintln!("[pvput_nowait_async] {pvname} error: {e}");
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            match tokio::time::timeout(Duration::from_secs(5), client.pvput(&pvname, &value_str))
+                .await
+            {
+                Ok(Ok(())) => Ok(true),
+                Ok(Err(e)) => {
+                    tracing::warn!(target: "ophyd_epicsrs::pvput_nowait", pv = %pvname, "put failed: {e}");
+                    Ok(false)
+                }
+                Err(_) => {
+                    tracing::warn!(target: "ophyd_epicsrs::pvput_nowait", pv = %pvname, "timed out (5s)");
+                    Ok(false)
+                }
             }
-        });
-        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(true) })
+        })
     }
 
     /// Async: typed put for structured PVA targets (e.g. NTTable).
@@ -723,10 +765,10 @@ impl EpicsRsPvaPV {
         })
     }
 
-    /// Async: fire-and-forget typed put. Same shape as
-    /// `put_pv_field_async` but the PVA pvput is spawned and the
-    /// Python awaitable resolves to True immediately. Use for busy
-    /// records where waiting for ack causes deadlock.
+    /// Async: short-bounded typed put for `wait=False` semantics.
+    /// Same trade-off as `put_nowait_async`: 5 s bounded wait so the
+    /// caller sees the real outcome instead of having errors silently
+    /// swallowed.
     #[pyo3(signature = (value, dtype_hints=None, struct_id=""))]
     fn put_pv_field_nowait_async<'py>(
         &self,
@@ -740,12 +782,24 @@ impl EpicsRsPvaPV {
         let client = self.client.clone();
         let name = self.pvname.clone();
         let pvname = name.clone();
-        self.runtime.spawn(async move {
-            if let Err(e) = client.pvput_pv_field(&pvname, &field).await {
-                eprintln!("[pvput_pv_field_nowait_async] {pvname} error: {e}");
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                client.pvput_pv_field(&pvname, &field),
+            )
+            .await
+            {
+                Ok(Ok(())) => Ok(true),
+                Ok(Err(e)) => {
+                    tracing::warn!(target: "ophyd_epicsrs::pvput_pv_field_nowait", pv = %pvname, "put failed: {e}");
+                    Ok(false)
+                }
+                Err(_) => {
+                    tracing::warn!(target: "ophyd_epicsrs::pvput_pv_field_nowait", pv = %pvname, "timed out (5s)");
+                    Ok(false)
+                }
             }
-        });
-        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(true) })
+        })
     }
 
     fn __repr__(&self) -> String {

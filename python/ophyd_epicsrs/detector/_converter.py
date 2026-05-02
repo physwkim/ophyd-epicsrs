@@ -251,11 +251,14 @@ class _EnumConverter(Converter):
         return raw
 
     def to_wire(self, value):
-        """Return an integer index when possible, falling back to label.
+        """Return an integer index when possible.
 
         CA put expects ``EpicsValue::Enum(u16)`` (or a numeric string),
-        not the enum label, so we resolve label → index using the cached
-        ``enum_strs``. PVA pvput accepts either form (server parses).
+        not the enum label. We resolve label → index using the cached
+        ``enum_strs``. If the cache is empty (connect-time metadata
+        fetch failed silently), we raise instead of sending the label
+        on the wire — CA's py_to_epics_value would surface a cryptic
+        TypeError, so fail loud here with context the user can act on.
         """
         if value is None:
             return None
@@ -267,12 +270,21 @@ class _EnumConverter(Converter):
             label = value.value
         else:
             label = str(value)
-        if self._cached_strs:
-            try:
-                return self._cached_strs.index(label)
-            except ValueError:
-                pass
-        return label
+        if not self._cached_strs:
+            raise RuntimeError(
+                f"enum_strs cache empty for {self.enum_cls.__name__}: "
+                f"connect-time metadata read did not complete. Cannot "
+                f"resolve label {label!r} to an integer index. Pass an "
+                f"int directly, or ensure the IOC responds during connect()."
+            )
+        try:
+            return self._cached_strs.index(label)
+        except ValueError as exc:
+            raise ValueError(
+                f"label {label!r} is not a valid choice for "
+                f"{self.enum_cls.__name__}; IOC choices are "
+                f"{self._cached_strs!r}"
+            ) from exc
 
     def datakey_dtype(self, _value):
         return "string", [], "|S40"

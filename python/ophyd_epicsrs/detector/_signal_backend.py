@@ -193,18 +193,25 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
         if not ok:
             raise RuntimeError(f"put to {self.source('', read=False)} failed")
 
+    # Generous backend-level timeout — asyncio.wait_for at the Signal
+    # layer is the user-facing gate. We pass a long timeout here so the
+    # Rust call does NOT silently return None / time out under the
+    # asyncio wait_for; either the IOC responds, asyncio cancels, or
+    # the backend raises (now never returns None).
+    _GET_TIMEOUT = 60.0
+
     async def get_value(self) -> SignalDatatypeT:
-        raw = await self._read_pv_native.get_value_async()
+        raw = await self._read_pv_native.get_value_async(timeout=self._GET_TIMEOUT)
         return self._converter.to_python(raw)
 
     async def get_setpoint(self) -> SignalDatatypeT:
-        raw = await self._write_pv_native.get_value_async()
+        raw = await self._write_pv_native.get_value_async(timeout=self._GET_TIMEOUT)
         return self._converter.to_python(raw)
 
     async def get_reading(self) -> Reading[SignalDatatypeT]:
-        md = await self._read_pv_native.get_reading_async(form="time")
-        if md is None:
-            raise RuntimeError(f"could not read {self.source('', read=True)}")
+        md = await self._read_pv_native.get_reading_async(
+            timeout=self._GET_TIMEOUT, form="time"
+        )
         severity = md.get("severity", 0)
         return {
             "value": self._converter.to_python(md["value"], md),
@@ -213,9 +220,9 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
         }
 
     async def get_datakey(self, source: str) -> DataKey:
-        md = await self._read_pv_native.get_reading_async(form="ctrl")
-        if md is None:
-            raise RuntimeError(f"could not read datakey for {source}")
+        md = await self._read_pv_native.get_reading_async(
+            timeout=self._GET_TIMEOUT, form="ctrl"
+        )
         # Apply the converter so dtype reflects the user-requested type
         # (e.g. requesting `int` on a DBR_DOUBLE PV records as integer).
         typed_value = self._converter.to_python(md["value"], md)

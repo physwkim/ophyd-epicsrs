@@ -145,6 +145,12 @@ fn struct_field_string(s: &PvStructure, name: &str) -> Option<String> {
     }
 }
 
+/// Public alias used by pva.rs to give get_value_async / monitor parity
+/// for NTEnum PVs (both surface as int index, not {index, choices} dict).
+pub(crate) fn try_extract_ntenum(s: &PvStructure) -> Option<(i32, Vec<String>)> {
+    extract_ntenum(s)
+}
+
 /// Return the NTEnum value field as (index, choices) if `value` is an
 /// `enum_t` substructure, or None otherwise.
 fn extract_ntenum(s: &PvStructure) -> Option<(i32, Vec<String>)> {

@@ -12,7 +12,6 @@ import asyncio
 from enum import Enum
 from typing import Any
 
-import numpy as np
 from bluesky.protocols import Reading
 from event_model import DataKey
 from ophyd_async.core import (
@@ -26,6 +25,8 @@ from ophyd_epicsrs._native import (
     EpicsRsContext,
     EpicsRsPvaContext,
 )
+
+from ._converter import Converter, make_converter
 
 
 class EpicsRsProtocol(Enum):
@@ -55,23 +56,6 @@ def _get_pva_context() -> EpicsRsPvaContext:
     return _pva_context
 
 
-def _datakey_dtype_for_value(value: Any) -> tuple[str, list[int], str]:
-    """Return ``(dtype, shape, dtype_numpy)`` for a Python value."""
-    if isinstance(value, np.ndarray):
-        return "array", list(value.shape), value.dtype.str
-    if isinstance(value, (list, tuple)):
-        arr = np.asarray(value)
-        return "array", list(arr.shape), arr.dtype.str
-    if isinstance(value, bool):
-        return "boolean", [], "|b1"
-    if isinstance(value, int):
-        return "integer", [], np.dtype(np.int64).str
-    if isinstance(value, float):
-        return "number", [], np.dtype(np.float64).str
-    # str or anything else
-    return "string", [], "|S40"
-
-
 class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
     """ophyd-async backend over epics-rs (CA + PVA)."""
 
@@ -90,6 +74,7 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
         else:
             self._write_pv_native = self._make_native_pv(write_pv)
         self._monitor_callback: Callback | None = None
+        self._converter: Converter = make_converter(datatype)
         super().__init__(datatype, read_pv, write_pv, options)
 
     def _make_native_pv(self, pv_name: str):
@@ -115,28 +100,42 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
             ok_w = ok_r
         if not (ok_r and ok_w):
             raise NotConnectedError(self.source("", read=True))
+        # Pull initial metadata so the converter can cache enum_strs etc.
+        # Failure here is not fatal — get_value works without it for non-enum types.
+        try:
+            md = await self._read_pv_native.get_reading_async(
+                timeout=min(timeout, 2.0), form="ctrl"
+            )
+            if md is not None:
+                self._converter.update_metadata(md)
+        except Exception:  # noqa: BLE001 — best-effort cache populate
+            pass
 
     async def put(self, value: SignalDatatypeT | None):
         if value is None:
-            value = await self._read_pv_native.get_value_async()
-        ok = await self._write_pv_native.put_async(value)
+            raw = await self._read_pv_native.get_value_async()
+            wire = self._converter.to_wire(self._converter.to_python(raw))
+        else:
+            wire = self._converter.to_wire(value)
+        ok = await self._write_pv_native.put_async(wire)
         if not ok:
             raise RuntimeError(f"put to {self.source('', read=False)} failed")
 
     async def get_value(self) -> SignalDatatypeT:
-        return await self._read_pv_native.get_value_async()
+        raw = await self._read_pv_native.get_value_async()
+        return self._converter.to_python(raw)
 
     async def get_setpoint(self) -> SignalDatatypeT:
-        return await self._write_pv_native.get_value_async()
+        raw = await self._write_pv_native.get_value_async()
+        return self._converter.to_python(raw)
 
     async def get_reading(self) -> Reading[SignalDatatypeT]:
         md = await self._read_pv_native.get_reading_async(form="time")
         if md is None:
             raise RuntimeError(f"could not read {self.source('', read=True)}")
-        # bluesky Reading: value, timestamp, alarm_severity (-1 for invalid)
         severity = md.get("severity", 0)
         return {
-            "value": md["value"],
+            "value": self._converter.to_python(md["value"], md),
             "timestamp": md.get("timestamp", 0.0),
             "alarm_severity": -1 if severity > 2 else severity,
         }
@@ -145,8 +144,10 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
         md = await self._read_pv_native.get_reading_async(form="ctrl")
         if md is None:
             raise RuntimeError(f"could not read datakey for {source}")
-        value = md["value"]
-        dtype, shape, dtype_numpy = _datakey_dtype_for_value(value)
+        # Apply the converter so dtype reflects the user-requested type
+        # (e.g. requesting `int` on a DBR_DOUBLE PV records as integer).
+        typed_value = self._converter.to_python(md["value"], md)
+        dtype, shape, dtype_numpy = self._converter.datakey_dtype(typed_value)
         datakey: DataKey = {
             "source": source,
             "dtype": dtype,
@@ -159,8 +160,6 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
             datakey["precision"] = md["precision"]
         if "enum_strs" in md:
             datakey["choices"] = list(md["enum_strs"])
-        # Display limits (PVA NTScalar `display.limitLow/High`,
-        # CA snapshot lower/upper_disp_limit)
         limits: dict[str, dict[str, Any]] = {}
         for source_lo, source_hi, target in (
             ("lower_disp_limit", "upper_disp_limit", "display"),
@@ -190,11 +189,12 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
             )
         self._monitor_callback = callback
 
-        # Native callback fires with kwargs (pyepics-shaped).  Wrap into Reading.
+        converter = self._converter
+
         def _wrapped(**kwargs):
             severity = kwargs.get("severity", 0)
             reading: Reading = {
-                "value": kwargs.get("value"),
+                "value": converter.to_python(kwargs.get("value"), kwargs),
                 "timestamp": kwargs.get("timestamp", 0.0),
                 "alarm_severity": -1 if severity > 2 else severity,
             }

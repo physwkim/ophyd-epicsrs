@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.6.3 (2026-05-03)
+
+### Bug fixes
+
+- **Shim's `pvname` now preserves the `pva://` / `ca://` prefix** —
+  `get_pv("pva://NAME")` used to construct `EpicsRsShimPV` with the
+  stripped bare name as its `pvname`. ophyd indexes per-PV state
+  (`_received_first_metadata`, `_signals`) by the pvname string ophyd
+  was originally handed; the moment the connection callback fires for
+  a `pva://`-prefixed Signal, that lookup raised `KeyError`. Existing
+  CA-only code is unaffected because no prefix means no name change.
+  Caught by a fresh integration test against the mini-beamline IOC.
+
+### Tests
+
+- New live integration suite (`tests/integration/test_mini_beamline.py`,
+  15 tests) running against the `mini-beamline` IOC from
+  `epics-rs/examples/mini-beamline`. Covers CA + PVA × native + ophyd
+  (sync) + ophyd-async (asyncio) frontends, plus `bulk_caget` timing,
+  motor↔detector CP-link contrast, and an areaDetector
+  Acquire/ArrayCounter cycle. The suite skips itself if the IOC is
+  not reachable, so it is safe to run in dev environments without
+  one.
+
+### CI
+
+- New `integration.yml` workflow: clones epics-rs, builds the
+  mini-beamline IOC, starts it on loopback, runs the integration
+  suite, then tears it down. Triggers on push to `main`, a 05:17 UTC
+  nightly cron, and manual dispatch — PRs do *not* trigger it
+  because the cold cargo build is ~5 min. `~/.cargo/registry` and
+  `epics-rs/target/` are cached on `epics-rs/Cargo.lock`. IOC log is
+  uploaded as an artifact on failure.
+
+### Docs
+
+- README: rephrased the NTNDArray paragraph to describe what the PVA
+  backend does and does not cover today, without overstating the gap
+  versus aioca + p4p (ophyd-async's `StandardDetector` pattern also
+  doesn't pull NTNDArray frames into Python).
+
 ## v0.6.2 (2026-05-03)
 
 ### Breaking

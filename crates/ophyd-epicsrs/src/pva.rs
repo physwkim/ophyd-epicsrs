@@ -80,6 +80,9 @@ pub struct EpicsRsPvaPV {
     /// clear_monitors so an in-flight subscribe does not later try to
     /// re-acquire the GIL after Python has finalized.
     monitor_setup_task: Mutex<Option<JoinHandle<()>>>,
+    /// JoinHandle for set_access_callback's spawned probe task. Same
+    /// teardown race as monitor_setup_task — aborted by disconnect.
+    access_setup_task: Mutex<Option<JoinHandle<()>>>,
     /// Python dispatch thread for monitor callbacks.
     dispatch_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Sender to dispatch thread; None = no monitor active.
@@ -102,6 +105,7 @@ impl EpicsRsPvaPV {
             pvname,
             monitor_handle: Arc::new(Mutex::new(None)),
             monitor_setup_task: Mutex::new(None),
+            access_setup_task: Mutex::new(None),
             dispatch_thread: Mutex::new(None),
             monitor_tx: Arc::new(Mutex::new(None)),
             py_monitor_callback: Arc::new(Mutex::new(None)),
@@ -411,17 +415,31 @@ impl EpicsRsPvaPV {
 
     /// Access rights callback — PVA does not surface separate access
     /// rights, so we fire (true, true) once after connection.
+    /// JoinHandle is stored in access_setup_task and aborted by
+    /// disconnect() so a slow pvconnect does not try to call back into
+    /// Python after the interpreter (or this PV) has been torn down.
     fn set_access_callback(&self, py: Python<'_>, callback: PyObject) {
         let cb = callback;
-        // Fire a fast best-effort on background task.
         let pvname = self.pvname.clone();
         let client = self.client.clone();
-        self.runtime.spawn(async move {
+        let task = self.runtime.spawn(async move {
             let _ = client.pvconnect(&pvname).await;
+            // Skip with_gil entirely if Python has been finalized — we
+            // can't peek at interpreter state, but acquiring the GIL on
+            // the spawned task path is what panics, so guard the rare
+            // case where the task survives clear/disconnect by deferring
+            // to the abort signal at task level (handled in disconnect).
             Python::with_gil(|py| {
                 let _ = cb.call1(py, (true, true));
             });
         });
+        // Replace any previous access task and abort it — re-registering
+        // the access callback should not leave an orphaned spawn that may
+        // later try to fire into a now-stale callback.
+        let prev = std::mem::replace(&mut *self.access_setup_task.lock(), Some(task));
+        if let Some(p) = prev {
+            p.abort();
+        }
         let _ = py;
     }
 
@@ -443,7 +461,12 @@ impl EpicsRsPvaPV {
     fn disconnect(&self) {
         self.clear_monitors();
         *self.connection_callback.lock() = None;
+        // Abort spawned probe tasks to prevent post-finalize Python::with_gil
+        // panics. Same pattern as monitor_setup_task.
         if let Some(handle) = self.connection_task.lock().take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.access_setup_task.lock().take() {
             handle.abort();
         }
         *self.connected.lock() = false;
@@ -469,6 +492,20 @@ impl EpicsRsPvaPV {
             *connected_ref.lock() = ok;
             Ok(ok)
         })
+    }
+
+    /// Async no-op for PVA — provided for symmetry with EpicsRsPV so
+    /// callers (e.g. EpicsRsSignalBackend.connect) can invoke the same
+    /// method on both protocol wrappers. PVA put goes through the
+    /// string-form pvput which has no native-type cache to populate.
+    #[pyo3(signature = (timeout=2.0))]
+    fn cache_native_type_async<'py>(
+        &self,
+        py: Python<'py>,
+        timeout: f64,
+    ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
+        let _ = timeout;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(true) })
     }
 
     /// Async: read the PV value (NTScalar value field, or whole PvField).

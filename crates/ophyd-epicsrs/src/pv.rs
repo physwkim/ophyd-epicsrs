@@ -41,7 +41,8 @@ pub struct EpicsRsPV {
     pub(crate) channel: Arc<CaChannel>,
     #[pyo3(get)]
     pub(crate) pvname: String,
-    native_type: Mutex<Option<DbFieldType>>,
+    /// Arc so cache_native_type_async's spawned task can share the slot.
+    native_type: Arc<Mutex<Option<DbFieldType>>>,
     monitor_task: Mutex<Option<JoinHandle<()>>>,
     py_monitor_callback: Arc<Mutex<Option<PyObject>>>,
     connection_callback: Arc<Mutex<Option<PyObject>>>,
@@ -100,7 +101,7 @@ impl EpicsRsPV {
             runtime,
             channel: ch,
             pvname,
-            native_type: Mutex::new(None),
+            native_type: Arc::new(Mutex::new(None)),
             monitor_task: Mutex::new(None),
             py_monitor_callback: Arc::new(Mutex::new(None)),
             connection_callback: Arc::new(Mutex::new(None)),
@@ -673,6 +674,38 @@ impl EpicsRsPV {
         let dur = Duration::from_secs_f64(timeout);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             Ok(channel.wait_connected(dur).await.is_ok())
+        })
+    }
+
+    /// Async: populate the cached native_type by reading the channel's
+    /// metadata via `CaChannel::info()` — a coordinator query that does
+    /// NOT issue a CA read. Returns True on success, False on timeout.
+    ///
+    /// Used by SignalBackend.connect() so subsequent put_nowait_async
+    /// calls do not have to do a synchronous pre-read to discover the
+    /// PV's DbFieldType. Critical for write-only PVs (where reads fail)
+    /// and for honoring the no-wait semantics on busy records.
+    #[pyo3(signature = (timeout=2.0))]
+    fn cache_native_type_async<'py>(
+        &self,
+        py: Python<'py>,
+        timeout: f64,
+    ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
+        let channel = self.channel.clone();
+        let dur = Duration::from_secs_f64(timeout);
+        let cache = self.native_type.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            // Skip if already cached.
+            if cache.lock().is_some() {
+                return Ok(true);
+            }
+            match tokio::time::timeout(dur, channel.info()).await {
+                Ok(Ok(info)) => {
+                    *cache.lock() = Some(info.native_type);
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
         })
     }
 

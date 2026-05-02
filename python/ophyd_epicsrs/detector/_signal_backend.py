@@ -103,6 +103,17 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
             ok_w = ok_r
         if not (ok_r and ok_w):
             raise NotConnectedError(self.source("", read=True))
+
+        # Populate native_type for the WRITE PV via channel.info() (a
+        # coordinator query — no CA read).  Without this, the first
+        # put_nowait_async call would do a 5s blocking pre-read to
+        # discover the DbFieldType, defeating wait=False semantics on
+        # busy records and failing entirely on write-only PVs.  PVA's
+        # implementation is a no-op (string-form pvput needs no cache).
+        await self._write_pv_native.cache_native_type_async(
+            timeout=min(timeout, 2.0)
+        )
+
         # Pull initial metadata so the converter can cache enum_strs,
         # Table column types, etc. Transient I/O errors here are OK
         # (we just degrade to runtime fetch later), but if metadata IS

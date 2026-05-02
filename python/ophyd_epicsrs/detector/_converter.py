@@ -207,6 +207,17 @@ class _EnumConverter(Converter):
             return None
         if isinstance(raw, self.enum_cls):
             return raw
+        # PVA NTEnum value substructure: {"index": int, "choices": [str]}
+        # surfaces as a Python dict from get_value_async / pvfield_to_py.
+        if isinstance(raw, dict) and "index" in raw:
+            idx = raw.get("index")
+            choices = raw.get("choices") or self._cached_strs
+            if isinstance(idx, (int, np.integer)) and 0 <= int(idx) < len(choices):
+                raw = choices[int(idx)]
+            elif isinstance(idx, (int, np.integer)):
+                return int(idx)
+            else:
+                return raw
         if isinstance(raw, (int, np.integer)):
             strs = self._strs(metadata)
             if 0 <= int(raw) < len(strs):
@@ -229,13 +240,28 @@ class _EnumConverter(Converter):
         return raw
 
     def to_wire(self, value):
+        """Return an integer index when possible, falling back to label.
+
+        CA put expects ``EpicsValue::Enum(u16)`` (or a numeric string),
+        not the enum label, so we resolve label → index using the cached
+        ``enum_strs``. PVA pvput accepts either form (server parses).
+        """
         if value is None:
             return None
+        if isinstance(value, (int, np.integer)):
+            return int(value)
         if isinstance(value, self.enum_cls):
-            return value.value
-        if isinstance(value, Enum):
-            return value.value
-        return str(value)
+            label = value.value
+        elif isinstance(value, Enum):
+            label = value.value
+        else:
+            label = str(value)
+        if self._cached_strs:
+            try:
+                return self._cached_strs.index(label)
+            except ValueError:
+                pass
+        return label
 
     def datakey_dtype(self, _value):
         return "string", [], "|S40"

@@ -1,8 +1,8 @@
 # ophyd-epicsrs
 
-Rust EPICS backend for [ophyd](https://github.com/bluesky/ophyd) — supports both Channel Access (CA) and pvAccess (PVA).
+Rust EPICS backend for [ophyd](https://github.com/bluesky/ophyd) and [ophyd-async](https://github.com/bluesky/ophyd-async) — supports both Channel Access (CA) and pvAccess (PVA).
 
-Replaces pyepics (`Python → ctypes → libca.so`) with [epics-rs](https://github.com/epics-rs/epics-rs) (`Python → PyO3 → Rust client`), releasing the GIL during all network I/O. CA and PVA share a single tokio runtime — no separate `aioca` + `p4p` binding stacks.
+Replaces pyepics (`Python → ctypes → libca.so`) with [epics-rs](https://github.com/epics-rs/epics-rs) (`Python → PyO3 → Rust client`), releasing the GIL during all network I/O. CA and PVA share a single tokio runtime — no separate `aioca` + `p4p` binding stacks. Sync (legacy ophyd) and async (ophyd-async, asyncio) call paths share the same runtime, channel cache, and monitor subscriptions.
 
 ## Installation
 
@@ -54,7 +54,9 @@ sig_pva = ophyd.EpicsSignal("pva://IOC:bar")
 ```
 
 The PVA backend supports the standard NT (Normative Type) shapes:
-NTScalar, NTScalarArray, NTEnum. The NTScalar `value`, `alarm.severity`,
+NTScalar, NTScalarArray, NTEnum, and NTTable (with typed `PvField`
+columns derived from `Table.__annotations__` so dtype information is
+preserved through the wire format). The NTScalar `value`, `alarm.severity`,
 `alarm.status`, `timeStamp.{secondsPastEpoch, nanoseconds}`, and
 `display.{units, precision, limitLow, limitHigh}` fields are projected
 onto the ophyd metadata dict so existing Signals/Devices receive the
@@ -62,6 +64,42 @@ same keys they expect from CA.
 
 NTNDArray (areaDetector image streams over PVA) is **not yet supported**;
 use the CA backend for areaDetector image PVs until the next release.
+
+## ophyd-async support (`ophyd_epicsrs.detector`)
+
+For [ophyd-async](https://github.com/bluesky/ophyd-async)-based devices,
+the package ships factory functions that return standard ophyd-async
+`SignalR` / `SignalRW` / `SignalW` / `SignalX` instances backed by
+epics-rs. No fork required — they drop straight into `StandardDetector`,
+`StandardReadable`, plan stubs, etc.
+
+```python
+from ophyd_epicsrs.detector import (
+    epicsrs_signal_r,
+    epicsrs_signal_rw,
+    epicsrs_signal_rw_rbv,
+    epicsrs_signal_w,
+    epicsrs_signal_x,
+)
+
+# Bare name and ca://… → CA backend; pva://… → PVA backend.
+sig_ca  = epicsrs_signal_rw(float, "IOC:motor.RBV", "IOC:motor.VAL")
+sig_pva = epicsrs_signal_rw(float, "pva://IOC:nt:scalar")
+
+await sig_pva.connect()
+await sig_pva.set(0.5)
+print(await sig_pva.get_value())
+```
+
+Under the hood, `EpicsRsSignalBackend` implements ophyd-async's
+`SignalBackend[T]` ABC and routes by URL prefix to the appropriate
+native client. The package includes datatype-aware converters covering
+the full ophyd-async type surface: `bool`, `int`, `float`, `str`,
+`Enum` / `StrictEnum` / `SubsetEnum` / `SupersetEnum`, `npt.NDArray`,
+`Sequence`, and `Table`. IOC schema is validated against the requested
+datatype at connect time using PVA `pvinfo`, so type mismatches surface
+as a clear error during `connect()` rather than a silent corruption at
+first read.
 
 ## Async surface
 
@@ -104,6 +142,10 @@ Available async methods on both CA and PVA wrappers:
 - `get_value_async(timeout) -> Any`
 - `get_reading_async(timeout, form) -> dict | None`
 - `put_async(value, timeout) -> bool`
+- `connect_and_prefetch_async(timeout) -> None` — single round-trip
+  connect + metadata fetch
+- `get_field_desc_async(timeout) -> dict | None` — PVA `pvinfo`
+  introspection (CA: returns `None`)
 
 The sync surface (`wait_for_connection`, `get_with_metadata`, `put`, etc.)
 remains unchanged — existing ophyd code works exactly as before.
@@ -247,36 +289,88 @@ The speedup scales with PV count — a 200-PV areaDetector Device initializes in
 
 `bulk_caget` reads multiple PVs concurrently using tokio `join_all`, completing in a single network round-trip with the GIL released. See the [Parallel PV Read](#parallel-pv-read-bulk_caget) section above.
 
+## Reliability
+
+Spawned tokio tasks (monitor delivery, connection-event watchers,
+pyo3-log forwarding) may execute callbacks into Python while the
+interpreter is being finalized — typically during pytest fixture
+teardown or normal process exit. A `Python::with_gil` call in that
+window panics; in a spawned task that panic would normally crash the
+process.
+
+Every such call site is wrapped with `safe_warn!` / `safe_call!` /
+`safe_call_or!` macros that `catch_unwind` the panic, increment a
+process-wide counter, and write a one-line stderr notice on the *first*
+caught panic. The counter is exposed for telemetry:
+
+```python
+from ophyd_epicsrs import caught_panic_count
+print(caught_panic_count())  # 0 in normal operation
+```
+
+`panic = "unwind"` is enforced at compile time via a
+`#[cfg(panic = "abort")] compile_error!` so a downstream `Cargo.toml`
+cannot silently disarm the guards.
+
 ## Architecture
 
 ```
-ophyd (Python)
-  └── _epicsrs_shim.py          ophyd control layer interface
-        └── ophyd_epicsrs        this package
-              └── _native.so     PyO3 bindings
-                    └── epics-rs pure Rust CA/PVA client (no libca.so)
+ophyd (sync)              ophyd-async (asyncio)
+  │                         │
+  └── ophyd.cl              └── ophyd_epicsrs.detector
+        │                         │ (EpicsRsSignalBackend)
+        └── ophyd_epicsrs._shim   │
+              │                   │
+              └─→ ophyd_epicsrs._native (PyO3 bindings) ←─┘
+                    │
+                    ├── EpicsRsContext / EpicsRsPV       (CA)
+                    └── EpicsRsPvaContext / EpicsRsPvaPV (PVA)
+                                │
+                                └── epics-rs (pure Rust, no libca.so)
+                                      └── shared tokio runtime
 ```
 
 ### GIL behavior
 
 | Operation | GIL |
 |-----------|-----|
-| CA get / put | **released** — `py.allow_threads()` → tokio async |
-| CA monitor receive | **released** — tokio background task |
+| CA / PVA get / put | **released** — `py.allow_threads()` → tokio async |
+| Monitor receive | **released** — tokio background task |
 | Monitor callback → Python | **held** — dispatch thread |
 | Connection wait | **released** — tokio async |
 | bulk_caget | **released** — tokio join_all |
+| `*_async` methods | **released** — `pyo3-async-runtimes` future |
 
 ### Key types
 
-- **`EpicsRsContext`** — Shared tokio runtime + CA client. One per session.
-- **`EpicsRsPV`** — PV channel wrapper with `wait_for_connection`, `get_with_metadata`, `put`, `add_monitor_callback`.
+- **`EpicsRsContext`** / **`EpicsRsPvaContext`** — Shared tokio runtime + CA / PVA client. One of each per session.
+- **`EpicsRsPV`** / **`EpicsRsPvaPV`** — PV channel wrappers. Sync surface (`wait_for_connection`, `get_with_metadata`, `put`, `add_monitor_callback`) plus `*_async` siblings.
+- **`ophyd_epicsrs.detector.EpicsRsSignalBackend`** — `ophyd-async` `SignalBackend` implementation; routes `pva://` / `ca://` / bare names to the appropriate native client and applies the datatype-aware converter for the requested ophyd-async type.
+
+## Logging
+
+Rust-side `tracing` events are bridged to Python's `logging` module via
+[`pyo3-log`](https://crates.io/crates/pyo3-log). Standard configuration
+applies:
+
+```python
+import logging
+logging.getLogger("ophyd_epicsrs.ca").setLevel(logging.WARN)
+logging.getLogger("ophyd_epicsrs.pva").setLevel(logging.DEBUG)
+```
+
+`pyo3-log` caches the level lookup for ~30 s. Call
+`ophyd_epicsrs.reset_log_cache()` after changing levels at runtime to
+force re-check on the next event.
 
 ## Requirements
 
-- Python >= 3.8
+- Python >= 3.10
 - ophyd >= 1.9 (vanilla PyPI — no fork required)
-- [epics-rs](https://github.com/epics-rs/epics-rs) (bundled at build time)
+- ophyd-async >= 0.16 (only required if you use `ophyd_epicsrs.detector`)
+- bluesky >= 1.13
+- [epics-rs](https://github.com/epics-rs/epics-rs) >= 0.13 (bundled at build time)
+- Rust toolchain >= 1.85 (build-time only)
 
 ## Related
 

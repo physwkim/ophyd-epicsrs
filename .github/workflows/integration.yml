@@ -93,10 +93,32 @@ jobs:
           EPICS_PVA_ADDR_LIST: 127.0.0.1
           EPICS_PVA_AUTO_ADDR_LIST: 'NO'
         run: |
-          # Run detached, capture logs for forensic inspection.
-          nohup ./target/release/mini_ioc examples/mini-beamline/ioc/st.cmd \
-            > /tmp/mini_ioc.log 2>&1 &
-          echo $! > /tmp/mini_ioc.pid
+          # `iocsh()` at the end of st.cmd reads from stdin. In CI we
+          # have no TTY, so without intervention the IOC sees EOF the
+          # moment iocsh tries to read — it exits right after the
+          # `CA server: UDP search on port 5064 ...` line and the
+          # readiness probe below times out at 30 s with no IOC to
+          # talk to. `nohup` only suppresses SIGHUP; it does NOT
+          # supply a stdin. `tail -f /dev/null | ...` pipes a stream
+          # that never ends so iocsh blocks instead of exiting.
+          tail -f /dev/null \
+            | ./target/release/mini_ioc examples/mini-beamline/ioc/st.cmd \
+              > /tmp/mini_ioc.log 2>&1 &
+          IOC_PID=$!
+          echo "$IOC_PID" > /tmp/mini_ioc.pid
+
+          # Quick liveness check: if the IOC died despite the stdin
+          # workaround (e.g. binary missing, port conflict, panic at
+          # init), surface that immediately rather than waiting out
+          # the 30 s probe timeout.
+          sleep 2
+          if ! kill -0 "$IOC_PID" 2>/dev/null; then
+            echo "::error::IOC process $IOC_PID exited within 2 s of launch"
+            echo "--- last 80 lines of /tmp/mini_ioc.log ---"
+            tail -80 /tmp/mini_ioc.log
+            exit 1
+          fi
+
           # Wait until the IOC is actually serving — poll mini:current
           # via our own native client, since that's what tests will use.
           # Hard cap at 30 s so a wedged IOC fails the job loudly

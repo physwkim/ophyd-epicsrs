@@ -1,0 +1,132 @@
+name: Integration
+
+# Run the live integration suite against a fresh build of the
+# mini-beamline IOC from epics-rs. Heavyweight (~5 min cold, ~1 min
+# warm with cargo cache) so this is gated on main pushes + a nightly
+# schedule, plus manual dispatch. PRs do not trigger this workflow —
+# the unit-test suite (release.yml) covers PR feedback.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 5 * * *'   # nightly 05:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mini-beamline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout ophyd-epicsrs
+        uses: actions/checkout@v4
+
+      - name: Checkout epics-rs (mini-beamline IOC source)
+        uses: actions/checkout@v4
+        with:
+          repository: epics-rs/epics-rs
+          path: epics-rs
+          # Track main HEAD; bump explicitly here if a regression in
+          # epics-rs main starts breaking us and we need to pin.
+          ref: main
+          fetch-depth: 1
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.85'
+
+      - name: Cache cargo registry + epics-rs target dir
+        uses: actions/cache@v4
+        with:
+          # Two caches share the same key family:
+          #  - the user-wide cargo registry (rarely changes)
+          #  - the epics-rs target/ (changes when epics-rs main moves)
+          # Lockfile-keyed so cache invalidates on dependency bumps.
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            epics-rs/target
+          key: epics-rs-mini-beamline-${{ runner.os }}-${{ hashFiles('epics-rs/Cargo.lock') }}
+          restore-keys: |
+            epics-rs-mini-beamline-${{ runner.os }}-
+
+      - name: Build mini-beamline IOC
+        working-directory: epics-rs
+        run: cargo build --release -p mini-beamline --features ioc
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install ophyd-epicsrs (editable, via maturin develop)
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip maturin
+          # Install runtime + test deps (pinned to whatever
+          # pyproject.toml declares). The ophyd-async detector tests
+          # need the optional 'test' extras.
+          pip install -e '.[test]'
+          maturin develop --release
+
+      - name: Start mini-beamline IOC in the background
+        working-directory: epics-rs
+        env:
+          # Make sure the IOC's own CA server doesn't pick up stray
+          # broadcast addresses from the runner (we want loopback only).
+          EPICS_CAS_INTF_ADDR_LIST: 127.0.0.1
+          EPICS_CAS_BEACON_ADDR_LIST: 127.0.0.1
+        run: |
+          # Run detached, capture logs for forensic inspection.
+          nohup ./target/release/mini_ioc examples/mini-beamline/ioc/st.cmd \
+            > /tmp/mini_ioc.log 2>&1 &
+          echo $! > /tmp/mini_ioc.pid
+          # Wait until the IOC is actually serving — poll mini:current
+          # via our own native client, since that's what tests will use.
+          # Hard cap at 30 s so a wedged IOC fails the job loudly
+          # rather than burning the timeout-minutes budget.
+          cd "${GITHUB_WORKSPACE}"
+          . .venv/bin/activate
+          python - <<'PY'
+          import time
+          from ophyd_epicsrs._native import EpicsRsContext
+          ctx = EpicsRsContext()
+          pv = ctx.create_pv('mini:current')
+          deadline = time.time() + 30
+          while time.time() < deadline:
+              if pv.wait_for_connection(timeout=2.0):
+                  print('IOC ready, mini:current =', pv.get_with_metadata(timeout=2.0)['value'])
+                  raise SystemExit(0)
+          raise SystemExit('IOC did not become ready within 30s')
+          PY
+
+      - name: Run integration tests
+        env:
+          EPICS_CA_ADDR_LIST: 127.0.0.1
+          EPICS_CA_AUTO_ADDR_LIST: NO
+          EPICS_PVA_ADDR_LIST: 127.0.0.1
+          EPICS_PVA_AUTO_ADDR_LIST: NO
+        run: |
+          . .venv/bin/activate
+          pytest tests/integration/ -v -s --tb=short
+
+      - name: Stop mini-beamline IOC
+        if: always()
+        run: |
+          if [ -f /tmp/mini_ioc.pid ]; then
+            kill "$(cat /tmp/mini_ioc.pid)" 2>/dev/null || true
+            sleep 1
+            kill -9 "$(cat /tmp/mini_ioc.pid)" 2>/dev/null || true
+          fi
+
+      - name: Upload IOC log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mini-ioc-log
+          path: /tmp/mini_ioc.log
+          if-no-files-found: ignore

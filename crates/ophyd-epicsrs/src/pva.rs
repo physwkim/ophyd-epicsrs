@@ -524,6 +524,30 @@ impl EpicsRsPvaPV {
         })
     }
 
+    /// Async: fire-and-forget pvput. PVA has no wire-level
+    /// fire-and-forget primitive (every PUT expects a PUT_RESPONSE),
+    /// so we spawn the operation and return immediately. Use for busy
+    /// records / acquire PVs where waiting for ack causes deadlock.
+    #[pyo3(signature = (value))]
+    fn put_nowait_async<'py>(
+        &self,
+        py: Python<'py>,
+        value: &Bound<'_, pyo3::PyAny>,
+    ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
+        let value_str = python_value_to_pvput_string(value)?;
+        let client = self.client.clone();
+        let name = self.pvname.clone();
+        // Spawn the put on the runtime so the future returned to Python
+        // resolves immediately. Errors are logged from the background task.
+        let pvname = name.clone();
+        self.runtime.spawn(async move {
+            if let Err(e) = client.pvput(&pvname, &value_str).await {
+                eprintln!("[pvput_nowait_async] {pvname} error: {e}");
+            }
+        });
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(true) })
+    }
+
     fn __repr__(&self) -> String {
         format!("EpicsRsPvaPV('{}')", self.pvname)
     }

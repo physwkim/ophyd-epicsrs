@@ -762,6 +762,55 @@ impl EpicsRsPV {
         })
     }
 
+    /// Async: fire-and-forget write (CA_PROTO_WRITE, no notify ack).
+    /// Mirrors the sync `put(value, wait=False)` path. Returns True
+    /// once the write request has been queued; does NOT wait for the
+    /// IOC to confirm. Use this for busy-record / acquire PVs where
+    /// `put_async` (which waits for write_notify) would deadlock.
+    #[pyo3(signature = (value))]
+    fn put_nowait_async<'py>(
+        &self,
+        py: Python<'py>,
+        value: &Bound<'_, pyo3::PyAny>,
+    ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
+        // Resolve native type once (sync) so we can convert the value.
+        let native = {
+            let cached = self.native_type.lock();
+            match *cached {
+                Some(t) => t,
+                None => {
+                    drop(cached);
+                    let channel = self.channel.clone();
+                    let snap = py.allow_threads(|| {
+                        self.spawn_wait(async move {
+                            tokio::time::timeout(Duration::from_secs(5), channel.get_with_metadata(DbrClass::Plain)).await
+                        })
+                    })?;
+                    match snap {
+                        Ok(Ok(s)) => {
+                            let t = s.value.dbr_type();
+                            *self.native_type.lock() = Some(t);
+                            t
+                        }
+                        _ => return Err(PyRuntimeError::new_err("cannot determine PV native type for put_nowait")),
+                    }
+                }
+            }
+        };
+        let epics_val = crate::convert::py_to_epics_value(value, native)?;
+        let channel = self.channel.clone();
+        let pvname = self.pvname.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            match channel.put_nowait(&epics_val).await {
+                Ok(()) => Ok(true),
+                Err(e) => {
+                    eprintln!("[put_nowait_async] {pvname} error: {e}");
+                    Ok(false)
+                }
+            }
+        })
+    }
+
     fn __repr__(&self) -> String {
         format!("EpicsRsPV('{}')", self.pvname)
     }

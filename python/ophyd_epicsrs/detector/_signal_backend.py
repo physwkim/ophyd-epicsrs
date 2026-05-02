@@ -121,7 +121,20 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
             wire = self._converter.to_wire(self._converter.to_python(raw))
         else:
             wire = self._converter.to_wire(value)
-        ok = await self._write_pv_native.put_async(wire)
+
+        # Honor EpicsOptions.wait — bool or callable.  When False, we use
+        # put_nowait_async (CA fire-and-forget / PVA spawn) so busy-record
+        # / acquire PVs don't deadlock waiting for write_notify ack.
+        wait_opt = self.options.wait
+        if callable(wait_opt):
+            wait = bool(wait_opt(value))
+        else:
+            wait = bool(wait_opt)
+
+        if wait:
+            ok = await self._write_pv_native.put_async(wire)
+        else:
+            ok = await self._write_pv_native.put_nowait_async(wire)
         if not ok:
             raise RuntimeError(f"put to {self.source('', read=False)} failed")
 

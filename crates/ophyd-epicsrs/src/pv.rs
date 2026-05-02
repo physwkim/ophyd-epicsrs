@@ -7,10 +7,10 @@ use pyo3::prelude::*;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
-use epics_rs::ca::client::CaChannel;
 use epics_rs::base::server::snapshot::{DbrClass, Snapshot};
-use epics_rs::base::types::EpicsValue;
 use epics_rs::base::types::DbFieldType;
+use epics_rs::base::types::EpicsValue;
+use epics_rs::ca::client::CaChannel;
 
 use crate::convert::{epics_value_to_py, py_to_epics_value, snapshot_to_pydict};
 
@@ -67,13 +67,16 @@ impl EpicsRsPV {
         let prefetch_ch = ch.clone();
         let prefetch_handle = runtime.spawn(async move {
             // Wait for connection (up to 30s)
-            if prefetch_ch.wait_connected(Duration::from_secs(30)).await.is_err() {
+            if prefetch_ch
+                .wait_connected(Duration::from_secs(30))
+                .await
+                .is_err()
+            {
                 return None;
             }
             // Channel info (coordinator query, not a CA read)
-            let info = match tokio::time::timeout(
-                Duration::from_secs(2), prefetch_ch.info()
-            ).await {
+            let info = match tokio::time::timeout(Duration::from_secs(2), prefetch_ch.info()).await
+            {
                 Ok(Ok(i)) => i,
                 _ => return None,
             };
@@ -81,8 +84,11 @@ impl EpicsRsPV {
             // Fetching CTRL upfront eliminates the race where describe() runs
             // before the lazy CTRL fetch completes (EpicsSignalRO after copy()).
             let snapshot = match tokio::time::timeout(
-                Duration::from_secs(2), prefetch_ch.get_with_metadata(DbrClass::Ctrl)
-            ).await {
+                Duration::from_secs(2),
+                prefetch_ch.get_with_metadata(DbrClass::Ctrl),
+            )
+            .await
+            {
                 Ok(Ok(s)) => s,
                 _ => return None,
             };
@@ -124,7 +130,8 @@ impl EpicsRsPV {
             let result = fut.await;
             let _ = tx.send(result);
         });
-        rx.recv().map_err(|_| PyRuntimeError::new_err("runtime task failed"))
+        rx.recv()
+            .map_err(|_| PyRuntimeError::new_err("runtime task failed"))
     }
 
     /// Best-effort injection of the current connection state for a newly
@@ -163,7 +170,8 @@ impl EpicsRsPV {
                     if let Some(cb) = &*guard {
                         let callback = cb.clone_ref(py);
                         drop(guard);
-                        let _ = callback.call1(py, (info.access_rights.read, info.access_rights.write));
+                        let _ =
+                            callback.call1(py, (info.access_rights.read, info.access_rights.write));
                     }
                 });
             }
@@ -178,20 +186,14 @@ impl EpicsRsPV {
         let channel = self.channel.clone();
         let dur = Duration::from_secs_f64(timeout);
         py.allow_threads(|| {
-            self.spawn_wait(async move {
-                channel.wait_connected(dur).await.is_ok()
-            })
+            self.spawn_wait(async move { channel.wait_connected(dur).await.is_ok() })
         })
     }
 
     /// Wait for the background prefetch (started at PV creation) to complete.
     /// Returns all metadata in a single dict, or falls back to synchronous fetch.
     #[pyo3(signature = (timeout=5.0))]
-    fn connect_and_prefetch(
-        &self,
-        py: Python<'_>,
-        timeout: f64,
-    ) -> PyResult<Option<PyObject>> {
+    fn connect_and_prefetch(&self, py: Python<'_>, timeout: f64) -> PyResult<Option<PyObject>> {
         let dur = Duration::from_secs_f64(timeout);
 
         // Take the background prefetch handle (if still pending)
@@ -199,9 +201,7 @@ impl EpicsRsPV {
         if let Some(handle) = handle {
             // Await the background task — just waiting, no new CA reads
             let result = py.allow_threads(|| {
-                self.spawn_wait(async move {
-                    tokio::time::timeout(dur, handle).await
-                })
+                self.spawn_wait(async move { tokio::time::timeout(dur, handle).await })
             })?;
             if let Ok(Ok(Some(prefetch))) = result {
                 *self.native_type.lock() = Some(prefetch.native_type);
@@ -250,9 +250,7 @@ impl EpicsRsPV {
     /// Get channel-level metadata without performing a CA read.
     fn get_channel_info(&self, py: Python<'_>) -> PyResult<Option<PyObject>> {
         let channel = self.channel.clone();
-        let result = py.allow_threads(|| {
-            self.spawn_wait(async move { channel.info().await })
-        })?;
+        let result = py.allow_threads(|| self.spawn_wait(async move { channel.info().await }))?;
         match result {
             Ok(info) => {
                 *self.native_type.lock() = Some(info.native_type);
@@ -288,9 +286,7 @@ impl EpicsRsPV {
             if let Some(handle) = handle {
                 let dur = Duration::from_secs_f64(timeout);
                 let result = py.allow_threads(|| {
-                    self.spawn_wait(async move {
-                        tokio::time::timeout(dur, handle).await
-                    })
+                    self.spawn_wait(async move { tokio::time::timeout(dur, handle).await })
                 })?;
                 if let Ok(Ok(Some(prefetch))) = result {
                     *self.native_type.lock() = Some(prefetch.native_type);
@@ -385,9 +381,9 @@ impl EpicsRsPV {
         if wait {
             // Blocking put — wait for write_notify response
             let result = py.allow_threads(|| {
-                self.spawn_wait(async move {
-                    tokio::time::timeout(dur, channel.put(&epics_val)).await
-                })
+                self.spawn_wait(
+                    async move { tokio::time::timeout(dur, channel.put(&epics_val)).await },
+                )
             })?;
             match result {
                 Ok(Ok(())) => {}
@@ -479,7 +475,8 @@ impl EpicsRsPV {
                     let _ = kwargs.set_item("value", epics_value_to_py(py, &snap.value));
 
                     // EPICS timestamp
-                    let ts = snap.timestamp
+                    let ts = snap
+                        .timestamp
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs_f64();
@@ -722,7 +719,9 @@ impl EpicsRsPV {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let result = tokio::time::timeout(dur, channel.get()).await;
             match result {
-                Ok(Ok((_dbr, val))) => Python::with_gil(|py| Ok(crate::convert::epics_value_to_py(py, &val))),
+                Ok(Ok((_dbr, val))) => {
+                    Python::with_gil(|py| Ok(crate::convert::epics_value_to_py(py, &val)))
+                }
                 _ => Python::with_gil(|py| Ok(py.None())),
             }
         })
@@ -746,7 +745,9 @@ impl EpicsRsPV {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let result = tokio::time::timeout(dur, channel.get_with_metadata(class)).await;
             match result {
-                Ok(Ok(snapshot)) => Python::with_gil(|py| Ok(crate::convert::snapshot_to_pydict(py, &snapshot))),
+                Ok(Ok(snapshot)) => {
+                    Python::with_gil(|py| Ok(crate::convert::snapshot_to_pydict(py, &snapshot)))
+                }
                 _ => Python::with_gil(|py| Ok(py.None())),
             }
         })
@@ -772,7 +773,8 @@ impl EpicsRsPV {
                     let dur = Duration::from_secs_f64(timeout.min(5.0));
                     let snap = py.allow_threads(|| {
                         self.spawn_wait(async move {
-                            tokio::time::timeout(dur, channel.get_with_metadata(DbrClass::Plain)).await
+                            tokio::time::timeout(dur, channel.get_with_metadata(DbrClass::Plain))
+                                .await
                         })
                     })?;
                     match snap {
@@ -781,7 +783,11 @@ impl EpicsRsPV {
                             *self.native_type.lock() = Some(t);
                             t
                         }
-                        _ => return Err(PyRuntimeError::new_err("cannot determine PV native type for put")),
+                        _ => {
+                            return Err(PyRuntimeError::new_err(
+                                "cannot determine PV native type for put",
+                            ));
+                        }
                     }
                 }
             }
@@ -816,7 +822,11 @@ impl EpicsRsPV {
                     let channel = self.channel.clone();
                     let snap = py.allow_threads(|| {
                         self.spawn_wait(async move {
-                            tokio::time::timeout(Duration::from_secs(5), channel.get_with_metadata(DbrClass::Plain)).await
+                            tokio::time::timeout(
+                                Duration::from_secs(5),
+                                channel.get_with_metadata(DbrClass::Plain),
+                            )
+                            .await
                         })
                     })?;
                     match snap {
@@ -825,7 +835,11 @@ impl EpicsRsPV {
                             *self.native_type.lock() = Some(t);
                             t
                         }
-                        _ => return Err(PyRuntimeError::new_err("cannot determine PV native type for put_nowait")),
+                        _ => {
+                            return Err(PyRuntimeError::new_err(
+                                "cannot determine PV native type for put_nowait",
+                            ));
+                        }
                     }
                 }
             }

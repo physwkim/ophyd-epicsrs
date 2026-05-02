@@ -42,9 +42,7 @@ impl EpicsRsContext {
             });
             rx.recv()
                 .map_err(|_| PyRuntimeError::new_err("runtime channel closed"))?
-                .map_err(|e| {
-                    PyRuntimeError::new_err(format!("failed to create CA client: {e}"))
-                })?
+                .map_err(|e| PyRuntimeError::new_err(format!("failed to create CA client: {e}")))?
         };
 
         Ok(Self {
@@ -82,12 +80,7 @@ impl EpicsRsContext {
     ///     data = ctx.bulk_caget(["PV:enc_wf", "PV:I0_wf", "PV:ROI1", ...])
     ///     # All PVs read in parallel — ~1 round-trip time instead of N
     #[pyo3(signature = (pvnames, timeout=5.0))]
-    fn bulk_caget(
-        &self,
-        py: Python<'_>,
-        pvnames: Vec<String>,
-        timeout: f64,
-    ) -> PyResult<PyObject> {
+    fn bulk_caget(&self, py: Python<'_>, pvnames: Vec<String>, timeout: f64) -> PyResult<PyObject> {
         let client = self.client.clone();
         let dur = Duration::from_secs_f64(timeout);
 
@@ -164,7 +157,8 @@ impl EpicsRsContext {
             Arc<CaChannel>,
             Option<tokio::task::JoinHandle<Option<PrefetchResult>>>,
         );
-        let tasks: Vec<PvTask> = pvs.iter()
+        let tasks: Vec<PvTask> = pvs
+            .iter()
             .map(|pv| {
                 let pv_ref = pv.borrow(py);
                 (
@@ -187,13 +181,11 @@ impl EpicsRsContext {
                 Option<tokio::task::JoinHandle<Option<PrefetchResult>>>,
                 tokio::task::JoinHandle<bool>,
             );
-            let mut connect_handles: Vec<ConnectHandle> =
-                Vec::with_capacity(tasks.len());
+            let mut connect_handles: Vec<ConnectHandle> = Vec::with_capacity(tasks.len());
             for (pvname, ch, prefetch) in tasks {
                 let ch_clone = ch.clone();
-                let handle = tokio::spawn(async move {
-                    ch_clone.wait_connected(dur).await.is_ok()
-                });
+                let handle =
+                    tokio::spawn(async move { ch_clone.wait_connected(dur).await.is_ok() });
                 connect_handles.push((pvname, ch, prefetch, handle));
             }
 

@@ -15,27 +15,16 @@ pub fn epics_value_to_py(py: Python<'_>, val: &EpicsValue) -> PyObject {
         EpicsValue::Char(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
         EpicsValue::Enum(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
         EpicsValue::String(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
-        EpicsValue::DoubleArray(v) => {
-            PyList::new(py, v.iter()).unwrap().into_any().unbind()
-        }
-        EpicsValue::FloatArray(v) => {
-            PyList::new(py, v.iter().map(|x| *x as f64)).unwrap().into_any().unbind()
-        }
-        EpicsValue::LongArray(v) => {
-            PyList::new(py, v.iter()).unwrap().into_any().unbind()
-        }
-        EpicsValue::ShortArray(v) => {
-            PyList::new(py, v.iter()).unwrap().into_any().unbind()
-        }
-        EpicsValue::CharArray(v) => {
-            PyList::new(py, v.iter()).unwrap().into_any().unbind()
-        }
-        EpicsValue::EnumArray(v) => {
-            PyList::new(py, v.iter()).unwrap().into_any().unbind()
-        }
-        EpicsValue::StringArray(v) => {
-            PyList::new(py, v.iter()).unwrap().into_any().unbind()
-        }
+        EpicsValue::DoubleArray(v) => PyList::new(py, v.iter()).unwrap().into_any().unbind(),
+        EpicsValue::FloatArray(v) => PyList::new(py, v.iter().map(|x| *x as f64))
+            .unwrap()
+            .into_any()
+            .unbind(),
+        EpicsValue::LongArray(v) => PyList::new(py, v.iter()).unwrap().into_any().unbind(),
+        EpicsValue::ShortArray(v) => PyList::new(py, v.iter()).unwrap().into_any().unbind(),
+        EpicsValue::CharArray(v) => PyList::new(py, v.iter()).unwrap().into_any().unbind(),
+        EpicsValue::EnumArray(v) => PyList::new(py, v.iter()).unwrap().into_any().unbind(),
+        EpicsValue::StringArray(v) => PyList::new(py, v.iter()).unwrap().into_any().unbind(),
     }
 }
 
@@ -103,11 +92,12 @@ pub fn py_to_epics_value(
             if let Ok(v) = obj.extract::<u16>() {
                 Ok(EpicsValue::Enum(v))
             } else if let Ok(s) = obj.extract::<String>() {
-                s.parse::<u16>()
-                    .map(EpicsValue::Enum)
-                    .map_err(|_| pyo3::exceptions::PyTypeError::new_err(
-                        format!("cannot convert '{}' to enum index", s),
+                s.parse::<u16>().map(EpicsValue::Enum).map_err(|_| {
+                    pyo3::exceptions::PyTypeError::new_err(format!(
+                        "cannot convert '{}' to enum index",
+                        s
                     ))
+                })
             } else {
                 Err(pyo3::exceptions::PyTypeError::new_err(
                     "enum value must be an integer or string",
@@ -166,7 +156,9 @@ fn py_sequence_to_epics_array(
 }
 
 fn system_time_to_epoch(t: SystemTime) -> f64 {
-    t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64()
+    t.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
 }
 
 /// Convert a Snapshot to a Python dict with ophyd-compatible metadata keys.
@@ -175,13 +167,15 @@ fn system_time_to_epoch(t: SystemTime) -> f64 {
 ///       lower_ctrl_limit, upper_ctrl_limit, enum_strs
 pub fn snapshot_to_pydict(py: Python<'_>, snapshot: &Snapshot) -> PyObject {
     let dict = PyDict::new(py);
-    dict.set_item("value", epics_value_to_py(py, &snapshot.value)).unwrap();
+    dict.set_item("value", epics_value_to_py(py, &snapshot.value))
+        .unwrap();
     dict.set_item("status", snapshot.alarm.status).unwrap();
     dict.set_item("severity", snapshot.alarm.severity).unwrap();
     let ts = system_time_to_epoch(snapshot.timestamp);
     dict.set_item("timestamp", ts).unwrap();
     dict.set_item("posixseconds", ts as u64).unwrap();
-    let nanos = snapshot.timestamp
+    let nanos = snapshot
+        .timestamp
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .subsec_nanos();
@@ -192,7 +186,10 @@ pub fn snapshot_to_pydict(py: Python<'_>, snapshot: &Snapshot) -> PyObject {
     let char_value = match &snapshot.value {
         EpicsValue::Enum(idx) => {
             if let Some(ref ei) = snapshot.enums {
-                ei.strings.get(*idx as usize).cloned().unwrap_or_else(|| idx.to_string())
+                ei.strings
+                    .get(*idx as usize)
+                    .cloned()
+                    .unwrap_or_else(|| idx.to_string())
             } else {
                 idx.to_string()
             }
@@ -208,17 +205,25 @@ pub fn snapshot_to_pydict(py: Python<'_>, snapshot: &Snapshot) -> PyObject {
     if let Some(ref disp) = snapshot.display {
         dict.set_item("precision", disp.precision).unwrap();
         dict.set_item("units", &disp.units).unwrap();
-        dict.set_item("upper_disp_limit", disp.upper_disp_limit).unwrap();
-        dict.set_item("lower_disp_limit", disp.lower_disp_limit).unwrap();
-        dict.set_item("upper_alarm_limit", disp.upper_alarm_limit).unwrap();
-        dict.set_item("lower_alarm_limit", disp.lower_alarm_limit).unwrap();
-        dict.set_item("upper_warning_limit", disp.upper_warning_limit).unwrap();
-        dict.set_item("lower_warning_limit", disp.lower_warning_limit).unwrap();
+        dict.set_item("upper_disp_limit", disp.upper_disp_limit)
+            .unwrap();
+        dict.set_item("lower_disp_limit", disp.lower_disp_limit)
+            .unwrap();
+        dict.set_item("upper_alarm_limit", disp.upper_alarm_limit)
+            .unwrap();
+        dict.set_item("lower_alarm_limit", disp.lower_alarm_limit)
+            .unwrap();
+        dict.set_item("upper_warning_limit", disp.upper_warning_limit)
+            .unwrap();
+        dict.set_item("lower_warning_limit", disp.lower_warning_limit)
+            .unwrap();
     }
 
     if let Some(ref ctrl) = snapshot.control {
-        dict.set_item("upper_ctrl_limit", ctrl.upper_ctrl_limit).unwrap();
-        dict.set_item("lower_ctrl_limit", ctrl.lower_ctrl_limit).unwrap();
+        dict.set_item("upper_ctrl_limit", ctrl.upper_ctrl_limit)
+            .unwrap();
+        dict.set_item("lower_ctrl_limit", ctrl.lower_ctrl_limit)
+            .unwrap();
     }
 
     if let Some(ref enums) = snapshot.enums {

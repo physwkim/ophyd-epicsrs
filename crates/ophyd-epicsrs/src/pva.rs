@@ -57,7 +57,11 @@ impl EpicsRsPvaContext {
 
     /// Create a PVA channel wrapper for the given name.
     fn create_pv(&self, pvname: &str) -> EpicsRsPvaPV {
-        EpicsRsPvaPV::new(self.runtime.clone(), self.client.clone(), pvname.to_string())
+        EpicsRsPvaPV::new(
+            self.runtime.clone(),
+            self.client.clone(),
+            pvname.to_string(),
+        )
     }
 
     fn __repr__(&self) -> String {
@@ -125,7 +129,8 @@ impl EpicsRsPvaPV {
             let result = fut.await;
             let _ = tx.send(result);
         });
-        rx.recv().map_err(|_| PyRuntimeError::new_err("runtime task failed"))
+        rx.recv()
+            .map_err(|_| PyRuntimeError::new_err("runtime task failed"))
     }
 }
 
@@ -138,9 +143,7 @@ impl EpicsRsPvaPV {
         let dur = Duration::from_secs_f64(timeout);
         let connected_ref = self.connected.clone();
         let result = py.allow_threads(|| {
-            self.spawn_wait(async move {
-                tokio::time::timeout(dur, client.pvconnect(&name)).await
-            })
+            self.spawn_wait(async move { tokio::time::timeout(dur, client.pvconnect(&name)).await })
         })?;
         let ok = matches!(result, Ok(Ok(_)));
         *connected_ref.lock() = ok;
@@ -163,9 +166,7 @@ impl EpicsRsPvaPV {
         let name = self.pvname.clone();
         let dur = Duration::from_secs_f64(timeout);
         let result = py.allow_threads(|| {
-            self.spawn_wait(async move {
-                tokio::time::timeout(dur, client.pvget(&name)).await
-            })
+            self.spawn_wait(async move { tokio::time::timeout(dur, client.pvget(&name)).await })
         })?;
         match result {
             Ok(Ok(field)) => Ok(Some(pvfield_to_metadata(py, &field))),
@@ -196,9 +197,8 @@ impl EpicsRsPvaPV {
     fn get_channel_info(&self, py: Python<'_>) -> PyResult<Option<PyObject>> {
         let client = self.client.clone();
         let name = self.pvname.clone();
-        let result = py.allow_threads(|| {
-            self.spawn_wait(async move { client.pvconnect(&name).await })
-        })?;
+        let result =
+            py.allow_threads(|| self.spawn_wait(async move { client.pvconnect(&name).await }))?;
         match result {
             Ok(addr) => {
                 let dict = PyDict::new(py);
@@ -215,11 +215,7 @@ impl EpicsRsPvaPV {
     /// Best-effort prefetch: just call get and return the dict.
     /// PVA has no separate "prefetch" path; the channel cache covers warm-up.
     #[pyo3(signature = (timeout=5.0))]
-    fn connect_and_prefetch(
-        &self,
-        py: Python<'_>,
-        timeout: f64,
-    ) -> PyResult<Option<PyObject>> {
+    fn connect_and_prefetch(&self, py: Python<'_>, timeout: f64) -> PyResult<Option<PyObject>> {
         self.get_with_metadata(py, timeout, "ctrl", 0)
     }
 
@@ -262,17 +258,18 @@ impl EpicsRsPvaPV {
         } else if let Some(cb) = callback {
             let pvname = self.pvname.clone();
             self.runtime.spawn(async move {
-                let success = match tokio::time::timeout(dur, client.pvput(&pvname, &value_str)).await {
-                    Ok(Ok(())) => true,
-                    Ok(Err(e)) => {
-                        eprintln!("[pvput] {pvname} error: {e}");
-                        false
-                    }
-                    Err(_) => {
-                        eprintln!("[pvput] {pvname} timed out");
-                        false
-                    }
-                };
+                let success =
+                    match tokio::time::timeout(dur, client.pvput(&pvname, &value_str)).await {
+                        Ok(Ok(())) => true,
+                        Ok(Err(e)) => {
+                            eprintln!("[pvput] {pvname} error: {e}");
+                            false
+                        }
+                        Err(_) => {
+                            eprintln!("[pvput] {pvname} timed out");
+                            false
+                        }
+                    };
                 Python::with_gil(|py| {
                     let _ = cb.call1(py, (success,));
                 });
@@ -341,20 +338,26 @@ impl EpicsRsPvaPV {
         let pvname_for_event = pvname.clone();
         let handle_slot = self.monitor_handle.clone();
         let setup = self.runtime.spawn(async move {
-            match client.pvmonitor_handle(&pvname_for_call, move |_desc, value| {
-                let event = PvaMonitorEvent {
-                    pvname: pvname_for_event.clone(),
-                    field: value.clone(),
-                };
-                let _ = tx.send(event);
-            }).await {
+            match client
+                .pvmonitor_handle(&pvname_for_call, move |_desc, value| {
+                    let event = PvaMonitorEvent {
+                        pvname: pvname_for_event.clone(),
+                        field: value.clone(),
+                    };
+                    let _ = tx.send(event);
+                })
+                .await
+            {
                 Ok(handle) => {
                     *handle_slot.lock() = Some(handle);
                     *connected_ref.lock() = true;
                     // Only acquire the GIL if there's actually a callback to fire.
                     // After clear_monitors / interpreter shutdown, conn_cb_ref may
                     // be empty — skipping with_gil avoids panics during teardown.
-                    let cb = conn_cb_ref.lock().as_ref().map(|c| Python::with_gil(|py| c.clone_ref(py)));
+                    let cb = conn_cb_ref
+                        .lock()
+                        .as_ref()
+                        .map(|c| Python::with_gil(|py| c.clone_ref(py)));
                     if let Some(cb) = cb {
                         Python::with_gil(|py| {
                             let _ = cb.call1(py, (true,));
@@ -392,14 +395,12 @@ impl EpicsRsPvaPV {
         let handle = self.runtime.spawn(async move {
             // One-shot connect probe with bounded timeout. After this,
             // disconnects are surfaced through the monitor task (if active).
-            let connected = tokio::time::timeout(
-                Duration::from_secs(30),
-                client.pvconnect(&pvname),
-            )
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .is_some();
+            let connected =
+                tokio::time::timeout(Duration::from_secs(30), client.pvconnect(&pvname))
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .is_some();
             *connected_ref.lock() = connected;
             Python::with_gil(|py| {
                 let guard = cb_ref.lock();
@@ -436,9 +437,8 @@ impl EpicsRsPvaPV {
         // Replace any previous access task and abort it — re-registering
         // the access callback should not leave an orphaned spawn that may
         // later try to fire into a now-stale callback.
-        let prev = std::mem::replace(&mut *self.access_setup_task.lock(), Some(task));
-        if let Some(p) = prev {
-            p.abort();
+        if let Some(prev) = self.access_setup_task.lock().replace(task) {
+            prev.abort();
         }
         let _ = py;
     }
@@ -488,7 +488,10 @@ impl EpicsRsPvaPV {
         let dur = Duration::from_secs_f64(timeout);
         let connected_ref = self.connected.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let ok = matches!(tokio::time::timeout(dur, client.pvconnect(&name)).await, Ok(Ok(_)));
+            let ok = matches!(
+                tokio::time::timeout(dur, client.pvconnect(&name)).await,
+                Ok(Ok(_))
+            );
             *connected_ref.lock() = ok;
             Ok(ok)
         })
@@ -531,7 +534,7 @@ impl EpicsRsPvaPV {
                             .unwrap_or_else(|| field.clone()),
                         _ => field.clone(),
                     };
-                    Ok(crate::pva_convert::pvfield_to_py(py, &value_field))
+                    Ok(pvfield_to_py(py, &value_field))
                 }),
                 _ => Python::with_gil(|py| Ok(py.None())),
             }
@@ -553,9 +556,9 @@ impl EpicsRsPvaPV {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let result = tokio::time::timeout(dur, client.pvget(&name)).await;
             match result {
-                Ok(Ok(field)) => Python::with_gil(|py| {
-                    Ok(crate::pva_convert::pvfield_to_metadata(py, &field))
-                }),
+                Ok(Ok(field)) => {
+                    Python::with_gil(|py| Ok(crate::pva_convert::pvfield_to_metadata(py, &field)))
+                }
                 _ => Python::with_gil(|py| Ok(py.None())),
             }
         })
@@ -645,7 +648,11 @@ fn python_value_to_pvput_string(value: &Bound<'_, pyo3::PyAny>) -> PyResult<Stri
     // Scalar fallback — Python's str() representation works for most
     // numeric / boolean / string types and matches pvput's parser.
     if let Ok(b) = value.extract::<bool>() {
-        return Ok(if b { "true".to_string() } else { "false".to_string() });
+        return Ok(if b {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        });
     }
     if let Ok(s) = value.extract::<String>() {
         return Ok(s);
@@ -658,10 +665,4 @@ fn python_value_to_pvput_string(value: &Bound<'_, pyo3::PyAny>) -> PyResult<Stri
     }
     let s = value.str()?.to_string();
     Ok(s)
-}
-
-// Suppress dead code warning until Python wrapper exposes typed put paths.
-#[allow(dead_code)]
-fn _touch_imports() {
-    let _: Option<&dyn Fn(Python<'_>, &PvField) -> PyObject> = Some(&pvfield_to_py);
 }

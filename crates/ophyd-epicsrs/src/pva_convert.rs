@@ -47,9 +47,10 @@ pub fn typed_array_to_py(py: Python<'_>, arr: &TypedScalarArray) -> PyObject {
         TypedScalarArray::UInt(a) => PyList::new(py, a.iter()).unwrap().into_any().unbind(),
         TypedScalarArray::Long(a) => PyList::new(py, a.iter()).unwrap().into_any().unbind(),
         TypedScalarArray::ULong(a) => PyList::new(py, a.iter()).unwrap().into_any().unbind(),
-        TypedScalarArray::Float(a) => {
-            PyList::new(py, a.iter().map(|x| *x as f64)).unwrap().into_any().unbind()
-        }
+        TypedScalarArray::Float(a) => PyList::new(py, a.iter().map(|x| *x as f64))
+            .unwrap()
+            .into_any()
+            .unbind(),
         TypedScalarArray::Double(a) => PyList::new(py, a.iter()).unwrap().into_any().unbind(),
         TypedScalarArray::String(a) => PyList::new(py, a.iter()).unwrap().into_any().unbind(),
     }
@@ -60,14 +61,16 @@ pub fn typed_array_to_py(py: Python<'_>, arr: &TypedScalarArray) -> PyObject {
 pub fn pvfield_to_py(py: Python<'_>, field: &PvField) -> PyObject {
     match field {
         PvField::Scalar(s) => scalar_to_py(py, s),
-        PvField::ScalarArray(arr) => {
-            PyList::new(py, arr.iter().map(|s| scalar_to_py(py, s))).unwrap().into_any().unbind()
-        }
+        PvField::ScalarArray(arr) => PyList::new(py, arr.iter().map(|s| scalar_to_py(py, s)))
+            .unwrap()
+            .into_any()
+            .unbind(),
         PvField::ScalarArrayTyped(arr) => typed_array_to_py(py, arr),
         PvField::Structure(s) => structure_to_py(py, s),
-        PvField::StructureArray(arr) => {
-            PyList::new(py, arr.iter().map(|s| structure_to_py(py, s))).unwrap().into_any().unbind()
-        }
+        PvField::StructureArray(arr) => PyList::new(py, arr.iter().map(|s| structure_to_py(py, s)))
+            .unwrap()
+            .into_any()
+            .unbind(),
         PvField::Union { value, .. } => pvfield_to_py(py, value),
         PvField::UnionArray(items) => {
             PyList::new(py, items.iter().map(|it| pvfield_to_py(py, &it.value)))
@@ -144,16 +147,14 @@ fn struct_field_string(s: &PvStructure, name: &str) -> Option<String> {
 
 /// Return the NTEnum value field as (index, choices) if `value` is an
 /// `enum_t` substructure, or None otherwise.
-fn extract_ntenum<'a>(s: &'a PvStructure) -> Option<(i32, Vec<String>)> {
+fn extract_ntenum(s: &PvStructure) -> Option<(i32, Vec<String>)> {
     let enum_struct = match s.get_field("value")? {
         PvField::Structure(es) => es,
         _ => return None,
     };
     let index = struct_field_scalar(enum_struct, "index").and_then(scalar_as_i64)? as i32;
     let choices = match enum_struct.get_field("choices")? {
-        PvField::ScalarArrayTyped(TypedScalarArray::String(arr)) => {
-            arr.iter().cloned().collect()
-        }
+        PvField::ScalarArrayTyped(TypedScalarArray::String(arr)) => arr.iter().cloned().collect(),
         PvField::ScalarArray(arr) => arr
             .iter()
             .filter_map(|v| match v {
@@ -177,8 +178,13 @@ pub fn pvfield_to_metadata(py: Python<'_>, field: &PvField) -> PyObject {
             // NTEnum: value is itself a structure with index + choices.
             if let Some((idx, choices)) = extract_ntenum(s) {
                 let _ = dict.set_item("value", idx);
-                let _ = dict.set_item("char_value",
-                    choices.get(idx as usize).cloned().unwrap_or_else(|| idx.to_string()));
+                let _ = dict.set_item(
+                    "char_value",
+                    choices
+                        .get(idx as usize)
+                        .cloned()
+                        .unwrap_or_else(|| idx.to_string()),
+                );
                 if !choices.is_empty() {
                     let tuple = PyTuple::new(py, choices.iter()).unwrap();
                     let _ = dict.set_item("enum_strs", tuple);
@@ -271,10 +277,12 @@ pub fn pvfield_to_metadata(py: Python<'_>, field: &PvField) -> PyObject {
                 if let Some(v) = struct_field_scalar(va, "lowAlarmLimit").and_then(scalar_as_f64) {
                     let _ = dict.set_item("lower_alarm_limit", v);
                 }
-                if let Some(v) = struct_field_scalar(va, "highWarningLimit").and_then(scalar_as_f64) {
+                if let Some(v) = struct_field_scalar(va, "highWarningLimit").and_then(scalar_as_f64)
+                {
                     let _ = dict.set_item("upper_warning_limit", v);
                 }
-                if let Some(v) = struct_field_scalar(va, "lowWarningLimit").and_then(scalar_as_f64) {
+                if let Some(v) = struct_field_scalar(va, "lowWarningLimit").and_then(scalar_as_f64)
+                {
                     let _ = dict.set_item("lower_warning_limit", v);
                 }
             }

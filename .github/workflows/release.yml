@@ -23,6 +23,14 @@ jobs:
           python-version: '3.x'
       - name: Build wheels
         uses: PyO3/maturin-action@v1
+        env:
+          # ring 0.17 (transitive via PVA → rustls → ring) ships
+          # pregenerated ASM that includes ring-core/asm_base.h, which
+          # `#error`s out unless __ARM_ARCH is defined. The manylinux
+          # aarch64-unknown-linux-gnu-gcc cross-toolchain does not set
+          # this automatically, so injecting it via CFLAGS is the
+          # smallest workaround (native arm64 builds are unaffected).
+          CFLAGS_aarch64_unknown_linux_gnu: "-D__ARM_ARCH=8"
         with:
           target: ${{ matrix.target }}
           args: --release --out dist

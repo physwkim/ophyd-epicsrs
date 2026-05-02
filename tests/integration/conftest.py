@@ -9,19 +9,23 @@ from __future__ import annotations
 
 import pytest
 
+from typing import TYPE_CHECKING
+
 from ophyd_epicsrs._contexts import get_ca_context, get_pva_context
-from ophyd_epicsrs._native import EpicsRsContext, EpicsRsPvaContext
+
+if TYPE_CHECKING:
+    from ophyd_epicsrs._native import EpicsRsContext, EpicsRsPvaContext
 
 
 @pytest.fixture(scope="session")
-def ca_ctx() -> EpicsRsContext:
+def ca_ctx() -> "EpicsRsContext":
     # Share the process-wide singleton so the test's CaClient is the
     # same one ophyd / ophyd-async use — see python/ophyd_epicsrs/_contexts.py.
     return get_ca_context()
 
 
 @pytest.fixture(scope="session")
-def pva_ctx() -> EpicsRsPvaContext:
+def pva_ctx() -> "EpicsRsPvaContext":
     return get_pva_context()
 
 

@@ -26,24 +26,28 @@ pub struct EpicsRsContext {
 #[pymethods]
 impl EpicsRsContext {
     #[new]
-    fn new() -> PyResult<Self> {
+    fn new(py: Python<'_>) -> PyResult<Self> {
         // Use the process-wide shared runtime so sync (this) and async
         // (pyo3-async-runtimes) entry points share one tokio executor.
         let runtime = crate::runtime::shared_runtime();
 
         // Create CaClient inside a spawned task so background tasks
-        // are properly rooted in the runtime's thread pool,
-        // not in a block_on context that may interfere with IO polling.
-        let client = {
+        // are properly rooted in the runtime's thread pool, not in a
+        // block_on context that may interfere with IO polling.
+        // Release the GIL while waiting on the spawned task — repeater
+        // registration and UDP setup can take milliseconds, and other
+        // Python threads must not be blocked on context construction.
+        let runtime_for_spawn = runtime.clone();
+        let client = py.allow_threads(move || -> PyResult<CaClient> {
             let (tx, rx) = std::sync::mpsc::channel();
-            runtime.spawn(async move {
+            runtime_for_spawn.spawn(async move {
                 let result = CaClient::new().await;
                 let _ = tx.send(result);
             });
             rx.recv()
                 .map_err(|_| PyRuntimeError::new_err("runtime channel closed"))?
-                .map_err(|e| PyRuntimeError::new_err(format!("failed to create CA client: {e}")))?
-        };
+                .map_err(|e| PyRuntimeError::new_err(format!("failed to create CA client: {e}")))
+        })?;
 
         Ok(Self {
             runtime,

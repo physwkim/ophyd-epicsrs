@@ -1,23 +1,32 @@
-"""ophyd-epicsrs: Rust EPICS backend for ophyd (Channel Access + pvAccess)."""
+"""ophyd-epicsrs: Rust EPICS backend for ophyd (Channel Access + pvAccess).
+
+The CA / PVA contexts are process-wide singletons. Construct PVs via
+``get_ca_context().create_pv(name)`` / ``get_pva_context().create_pv(name)``
+— do NOT instantiate ``EpicsRsContext`` / ``EpicsRsPvaContext`` directly.
+Each independent context spins up its own beacon monitor / search engine
+and trips spurious ``first_sighting`` anomalies in epics-ca-rs that drop
+healthy TCP circuits. ``EpicsRsPV`` / ``EpicsRsPvaPV`` are exposed for
+``isinstance`` checks and type annotations on the values returned by
+``create_pv``; users should not construct them directly either.
+"""
 
 import logging
 import types
 
+from ophyd_epicsrs._contexts import get_ca_context, get_pva_context
 from ophyd_epicsrs._native import (
-    EpicsRsContext,
     EpicsRsPV,
-    EpicsRsPvaContext,
     EpicsRsPvaPV,
     caught_panic_count,
     reset_log_cache,
 )
 
 __all__ = [
-    "EpicsRsContext",
     "EpicsRsPV",
-    "EpicsRsPvaContext",
     "EpicsRsPvaPV",
     "caught_panic_count",
+    "get_ca_context",
+    "get_pva_context",
     "reset_log_cache",
     "use_epicsrs",
 ]

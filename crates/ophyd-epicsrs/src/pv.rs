@@ -129,12 +129,18 @@ pub struct EpicsRsPV {
 impl EpicsRsPV {
     pub fn new(runtime: Arc<Runtime>, channel: CaChannel, pvname: String) -> Self {
         let ch = Arc::new(channel);
+        // Built up-front so the prefetch task can capture it eagerly —
+        // see the comment inside the spawn for why "eagerly" matters
+        // for async-only callers that never go through the sync
+        // get_with_metadata path.
+        let cached_ctrl: Arc<Mutex<CachedCtrl>> = Arc::new(Mutex::new(CachedCtrl::default()));
 
         // Start background prefetch immediately — runs concurrently with
         // all other PVs' prefetches in the tokio runtime (no GIL needed).
         // Short timeouts on CA reads so slow PVs fail fast and don't
         // block bulk_connect_and_prefetch from returning promptly.
         let prefetch_ch = ch.clone();
+        let prefetch_ctrl = cached_ctrl.clone();
         let prefetch_handle = runtime.spawn(async move {
             // Wait for connection (up to 30s)
             if prefetch_ch
@@ -162,6 +168,15 @@ impl EpicsRsPV {
                 Ok(Ok(s)) => s,
                 _ => return None,
             };
+            // Eagerly populate the CTRL cache so the very first
+            // get_reading_async("time") (or anything else that lands on
+            // a DBR_TIME read) returns a complete dict — units,
+            // precision, limits, enum_strs all present without the
+            // user having to go through the sync get_with_metadata
+            // path first. async-only callers (ophyd-async
+            // SignalBackend) never touch the sync path, so without
+            // this their first reading is missing CTRL fields.
+            prefetch_ctrl.lock().capture(&snapshot);
             Some(PrefetchResult {
                 native_type: info.native_type,
                 type_name: format!("{:?}", info.native_type).to_lowercase(),
@@ -187,7 +202,7 @@ impl EpicsRsPV {
             monitor_tx: Arc::new(Mutex::new(None)),
             dispatch_thread: Mutex::new(None),
             prefetch_handle: Mutex::new(Some(prefetch_handle)),
-            cached_ctrl: Arc::new(Mutex::new(CachedCtrl::default())),
+            cached_ctrl,
             emit_tasks: Mutex::new(Vec::new()),
         }
     }
@@ -891,6 +906,7 @@ impl EpicsRsPV {
         let channel = self.channel.clone();
         let dur = Duration::from_secs_f64(timeout);
         let cache = self.native_type.clone();
+        let cached_ctrl = self.cached_ctrl.clone();
         // Drain the prefetch handle once if it's still pending — this
         // recovers the work the constructor's spawn already did and
         // avoids issuing a redundant info() round trip.
@@ -903,6 +919,12 @@ impl EpicsRsPV {
             if let Some(handle) = prefetch {
                 if let Ok(Ok(Some(result))) = tokio::time::timeout(dur, handle).await {
                     *cache.lock() = Some(result.native_type);
+                    // Capture the prefetch's CTRL fields too — without
+                    // this, the SignalBackend.connect path consumes
+                    // the prefetch (and its display/control/enums)
+                    // and then a second get_reading_async("ctrl") has
+                    // to round-trip the IOC again to recover them.
+                    cached_ctrl.lock().capture(&result.snapshot);
                     return Ok(true);
                 }
             }

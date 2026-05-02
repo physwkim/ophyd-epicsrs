@@ -41,6 +41,7 @@ fn ophyd_epicsrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<pva::EpicsRsPvaPV>()?;
     m.add_function(wrap_pyfunction!(reset_log_cache, m)?)?;
     m.add_function(wrap_pyfunction!(caught_panic_count, m)?)?;
+    m.add_function(wrap_pyfunction!(_reset_panic_count_for_test, m)?)?;
     Ok(())
 }
 
@@ -69,4 +70,13 @@ fn reset_log_cache() -> bool {
 #[pyfunction]
 fn caught_panic_count() -> u64 {
     safe_log::caught_panic_count()
+}
+
+/// Test-only: zero the panic counter. Lets unit tests check
+/// "this operation incremented by N" without coupling to any prior
+/// test's running totals. Not for production use (no thread guard,
+/// no separation between tests in a parallel runner).
+#[pyfunction]
+fn _reset_panic_count_for_test() {
+    safe_log::reset_panic_count_for_test();
 }

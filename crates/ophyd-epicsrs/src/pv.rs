@@ -769,14 +769,20 @@ impl EpicsRsPV {
     ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
         let _ = timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            // safe_call_or! around the with_gil so a finalize race
-            // (rare here — the awaitable would normally be dropped
-            // first) doesn't unwind the future. py.None() is the
-            // semantically correct fallback for the no-op CA stub.
-            Ok(crate::safe_call_or!(
-                Python::with_gil(|py| py.None()),
-                Python::with_gil(|py| py.None())
-            ))
+            // safe_call_or!'s `default` is evaluated OUTSIDE the
+            // catch_unwind guard — it must therefore be panic-free
+            // and GIL-free. The earlier version called
+            // `Python::with_gil` in BOTH the body and the default,
+            // which would re-trigger the same finalize panic that
+            // the guard was meant to absorb. Use a GIL-free
+            // PyRuntimeError as the fallback (PyErr::new_err defers
+            // message realisation until display).
+            crate::safe_call_or!(
+                Err::<PyObject, PyErr>(PyRuntimeError::new_err(
+                    "get_field_desc_async (CA stub): panic in Python::with_gil",
+                )),
+                Python::with_gil(|py| Ok::<PyObject, PyErr>(py.None()))
+            )
         })
     }
 

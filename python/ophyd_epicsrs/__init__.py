@@ -6,6 +6,8 @@ import types
 from ophyd_epicsrs._native import (
     EpicsRsContext,
     EpicsRsPV,
+    EpicsRsPvaContext,
+    EpicsRsPvaPV,
     caught_panic_count,
     reset_log_cache,
 )
@@ -13,6 +15,8 @@ from ophyd_epicsrs._native import (
 __all__ = [
     "EpicsRsContext",
     "EpicsRsPV",
+    "EpicsRsPvaContext",
+    "EpicsRsPvaPV",
     "caught_panic_count",
     "reset_log_cache",
     "use_epicsrs",

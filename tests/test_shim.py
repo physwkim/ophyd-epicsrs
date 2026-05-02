@@ -163,5 +163,12 @@ def test_release_pvs_clears_handlers():
     pv._on_connection_change(True)   # transition back
     assert cb.call_count == 0, "callback must not fire after release"
 
+    # Rust-side liveness: re-registering a callback after release_pvs
+    # must work (i.e. release didn't permanently break the underlying
+    # native PV's callback machinery — only cleared current state).
+    new_cb = Mock()
+    pv._pv.set_connection_callback(lambda c: new_cb(c))
+    # Just verifying the call doesn't raise — actual emission needs an IOC.
+
     # Idempotency: repeated release must not raise.
     shim.release_pvs(pv)

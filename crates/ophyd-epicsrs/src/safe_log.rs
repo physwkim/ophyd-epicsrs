@@ -57,8 +57,14 @@ pub fn caught_panic_count() -> u64 {
 /// during a finalize storm.
 ///
 /// `payload` is the Box returned by `catch_unwind`'s Err arm. We
-/// downcast to the common types (`&'static str`, `String`); other
-/// payload types print as `<unknown panic payload>`.
+/// downcast to the common types (`&'static str`, `String`); for any
+/// other payload type we surface the type name so a `panic_any(...)`
+/// custom payload at least leaves a forensic trail.
+///
+/// `track totals via …` cites two paths because, if the panic fires
+/// while `ophyd_epicsrs/__init__.py` is still importing, the package
+/// re-export won't be reachable yet — the underlying `_native.*`
+/// always is.
 pub fn record_panic(payload: Box<dyn std::any::Any + Send>) {
     let prev = PANIC_COUNT.fetch_add(1, Ordering::Relaxed);
     if prev == 0 {
@@ -68,15 +74,29 @@ pub fn record_panic(payload: Box<dyn std::any::Any + Send>) {
             .copied()
             .map(|s| s.to_string())
             .or_else(|| payload.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "<unknown panic payload>".to_string());
+            .unwrap_or_else(|| {
+                format!(
+                    "<unknown panic payload: type {}>",
+                    std::any::type_name_of_val(&*payload)
+                )
+            });
         let _ = writeln!(
             std::io::stderr(),
             "[ophyd-epicsrs] caught panic in spawned task: {msg}\n\
              (typically a Python interpreter finalize race; if you see \
-             this during normal operation it may be a real bug — call \
-             `ophyd_epicsrs.caught_panic_count()` to track totals)"
+             this during normal operation it may be a real bug — track \
+             totals via `ophyd_epicsrs.caught_panic_count()` (or \
+             `ophyd_epicsrs._native.caught_panic_count()` if package \
+             import is incomplete))"
         );
     }
+}
+
+/// Test-only: zero the panic counter so tests can assert "this
+/// operation increments by N" without coupling to other tests'
+/// totals. Exposed via `_native._reset_panic_count_for_test()`.
+pub fn reset_panic_count_for_test() {
+    PANIC_COUNT.store(0, Ordering::Relaxed);
 }
 
 #[doc(hidden)]
@@ -126,6 +146,13 @@ macro_rules! safe_call {
 /// `Python::with_gil` inside `future_into_py` that produces the
 /// `PyObject` resolution value. On panic, returns `$default` and
 /// records the panic; otherwise returns the block's value.
+///
+/// **CRITICAL**: `$default` is evaluated OUTSIDE the catch_unwind
+/// guard. It must be panic-free and must not call `Python::with_gil`
+/// — if it does, a finalize-time panic in the body will be caught
+/// only to re-trigger the same panic in the default. Use a precomputed
+/// Rust value or `Err(PyRuntimeError::new_err("..."))`
+/// (`PyErr::new_err` is GIL-free at construction).
 #[doc(hidden)]
 #[macro_export]
 macro_rules! safe_call_or {

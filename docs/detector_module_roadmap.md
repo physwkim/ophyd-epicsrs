@@ -35,9 +35,12 @@ This modeling does not exist in upstream ophyd, and AI code generation cannot re
 
 - **Do not fork ophyd-async** — tracking ~30k LOC upstream would dilute focus and forfeit the zero-migration USP.
 - **Do not migrate to a fully async API** — preserve existing ophyd users and code.
-- **Port only ophyd-async's detector layer into ophyd-epicsrs** — invest where the architectural payoff is highest.
+- **Do not port detector / path / status abstractions** — superseded by the decision below.
+- **Use ophyd-async as a required dependency and ship a `SignalBackend` adapter only.** Users get `StandardDetector`, `PathProvider`, `AsyncStatus`, and every existing ophyd-async detector wrapper (Pilatus, Eiger, PandABlocks, …) for free, running on the Rust epics-rs transport via `EpicsRsSignalBackend`.
 
-bluesky's RunEngine already supports mixed plans containing both `Status` (sync ophyd) and `AsyncStatus` (async detector) devices, so user plan code requires no changes.
+bluesky's RunEngine already supports mixed plans containing both `Status` (sync ophyd) and `AsyncStatus` (async ophyd-async) devices, so user plan code requires no changes.
+
+The work that genuinely needs to live in this repo is **semantic parity with `aioca` / `p4p` at the SignalBackend layer**: `wait`, callback event-loop affinity, enum / table / datakey conversion, cancellation / timeout. Detector composition and file-path policy belong upstream.
 
 ## Architecture
 
@@ -47,75 +50,79 @@ User code
   │     → ophyd (vanilla) + use_epicsrs()         [unchanged]
   │
   └── new detector
-        → ophyd_epicsrs.detector.StandardDetector
-            ├── TriggerLogic
-            ├── ArmLogic
-            ├── DataLogic [multiple]
-            └── PathProvider
+        → ophyd_async.core.StandardDetector  (or any upstream detector class)
+            ├── TriggerLogic / ArmLogic / DataLogic[]   ← upstream
+            └── PathProvider                            ← upstream
                   ↓
-            await sig.set / get  (pyo3-asyncio)
+            ophyd_async.core.Signal[T]
+                  ↓ (backend swap)
+            ophyd_epicsrs.detector.EpicsRsSignalBackend
                   ↓
-            EpicsRsPV  (Rust, tokio)
+            EpicsRsPV  /  EpicsRsPvaPV  (Rust, tokio)
                   ↓
             epics-rs   [unified CA + PVA via shared Arc<Runtime>]
 ```
 
 Core principles:
-1. **Single shared Rust runtime** — both entry points (sync `EpicsRsShimPV` and async `EpicsRsPV.*_async`) use the same `Arc<Runtime>`. Avoids runtime fragmentation.
-2. **No PV cache** — the same PV may be accessed concurrently from sync ophyd and the async detector module without conflict; channel sharing is already handled at the transport layer.
+1. **Single shared Rust runtime** — both entry points (sync `EpicsRsShimPV` and async `EpicsRsPV.*_async` / `EpicsRsPvaPV.*_async`) use the same `Arc<Runtime>`. Avoids runtime fragmentation.
+2. **No PV cache** — the same PV may be accessed concurrently from sync ophyd and the async backend without conflict; channel sharing is already handled at the transport layer.
 3. **bluesky mixed plans** — `Status` and `AsyncStatus` coexist in a single plan; users do not need to know which protocol a device implements.
-4. **Unified CA + PVA backend** — unlike ophyd-async (which uses `aioca` for CA and `p4p` for PVA, two FFI surfaces with different threading models), ophyd-epicsrs exposes both protocols through one Rust runtime. A `Signal` can be backed by either protocol with no code-shape change in the detector layer; modern detectors (NTNDArray-based areaDetector, PVA-native PandABlocks) work without a parallel binding stack.
+4. **Unified CA + PVA backend** — unlike ophyd-async (which uses `aioca` for CA and `p4p` for PVA, two FFI surfaces with different threading models), ophyd-epicsrs exposes both protocols through one Rust runtime. The single `EpicsRsSignalBackend` dispatches by `pv://` prefix; modern detectors (NTNDArray-based areaDetector, PVA-native PandABlocks) work without a parallel binding stack.
 
 ## Build Plan
 
-### LOC estimate (~3,500 LOC, 1–2 person-months)
+### LOC estimate (~400 LOC adapter + ~300 LOC tests, ~2 person-weeks)
 
-| Component | LOC | Location |
-|-----------|-----|----------|
-| pyo3-asyncio bridge (`put_async`, `get_async`, `monitor_async`) | ~300 | extend `crates/ophyd-epicsrs/src/pv.rs` |
-| Logic ABCs + StandardDetector | ~600 | `python/ophyd_epicsrs/detector/_core.py` |
-| PathProvider family | ~400 | `python/ophyd_epicsrs/detector/_path.py` |
-| AsyncStatus | ~150 | `python/ophyd_epicsrs/detector/_status.py` |
-| areaDetector core (HDF5 DataLogic + ROI + Stats) | ~1000 | `python/ophyd_epicsrs/detector/adcore/` |
-| Tests (mock SignalBackend, no IOC required) | ~1000 | `python/ophyd_epicsrs/detector/tests/` |
+| Component | LOC | Location | Status |
+|-----------|-----|----------|--------|
+| pyo3-async-runtimes bridge (`*_async` methods) | ~300 | `crates/ophyd-epicsrs/src/{pv,pva,runtime}.rs` | done |
+| Async `EpicsRsSignalBackend` (CA + PVA dispatch) | ~200 | `python/ophyd_epicsrs/detector/_signal_backend.py` | done |
+| Factory functions (`epicsrs_signal_{r,rw,rw_rbv,w,x}`) | ~120 | `python/ophyd_epicsrs/detector/_factory.py` | done |
+| Datatype-aware converters (bool / int / float / str / Enum / Array1D / Sequence / Table) | ~340 | `python/ophyd_epicsrs/detector/_converter.py` | done |
+| Tests against softIoc + mock | ~300 | `python/ophyd_epicsrs/detector/tests/` | next |
 
 ### Phases
 
-**Phase 1 — Async PV primitives (Rust)**: Add `pyo3-asyncio` based async methods to `EpicsRsPV` while preserving the existing sync surface. Verify single-runtime sharing.
+**Phase 1 — Async PV primitives (Rust)**: Add `pyo3-async-runtimes` based async methods to `EpicsRsPV` and `EpicsRsPvaPV` while preserving the existing sync surface. Verify single-runtime sharing.  ✅ done
 
-**Phase 2 — Core abstraction (Python)**: Port `_detector.py`, `_path_providers.py`, and `_status.py` from ophyd-async. Define TriggerLogic / ArmLogic / DataLogic ABCs, `StandardDetector`, `AsyncStatus`, and the `PathProvider` family.
+**Phase 2 — `EpicsRsSignalBackend` adapter (Python)**: Implement ophyd-async's `SignalBackend[T]` ABC over the async PV primitives. Includes datatype-aware converters (Bool / Int / Float / Str / Enum / Array1D / Sequence / Table) and `pv://`-prefix protocol dispatch.  ✅ done
 
-**Phase 3 — areaDetector adcore**: Port the HDF5 writer DataLogic and standard plugins (ROI, Stats). Reference `ophyd-async/src/ophyd_async/epics/adcore/`.
+**Phase 3 — Semantic parity with `aioca` / `p4p`**: Make the adapter behave indistinguishably from `aioca`-backed and `p4p`-backed signals for the test suites that ship in ophyd-async.  Includes (in this branch): `EpicsOptions.wait` plumbing, `loop.call_soon_threadsafe` callback bridge, enum bidirectional conversion, non-blocking PVA monitor registration.  ✅ done
 
-**Phase 4 — Real camera integration**: End-to-end validation with a production beamline camera (Pilatus, Eiger, or similar).
+**Phase 4 — Real camera integration**: End-to-end validation with a production beamline camera (Pilatus, Eiger, or similar) constructed from upstream ophyd-async, backend-swapped to `EpicsRsSignalBackend`.  next
 
 ## Out of Scope
 
-The following are intentionally **not** ported:
+The following are intentionally **not** built in this repo — they live upstream in ophyd-async:
 
-- ophyd-async's motor / sim / plan_stub modules — vanilla ophyd is sufficient
-- The full `Signal[T]` abstraction — wrap only as needed inside detector code
-- ophyd-async's fastcs / PandABlocks integration — evaluate separately later
+- `StandardDetector`, `TriggerLogic`, `ArmLogic`, `DataLogic` — use upstream
+- `PathProvider` family — use upstream
+- `AsyncStatus`, `WatchableAsyncStatus` — use upstream
+- Per-detector wrappers (Pilatus, Eiger, Aravis, PandABlocks, …) — use upstream
+- Motor / sim / plan_stub modules — use vanilla ophyd
 - Tango backend — EPICS only
 
 CA and PVA are **both in scope** from day 1 via the shared epics-rs backend.
 
 ## Technical Considerations
 
-### pyo3-asyncio cancellation
+### Cancellation
 On Python `task.cancel()`, the corresponding Rust Future must `Drop` cleanly so any in-flight CA or PVA request aborts. Verify cancel-safety in epics-rs CA and PVA client paths (one known minor gap: CA G1 "TCP send timeout" SHOULD-FIX from the 2026-04-29 re-audit; tracked separately in epics-rs).
 
 ### Event loop binding
-pyo3-asyncio bridges Python's asyncio loop with the tokio runtime. Awaiting on the wrong thread can deadlock against the GIL. Enforce a convention: every async entry point goes through `pyo3_asyncio::tokio::future_into_py`.
+`pyo3-async-runtimes` bridges Python's asyncio loop with the tokio runtime. Awaiting on the wrong thread can deadlock against the GIL. Convention: every async entry point goes through `pyo3_async_runtimes::tokio::future_into_py`. Monitor callbacks fire on a Rust dispatch thread; `EpicsRsSignalBackend.set_callback` captures the running loop and uses `loop.call_soon_threadsafe` to deliver each `Reading` on the loop thread (asyncio.Event / Queue inside ophyd-async's signal cache are not thread-safe).
 
 ### bluesky AsyncStatus protocol
-Match the exact signature of `bluesky.protocols.Status` and `AsyncStatus`. Confirm RunEngine's `_wait_for` path handles our implementation correctly.
+ophyd-async ships its own `AsyncStatus` implementation; this repo does not provide one.
+
+### `EpicsOptions.wait` semantics
+`wait=False` (and callable variants — e.g. busy / acquire records that hang on Acquire=0) routes through `put_nowait_async`, which on CA fires `CA_PROTO_WRITE` (no notify) and on PVA spawns the put without awaiting the response.
 
 ## Success Criteria
 
 1. Existing ophyd user code runs unchanged, line for line
-2. A new detector can be defined in ~200 LOC (3–5x reduction vs. ophyd)
-3. Logic components are unit-testable without an IOC
+2. ophyd-async detector classes constructed from upstream work backend-swapped onto `EpicsRsSignalBackend`
+3. The adapter passes ophyd-async's existing `aioca` / `p4p` SignalBackend test suites (semantic parity)
 4. bluesky mixed plans (sync motor + async detector) work end to end
 5. The same PV can be accessed concurrently from sync and async paths
 

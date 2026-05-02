@@ -86,7 +86,7 @@ def test_pva_ntenum_put_index(pva_ctx):
     string-form pvput is silently rejected by the server because the
     top-level value is a structure, not a scalar. The wrapper detects
     NTEnum from the first read (sync OR async — see
-    test_async_pva_ntenum_signal_round_trip) and routes int / bool
+    test_async_pva_ntenum_via_ophyd_async_strict_enum) and routes int / bool
     puts via `pvput_field("value.index", ...)`. The same routing now
     also runs in `put_async` / `put_nowait_async` so ophyd-async
     `await sig.set(MyEnum.X)` works."""

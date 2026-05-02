@@ -7,7 +7,7 @@ use pyo3::prelude::*;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
-use epics_rs::base::server::snapshot::{DbrClass, Snapshot};
+use epics_rs::base::server::snapshot::{ControlInfo, DbrClass, DisplayInfo, EnumInfo, Snapshot};
 use epics_rs::base::types::DbFieldType;
 use epics_rs::base::types::EpicsValue;
 use epics_rs::ca::client::CaChannel;
@@ -18,6 +18,46 @@ use crate::convert::{epics_value_to_py, py_to_epics_value, snapshot_to_pydict};
 struct MonitorEvent {
     pvname: String,
     snapshot: Snapshot,
+}
+
+/// CTRL-class metadata captured at the first DBR_CTRL read so that
+/// subsequent DBR_TIME reads (which lack these fields on the wire)
+/// can still report a complete ophyd metadata dict.
+#[derive(Default, Clone)]
+struct CachedCtrl {
+    display: Option<DisplayInfo>,
+    control: Option<ControlInfo>,
+    enums: Option<EnumInfo>,
+}
+
+impl CachedCtrl {
+    /// Promote any CTRL-only fields the snapshot lacks from the cache.
+    fn enrich(&self, snapshot: &mut Snapshot) {
+        if snapshot.display.is_none() {
+            snapshot.display = self.display.clone();
+        }
+        if snapshot.control.is_none() {
+            snapshot.control = self.control.clone();
+        }
+        if snapshot.enums.is_none() {
+            snapshot.enums = self.enums.clone();
+        }
+    }
+
+    /// Save any CTRL-only fields the snapshot carries (idempotent —
+    /// later reads overwrite earlier cache entries, which is what we
+    /// want when the IOC publishes updated limits via DBR_CTRL).
+    fn capture(&mut self, snapshot: &Snapshot) {
+        if snapshot.display.is_some() {
+            self.display = snapshot.display.clone();
+        }
+        if snapshot.control.is_some() {
+            self.control = snapshot.control.clone();
+        }
+        if snapshot.enums.is_some() {
+            self.enums = snapshot.enums.clone();
+        }
+    }
 }
 
 /// Why `resolve_native_type` failed. Lets `put_async` distinguish a
@@ -70,6 +110,16 @@ pub struct EpicsRsPV {
     dispatch_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Background prefetch: starts on PV creation, completes before Python asks
     pub(crate) prefetch_handle: Mutex<Option<JoinHandle<Option<PrefetchResult>>>>,
+    /// CTRL-class metadata cached at first DBR_CTRL read (prefetch).
+    /// Subsequent DBR_TIME reads carry only value + alarm + timestamp,
+    /// so without this cache the per-call ophyd metadata dict would
+    /// lose `units`, `precision`, the `*_disp_limit` family, the
+    /// `*_ctrl_limit` family, and `enum_strs` after the first call —
+    /// and `char_value` for enum PVs would silently degrade from the
+    /// label string to the raw int index. Cached values are merged
+    /// into the snapshot in `get_with_metadata` and `_on_monitor_event`
+    /// before `snapshot_to_pydict` runs.
+    cached_ctrl: Arc<Mutex<CachedCtrl>>,
     /// Fire-and-forget probe tasks spawned by emit_current_*_state.
     /// Tracked so Drop can abort in-flight `Python::with_gil` after
     /// interpreter finalize — same teardown race as monitor_setup_task.
@@ -137,6 +187,7 @@ impl EpicsRsPV {
             monitor_tx: Arc::new(Mutex::new(None)),
             dispatch_thread: Mutex::new(None),
             prefetch_handle: Mutex::new(Some(prefetch_handle)),
+            cached_ctrl: Arc::new(Mutex::new(CachedCtrl::default())),
             emit_tasks: Mutex::new(Vec::new()),
         }
     }
@@ -287,6 +338,7 @@ impl EpicsRsPV {
             })?;
             if let Ok(Ok(Some(prefetch))) = result {
                 *self.native_type.lock() = Some(prefetch.native_type);
+                self.cached_ctrl.lock().capture(&prefetch.snapshot);
                 let dict = snapshot_to_pydict(py, &prefetch.snapshot);
                 let dict_ref = dict.downcast_bound::<pyo3::types::PyDict>(py).unwrap();
                 let _ = dict_ref.set_item("ftype", prefetch.native_type as u16);
@@ -315,6 +367,7 @@ impl EpicsRsPV {
         match result {
             Ok((info, snapshot)) => {
                 *self.native_type.lock() = Some(info.native_type);
+                self.cached_ctrl.lock().capture(&snapshot);
                 let dict = snapshot_to_pydict(py, &snapshot);
                 let dict_ref = dict.downcast_bound::<pyo3::types::PyDict>(py).unwrap();
                 let _ = dict_ref.set_item("ftype", info.native_type as u16);
@@ -372,6 +425,7 @@ impl EpicsRsPV {
                 })?;
                 if let Ok(Ok(Some(prefetch))) = result {
                     *self.native_type.lock() = Some(prefetch.native_type);
+                    self.cached_ctrl.lock().capture(&prefetch.snapshot);
                     return Ok(Some(snapshot_to_pydict(py, &prefetch.snapshot)));
                 }
             }
@@ -391,8 +445,15 @@ impl EpicsRsPV {
         })?;
 
         match result {
-            Ok(Ok(snapshot)) => {
+            Ok(Ok(mut snapshot)) => {
                 *self.native_type.lock() = Some(snapshot.value.dbr_type());
+                // DBR_TIME (the default form) ships value + alarm +
+                // timestamp only — no display/control/enums fields.
+                // Re-inject what we captured at the first DBR_CTRL read
+                // so the per-call dict stays complete (in particular,
+                // enum_strs survives so char_value resolves to the
+                // label instead of degrading to the raw int index).
+                self.cached_ctrl.lock().enrich(&mut snapshot);
                 Ok(Some(snapshot_to_pydict(py, &snapshot)))
             }
             Ok(Err(e)) => {
@@ -487,10 +548,23 @@ impl EpicsRsPV {
         Ok(())
     }
 
-    /// Register a monitor callback.
+    /// Register the monitor callback.
     ///
-    /// Events flow: tokio monitor task → mpsc queue → Python dispatch thread → callback.
-    /// This avoids GIL acquisition in tokio tasks, preventing deadlocks with put().
+    /// **Set semantics, not add**: only one callback at a time — a
+    /// second registration replaces the first. The "add" prefix is a
+    /// historical artefact preserved for backward compatibility; new
+    /// code should call `set_monitor_callback` (alias). Multi-callback
+    /// fan-out belongs at the shim layer (`EpicsRsShimPV._callbacks`),
+    /// which keeps a Python-side dict and registers a single
+    /// dispatcher with the native PV.
+    ///
+    /// Events flow: tokio monitor task → mpsc queue → Python dispatch
+    /// thread → callback. This avoids GIL acquisition in tokio tasks,
+    /// preventing deadlocks with put().
+    fn set_monitor_callback(&self, py: Python<'_>, callback: PyObject) {
+        self.add_monitor_callback(py, callback);
+    }
+
     fn add_monitor_callback(&self, py: Python<'_>, callback: PyObject) {
         *self.py_monitor_callback.lock() = Some(callback.clone_ref(py));
 
@@ -521,8 +595,9 @@ impl EpicsRsPV {
         // Start Python dispatch thread — reads from queue, calls Python callback
         let cb_ref = self.py_monitor_callback.clone();
         let gen_ref = self.monitor_generation.clone();
+        let cached_ctrl_ref = self.cached_ctrl.clone();
         let dispatch = std::thread::spawn(move || {
-            while let Ok(event) = rx.recv() {
+            while let Ok(mut event) = rx.recv() {
                 // Race guard: if a NEW set_callback ran while we still
                 // had pending events, the canonical generation has
                 // advanced past ours — the new dispatch thread owns
@@ -530,6 +605,11 @@ impl EpicsRsPV {
                 if gen_ref.load(std::sync::atomic::Ordering::SeqCst) != generation {
                     continue;
                 }
+                // Enrich monitor snapshot with cached CTRL fields —
+                // DBR_TIME monitors don't carry display/control/enums
+                // on the wire, so without this the dispatch path
+                // silently degrades enum char_value to a missing key.
+                cached_ctrl_ref.lock().enrich(&mut event.snapshot);
                 crate::safe_call!(Python::with_gil(|py| {
                     let guard = cb_ref.lock();
                     let callback = match &*guard {
@@ -891,11 +971,20 @@ impl EpicsRsPV {
             _ => DbrClass::Time,
         };
         let cache = self.native_type.clone();
+        let cached_ctrl = self.cached_ctrl.clone();
         let pvname = self.pvname.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             match tokio::time::timeout(dur, channel.get_with_metadata(class)).await {
-                Ok(Ok(snapshot)) => {
+                Ok(Ok(mut snapshot)) => {
                     *cache.lock() = Some(snapshot.value.dbr_type());
+                    // Capture if this read brought CTRL fields, then
+                    // enrich any DBR_TIME read with the cache so the
+                    // dict stays complete (units/limits/enum_strs).
+                    {
+                        let mut g = cached_ctrl.lock();
+                        g.capture(&snapshot);
+                        g.enrich(&mut snapshot);
+                    }
                     crate::safe_call_or!(
                         Err(PyRuntimeError::new_err(format!(
                             "get_reading on {pvname}: panic in Python::with_gil during snapshot conversion"

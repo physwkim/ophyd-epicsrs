@@ -26,11 +26,23 @@ from typing import Any, Mapping, get_args, get_origin
 
 import numpy as np
 
+try:
+    from ophyd_async.core import Table
+except ImportError:  # pragma: no cover - ophyd-async is a hard dep, but stay safe
+    Table = None  # type: ignore[assignment]
+
+try:
+    from ophyd_async.epics.core._util import get_supported_values
+except ImportError:  # pragma: no cover
+    get_supported_values = None  # type: ignore[assignment]
+
 
 class Converter:
     """Identity converter — used when no datatype hint is given."""
 
-    def update_metadata(self, metadata: Mapping[str, Any]) -> None:  # noqa: D401
+    def update_metadata(
+        self, metadata: Mapping[str, Any], source: str = "<unknown>"
+    ) -> None:
         """Update internal state from connect-time metadata."""
 
     def to_python(self, raw: Any, _metadata: Mapping[str, Any] | None = None) -> Any:
@@ -99,12 +111,36 @@ class _FloatConverter(Converter):
         return "number", [], np.dtype(np.float64).str
 
 
+def _decode_char_array(raw: list | tuple) -> str | None:
+    """Decode a CA char waveform (DBR_CHAR array) as null-terminated UTF-8.
+
+    Returns None if the input does not look like a char array.
+    """
+    if not raw or not all(isinstance(x, int) for x in raw):
+        return None
+    if not all(0 <= x <= 255 for x in raw):
+        return None
+    try:
+        end = raw.index(0)
+    except ValueError:
+        end = len(raw)
+    try:
+        return bytes(raw[:end]).decode("utf-8", errors="replace")
+    except (ValueError, OverflowError):
+        return None
+
+
 class _StrConverter(Converter):
     def to_python(self, raw, _metadata=None):
         if raw is None:
             return None
         if isinstance(raw, bytes):
             return raw.decode("utf-8", errors="replace")
+        # CA char waveform PV (DBR_CHAR array) → null-terminated UTF-8 string
+        if isinstance(raw, (list, tuple)):
+            decoded = _decode_char_array(raw)
+            if decoded is not None:
+                return decoded
         return str(raw)
 
     def to_wire(self, value):
@@ -112,6 +148,10 @@ class _StrConverter(Converter):
             return None
         if isinstance(value, Enum):
             return str(value.value)
+        # For char waveform targets, the Rust convert layer will detect
+        # DbFieldType::Char and convert string → null-terminated bytes
+        # automatically. So returning a plain str works for both
+        # DBR_STRING and DBR_CHAR_ARRAY targets.
         return str(value)
 
     def datakey_dtype(self, _value):
@@ -121,18 +161,39 @@ class _StrConverter(Converter):
 class _EnumConverter(Converter):
     """Map integer index ↔ enum-string ↔ ``EnumCls`` instance.
 
-    ``enum_strs`` is sourced from metadata when available, with a fallback
-    to whatever was cached at connect time.
+    On ``update_metadata`` the converter validates the IOC's ``enum_strs``
+    against the enum class declaration via ophyd-async's
+    :func:`get_supported_values`. This raises :class:`TypeError` for:
+
+    - ``StrictEnum``: PV choices and enum values must match exactly
+    - ``SubsetEnum``: enum values must be a subset of PV choices
+    - ``SupersetEnum``: PV choices must be a subset of enum values
+
+    Validation is best-effort during smoke testing (no metadata, e.g.
+    PVA stub) — ``to_python`` falls back to ``enum_cls(string)`` lookup
+    in that case.
     """
 
     def __init__(self, enum_cls: type[Enum]):
         self.enum_cls = enum_cls
         self._cached_strs: list[str] = []
+        # Mapping str → EnumCls instance (for StrictEnum / SupersetEnum
+        # all values are EnumCls; for SubsetEnum some are raw strings).
+        self._supported: dict[str, Enum | str] | None = None
 
-    def update_metadata(self, metadata: Mapping[str, Any]) -> None:
+    def update_metadata(
+        self, metadata: Mapping[str, Any], source: str = "<unknown>"
+    ) -> None:
         choices = metadata.get("enum_strs")
-        if choices:
-            self._cached_strs = list(choices)
+        if not choices:
+            return
+        self._cached_strs = list(choices)
+        if get_supported_values is None:  # pragma: no cover
+            return
+        # Raises TypeError if PV choices violate Strict/Subset/Superset semantics
+        self._supported = dict(
+            get_supported_values(source, self.enum_cls, list(choices))
+        )
 
     def _strs(self, metadata: Mapping[str, Any] | None) -> list[str]:
         if metadata:
@@ -156,10 +217,14 @@ class _EnumConverter(Converter):
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8", errors="replace")
         if isinstance(raw, str):
+            # Prefer the validated mapping (handles SubsetEnum's mixed
+            # enum/string return values cleanly).
+            if self._supported is not None and raw in self._supported:
+                return self._supported[raw]
             try:
                 return self.enum_cls(raw)
             except ValueError:
-                # SubsetEnum: PV may return a value outside our enum.
+                # PV value outside our enum (SubsetEnum) — return raw string.
                 return raw
         return raw
 
@@ -203,6 +268,52 @@ class _NumpyArrayConverter(Converter):
             return "array", [0], np.dtype(np.float64).str
         arr = np.asarray(value)
         return "array", list(arr.shape), arr.dtype.str
+
+
+class _TableConverter(Converter):
+    """Convert PVA NTTable structure ↔ ``ophyd_async.core.Table`` subclass.
+
+    Wire format from PVA: ``{"col1": [...], "col2": [...], ...}`` (the
+    ``value`` substructure of NTTable, projected by our pva_convert layer).
+    """
+
+    def __init__(self, table_cls: type):
+        self.table_cls = table_cls
+
+    def to_python(self, raw, _metadata=None):
+        if raw is None:
+            return None
+        if isinstance(raw, self.table_cls):
+            return raw
+        if isinstance(raw, dict):
+            # pydantic validation in Table.__init__ will coerce columns
+            return self.table_cls(**raw)
+        return raw
+
+    def to_wire(self, value):
+        if value is None:
+            return None
+        if hasattr(value, "model_dump"):
+            return value.model_dump()
+        if isinstance(value, dict):
+            return value
+        return value
+
+    def datakey_dtype(self, value):
+        if value is None:
+            return "array", [0], "|V0"
+        # Use the Table's structured numpy dtype — one row per index.
+        # For structured dtypes ophyd-async / event-model expects the
+        # `descr` list-of-tuples form (e.g. [('a', '|i1'), ('b', '|S40')])
+        # rather than the opaque "|VN" string.
+        if hasattr(value, "numpy_dtype") and hasattr(value, "__len__"):
+            try:
+                nd = value.numpy_dtype()
+                dtype_numpy = nd.descr if len(nd.descr) > 1 else nd.str
+                return "array", [len(value)], dtype_numpy
+            except (ValueError, TypeError):
+                pass
+        return "array", [0], "|V0"
 
 
 class _SequenceConverter(Converter):
@@ -277,6 +388,10 @@ def make_converter(datatype: Any) -> Converter:
     # Enum subclasses (StrictEnum / SubsetEnum / SupersetEnum / plain Enum)
     if isinstance(datatype, type) and issubclass(datatype, Enum):
         return _EnumConverter(datatype)
+
+    # Table subclasses (pydantic-based ophyd-async NTTable wrapper)
+    if Table is not None and isinstance(datatype, type) and issubclass(datatype, Table):
+        return _TableConverter(datatype)
 
     # numpy.ndarray (with or without dtype argument)
     origin = get_origin(datatype)

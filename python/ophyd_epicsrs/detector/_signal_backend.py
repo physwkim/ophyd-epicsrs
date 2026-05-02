@@ -100,16 +100,20 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
             ok_w = ok_r
         if not (ok_r and ok_w):
             raise NotConnectedError(self.source("", read=True))
-        # Pull initial metadata so the converter can cache enum_strs etc.
-        # Failure here is not fatal — get_value works without it for non-enum types.
+        # Pull initial metadata so the converter can cache enum_strs,
+        # Table column types, etc. Transient I/O errors here are OK
+        # (we just degrade to runtime fetch later), but if metadata IS
+        # received and the converter rejects it (e.g. StrictEnum choices
+        # mismatch) that TypeError propagates as a connect failure —
+        # caller is asking for a typed signal that does not match the IOC.
         try:
             md = await self._read_pv_native.get_reading_async(
                 timeout=min(timeout, 2.0), form="ctrl"
             )
-            if md is not None:
-                self._converter.update_metadata(md)
-        except Exception:  # noqa: BLE001 — best-effort cache populate
-            pass
+        except Exception:  # noqa: BLE001 — transient I/O, retry on next get
+            md = None
+        if md is not None:
+            self._converter.update_metadata(md, source=self.source("", read=True))
 
     async def put(self, value: SignalDatatypeT | None):
         if value is None:

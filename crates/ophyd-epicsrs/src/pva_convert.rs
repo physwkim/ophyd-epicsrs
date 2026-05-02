@@ -240,13 +240,7 @@ pub fn pvfield_to_metadata(py: Python<'_>, field: &PvField) -> PyObject {
                 let _ = dict.set_item("posixseconds", secs);
                 let _ = dict.set_item("nanoseconds", nanos);
             } else {
-                use std::time::{SystemTime, UNIX_EPOCH};
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default();
-                let _ = dict.set_item("timestamp", now.as_secs_f64());
-                let _ = dict.set_item("posixseconds", now.as_secs() as i64);
-                let _ = dict.set_item("nanoseconds", now.subsec_nanos());
+                set_client_timestamp(&dict);
             }
 
             // display
@@ -293,14 +287,32 @@ pub fn pvfield_to_metadata(py: Python<'_>, field: &PvField) -> PyObject {
                 }
             }
         }
-        // Non-NT top-level value — just wrap as value
+        // Non-NT top-level value (Variant, ScalarArray, etc.) — wrap
+        // the raw value and stamp a client-side timestamp so callers
+        // never see a 0.0 epoch as a "valid" Reading.
         other => {
             let _ = dict.set_item("value", pvfield_to_py(py, other));
             let _ = dict.set_item("char_value", format!("{other}"));
             let _ = dict.set_item("severity", 0i64);
             let _ = dict.set_item("status", 0i64);
+            set_client_timestamp(&dict);
         }
     }
 
     dict.into_any().unbind()
+}
+
+/// Stamp a client-side timestamp on the metadata dict and mark it as
+/// such. `client_timestamp = True` so downstream code can distinguish
+/// IOC-sourced from synthesized timestamps (and choose to ignore the
+/// latter for time-critical metrics).
+fn set_client_timestamp(dict: &Bound<'_, PyDict>) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let _ = dict.set_item("timestamp", now.as_secs_f64());
+    let _ = dict.set_item("posixseconds", now.as_secs() as i64);
+    let _ = dict.set_item("nanoseconds", now.subsec_nanos());
+    let _ = dict.set_item("client_timestamp", true);
 }

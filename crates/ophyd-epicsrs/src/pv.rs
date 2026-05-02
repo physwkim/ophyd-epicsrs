@@ -710,14 +710,18 @@ impl EpicsRsPV {
         })
     }
 
-    /// Async: populate the cached native_type by reading the channel's
-    /// metadata via `CaChannel::info()` — a coordinator query that does
-    /// NOT issue a CA read. Returns True on success, False on timeout.
+    /// Async: populate the cached native_type. Strategy in order:
     ///
-    /// Used by SignalBackend.connect() so subsequent put_nowait_async
-    /// calls do not have to do a synchronous pre-read to discover the
-    /// PV's DbFieldType. Critical for write-only PVs (where reads fail)
-    /// and for honoring the no-wait semantics on busy records.
+    /// 1. Cache hit — return immediately (no I/O).
+    /// 2. Drain the background prefetch_handle started at PV creation
+    ///    — the prefetch already did wait_connected + info() + a CTRL
+    ///    read, so consuming it costs ~0 round trips.
+    /// 3. Fall back to channel.info() (coordinator query, no CA read).
+    ///
+    /// Returns True on success, False on timeout — used by
+    /// SignalBackend.connect to ensure subsequent puts (especially
+    /// put_nowait_async on busy records) don't pay the channel.info()
+    /// latency on the put path.
     #[pyo3(signature = (timeout=2.0))]
     fn cache_native_type_async<'py>(
         &self,
@@ -727,11 +731,22 @@ impl EpicsRsPV {
         let channel = self.channel.clone();
         let dur = Duration::from_secs_f64(timeout);
         let cache = self.native_type.clone();
+        // Drain the prefetch handle once if it's still pending — this
+        // recovers the work the constructor's spawn already did and
+        // avoids issuing a redundant info() round trip.
+        let prefetch = self.prefetch_handle.lock().take();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            // Skip if already cached.
             if cache.lock().is_some() {
                 return Ok(true);
             }
+            // Try the prefetch first.
+            if let Some(handle) = prefetch {
+                if let Ok(Ok(Some(result))) = tokio::time::timeout(dur, handle).await {
+                    *cache.lock() = Some(result.native_type);
+                    return Ok(true);
+                }
+            }
+            // Fallback: standalone channel.info() query.
             match tokio::time::timeout(dur, channel.info()).await {
                 Ok(Ok(info)) => {
                     *cache.lock() = Some(info.native_type);

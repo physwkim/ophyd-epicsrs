@@ -906,7 +906,9 @@ fn extract_dtype_hints(
 }
 
 /// Convert a Python value to a string suitable for `PvaClient::pvput`.
-/// pvxs accepts comma-separated values for arrays.
+/// pvxs accepts comma-separated values for arrays. Strings containing
+/// commas, quotes, or whitespace are JSON-escaped + quoted so the
+/// pvxs parser sees a single element instead of splitting them.
 fn python_value_to_pvput_string(value: &Bound<'_, pyo3::PyAny>) -> PyResult<String> {
     // numpy scalar → Python scalar
     if value.hasattr("dtype").unwrap_or(false) && value.hasattr("ndim").unwrap_or(false) {
@@ -916,7 +918,6 @@ fn python_value_to_pvput_string(value: &Bound<'_, pyo3::PyAny>) -> PyResult<Stri
                 return python_value_to_pvput_string(&native);
             }
         } else {
-            // numpy array → list of strings
             let lst: Vec<Bound<'_, pyo3::PyAny>> = value.try_iter()?.collect::<PyResult<_>>()?;
             let parts: Vec<String> = lst
                 .iter()
@@ -939,8 +940,6 @@ fn python_value_to_pvput_string(value: &Bound<'_, pyo3::PyAny>) -> PyResult<Stri
             .collect::<PyResult<_>>()?;
         return Ok(parts.join(","));
     }
-    // Scalar fallback — Python's str() representation works for most
-    // numeric / boolean / string types and matches pvput's parser.
     if let Ok(b) = value.extract::<bool>() {
         return Ok(if b {
             "true".to_string()
@@ -948,8 +947,9 @@ fn python_value_to_pvput_string(value: &Bound<'_, pyo3::PyAny>) -> PyResult<Stri
             "false".to_string()
         });
     }
+    // Strings before integers, since `bool` extracts as int too.
     if let Ok(s) = value.extract::<String>() {
-        return Ok(s);
+        return Ok(escape_pvput_string(&s));
     }
     if let Ok(i) = value.extract::<i64>() {
         return Ok(i.to_string());
@@ -958,5 +958,38 @@ fn python_value_to_pvput_string(value: &Bound<'_, pyo3::PyAny>) -> PyResult<Stri
         return Ok(f.to_string());
     }
     let s = value.str()?.to_string();
-    Ok(s)
+    Ok(escape_pvput_string(&s))
+}
+
+/// Escape a string for the pvxs value parser. Wraps in double quotes
+/// and JSON-escapes the contents whenever the raw value would be
+/// ambiguous (commas → ScalarArray split, quotes → premature
+/// termination, leading whitespace → trim). For "safe" strings we
+/// keep the unquoted form to remain compatible with parsers that don't
+/// accept quoted scalars.
+fn escape_pvput_string(s: &str) -> String {
+    let needs_quoting = s.is_empty()
+        || s.contains(',')
+        || s.contains('"')
+        || s.contains('\\')
+        || s.contains('\n')
+        || s.starts_with(' ')
+        || s.ends_with(' ');
+    if !needs_quoting {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
 }

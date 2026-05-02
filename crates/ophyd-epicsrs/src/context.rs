@@ -27,13 +27,9 @@ pub struct EpicsRsContext {
 impl EpicsRsContext {
     #[new]
     fn new() -> PyResult<Self> {
-        // Build a multi-threaded runtime that stays alive.
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| {
-                PyRuntimeError::new_err(format!("failed to create tokio runtime: {e}"))
-            })?;
+        // Use the process-wide shared runtime so sync (this) and async
+        // (pyo3-async-runtimes) entry points share one tokio executor.
+        let runtime = crate::runtime::shared_runtime();
 
         // Create CaClient inside a spawned task so background tasks
         // are properly rooted in the runtime's thread pool,
@@ -52,7 +48,7 @@ impl EpicsRsContext {
         };
 
         Ok(Self {
-            runtime: Arc::new(runtime),
+            runtime,
             client: Arc::new(client),
         })
     }

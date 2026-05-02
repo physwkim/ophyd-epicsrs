@@ -12,6 +12,7 @@ crate-type = ["cdylib"]
 [dependencies]
 epics-rs = { version = "0.13.0", features = ["ca", "pva"] }
 pyo3 = { version = "0.24", features = ["extension-module", "abi3-py38"] }
+pyo3-async-runtimes = { version = "0.24", features = ["tokio-runtime"] }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
 parking_lot = "0.12"
 tracing = "0.1"

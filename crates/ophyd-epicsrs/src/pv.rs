@@ -656,6 +656,112 @@ impl EpicsRsPV {
         }
     }
 
+    // ===== async surface (pyo3-async-runtimes) =====
+    //
+    // These methods return Python awaitables. They share the same tokio
+    // runtime, CaClient, and CaChannel cache as the sync methods above —
+    // mixed sync+async use against the same PV is safe.
+
+    /// Async: wait until the PV is connected. Returns True on success,
+    /// False on timeout. Mirrors `wait_for_connection` (sync).
+    fn connect_async<'py>(
+        &self,
+        py: Python<'py>,
+        timeout: f64,
+    ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
+        let channel = self.channel.clone();
+        let dur = Duration::from_secs_f64(timeout);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            Ok(channel.wait_connected(dur).await.is_ok())
+        })
+    }
+
+    /// Async: read the PV value (no metadata). Returns the converted
+    /// Python value, or None on failure/timeout.
+    #[pyo3(signature = (timeout=2.0))]
+    fn get_value_async<'py>(
+        &self,
+        py: Python<'py>,
+        timeout: f64,
+    ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
+        let channel = self.channel.clone();
+        let dur = Duration::from_secs_f64(timeout);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let result = tokio::time::timeout(dur, channel.get()).await;
+            match result {
+                Ok(Ok((_dbr, val))) => Python::with_gil(|py| Ok(crate::convert::epics_value_to_py(py, &val))),
+                _ => Python::with_gil(|py| Ok(py.None())),
+            }
+        })
+    }
+
+    /// Async: read value + metadata. Returns the same dict shape as
+    /// the sync `get_with_metadata`.
+    #[pyo3(signature = (timeout=2.0, form="time"))]
+    fn get_reading_async<'py>(
+        &self,
+        py: Python<'py>,
+        timeout: f64,
+        form: &str,
+    ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
+        let channel = self.channel.clone();
+        let dur = Duration::from_secs_f64(timeout);
+        let class = match form {
+            "ctrl" | "control" => DbrClass::Ctrl,
+            _ => DbrClass::Time,
+        };
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let result = tokio::time::timeout(dur, channel.get_with_metadata(class)).await;
+            match result {
+                Ok(Ok(snapshot)) => Python::with_gil(|py| Ok(crate::convert::snapshot_to_pydict(py, &snapshot))),
+                _ => Python::with_gil(|py| Ok(py.None())),
+            }
+        })
+    }
+
+    /// Async: write a value. Returns True on success, False on failure
+    /// or timeout. Always waits for write_notify ack.
+    #[pyo3(signature = (value, timeout=300.0))]
+    fn put_async<'py>(
+        &self,
+        py: Python<'py>,
+        value: &Bound<'_, pyo3::PyAny>,
+        timeout: f64,
+    ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
+        // Resolve native type once (sync path) so we can convert the value.
+        let native = {
+            let cached = self.native_type.lock();
+            match *cached {
+                Some(t) => t,
+                None => {
+                    drop(cached);
+                    let channel = self.channel.clone();
+                    let dur = Duration::from_secs_f64(timeout.min(5.0));
+                    let snap = py.allow_threads(|| {
+                        self.spawn_wait(async move {
+                            tokio::time::timeout(dur, channel.get_with_metadata(DbrClass::Plain)).await
+                        })
+                    })?;
+                    match snap {
+                        Ok(Ok(s)) => {
+                            let t = s.value.dbr_type();
+                            *self.native_type.lock() = Some(t);
+                            t
+                        }
+                        _ => return Err(PyRuntimeError::new_err("cannot determine PV native type for put")),
+                    }
+                }
+            }
+        };
+        let epics_val = crate::convert::py_to_epics_value(value, native)?;
+        let channel = self.channel.clone();
+        let dur = Duration::from_secs_f64(timeout);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let result = tokio::time::timeout(dur, channel.put(&epics_val)).await;
+            Ok(matches!(result, Ok(Ok(()))))
+        })
+    }
+
     fn __repr__(&self) -> String {
         format!("EpicsRsPV('{}')", self.pvname)
     }

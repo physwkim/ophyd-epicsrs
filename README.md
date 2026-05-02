@@ -63,6 +63,51 @@ same keys they expect from CA.
 NTNDArray (areaDetector image streams over PVA) is **not yet supported**;
 use the CA backend for areaDetector image PVs until the next release.
 
+## Async surface
+
+Both `EpicsRsPV` (CA) and `EpicsRsPvaPV` (PVA) expose `*_async` methods
+that return Python awaitables, in addition to the sync methods used by
+ophyd. The async path goes through `pyo3-async-runtimes` and shares the
+same tokio runtime as the sync path — no runtime fragmentation, same
+channel cache, mixed use against the same PV is safe.
+
+```python
+from ophyd_epicsrs._native import EpicsRsContext, EpicsRsPvaContext
+import asyncio
+
+ctx_ca = EpicsRsContext()
+ctx_pva = EpicsRsPvaContext()
+
+async def main():
+    pv_ca = ctx_ca.create_pv("IOC:motor.RBV")
+    pv_pva = ctx_pva.create_pv("IOC:nt:scalar")
+
+    # Wait for connection in parallel
+    ok_ca, ok_pva = await asyncio.gather(
+        pv_ca.connect_async(timeout=5.0),
+        pv_pva.connect_async(timeout=5.0),
+    )
+
+    # Read value (scalar) or full reading (value + alarm + timestamp + display)
+    val = await pv_ca.get_value_async()
+    reading = await pv_pva.get_reading_async()
+
+    # Write — returns True on success
+    ok = await pv_ca.put_async(0.5)
+
+asyncio.run(main())
+```
+
+Available async methods on both CA and PVA wrappers:
+
+- `connect_async(timeout) -> bool`
+- `get_value_async(timeout) -> Any`
+- `get_reading_async(timeout, form) -> dict | None`
+- `put_async(value, timeout) -> bool`
+
+The sync surface (`wait_for_connection`, `get_with_metadata`, `put`, etc.)
+remains unchanged — existing ophyd code works exactly as before.
+
 ## Parallel PV Read (bulk_caget)
 
 Read multiple PVs concurrently in a single call. All CA requests are sent simultaneously using tokio async, completing in one network round-trip instead of N sequential reads.

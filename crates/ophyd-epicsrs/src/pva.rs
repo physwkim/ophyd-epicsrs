@@ -43,25 +43,13 @@ pub struct EpicsRsPvaContext {
 impl EpicsRsPvaContext {
     #[new]
     fn new() -> PyResult<Self> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| PyRuntimeError::new_err(format!("failed to create tokio runtime: {e}")))?;
-        let runtime = Arc::new(runtime);
+        // Share the process-wide tokio runtime with CA + async surface.
+        let runtime = crate::runtime::shared_runtime();
 
-        // Build the PvaClient on the runtime so its background tasks
-        // root in the runtime's thread pool.
-        let (tx, rx) = std::sync::mpsc::channel();
-        let rt_clone = runtime.clone();
-        runtime.spawn(async move {
-            let client = PvaClient::new();
-            let _ = tx.send(client);
-            // keep handle alive via runtime ownership
-            let _ = rt_clone;
-        });
-        let client = rx
-            .recv()
-            .map_err(|_| PyRuntimeError::new_err("runtime channel closed"))?
+        // PvaClient::new() and the underlying builder are sync, so no
+        // need to spawn for construction. Background tasks (search engine,
+        // connection pool) are spawned lazily on first channel use.
+        let client = PvaClient::new()
             .map_err(|e| PyRuntimeError::new_err(format!("failed to create PVA client: {e}")))?;
 
         Ok(Self { runtime, client })
@@ -441,6 +429,99 @@ impl EpicsRsPvaPV {
             handle.abort();
         }
         *self.connected.lock() = false;
+    }
+
+    // ===== async surface (pyo3-async-runtimes) =====
+    //
+    // Mirrors the CA EpicsRsPV async methods. Same shared runtime,
+    // same PvaClient channel cache as the sync methods above.
+
+    /// Async: wait until the channel is connected. Returns True/False.
+    fn connect_async<'py>(
+        &self,
+        py: Python<'py>,
+        timeout: f64,
+    ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
+        let client = self.client.clone();
+        let name = self.pvname.clone();
+        let dur = Duration::from_secs_f64(timeout);
+        let connected_ref = self.connected.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let ok = matches!(tokio::time::timeout(dur, client.pvconnect(&name)).await, Ok(Ok(_)));
+            *connected_ref.lock() = ok;
+            Ok(ok)
+        })
+    }
+
+    /// Async: read the PV value (NTScalar value field, or whole PvField).
+    /// Returns Python value, or None on failure/timeout.
+    #[pyo3(signature = (timeout=2.0))]
+    fn get_value_async<'py>(
+        &self,
+        py: Python<'py>,
+        timeout: f64,
+    ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
+        let client = self.client.clone();
+        let name = self.pvname.clone();
+        let dur = Duration::from_secs_f64(timeout);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let result = tokio::time::timeout(dur, client.pvget(&name)).await;
+            match result {
+                Ok(Ok(field)) => Python::with_gil(|py| {
+                    // Extract `.value` for NTScalar; fall back to whole field.
+                    let value_field = match &field {
+                        epics_rs::pva::pvdata::PvField::Structure(s) => s
+                            .get_field("value")
+                            .cloned()
+                            .unwrap_or_else(|| field.clone()),
+                        _ => field.clone(),
+                    };
+                    Ok(crate::pva_convert::pvfield_to_py(py, &value_field))
+                }),
+                _ => Python::with_gil(|py| Ok(py.None())),
+            }
+        })
+    }
+
+    /// Async: read value + metadata as ophyd-compatible dict.
+    #[pyo3(signature = (timeout=2.0, form="time"))]
+    fn get_reading_async<'py>(
+        &self,
+        py: Python<'py>,
+        timeout: f64,
+        form: &str,
+    ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
+        let _ = form;
+        let client = self.client.clone();
+        let name = self.pvname.clone();
+        let dur = Duration::from_secs_f64(timeout);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let result = tokio::time::timeout(dur, client.pvget(&name)).await;
+            match result {
+                Ok(Ok(field)) => Python::with_gil(|py| {
+                    Ok(crate::pva_convert::pvfield_to_metadata(py, &field))
+                }),
+                _ => Python::with_gil(|py| Ok(py.None())),
+            }
+        })
+    }
+
+    /// Async: write a value via string-form pvput. Returns True on success.
+    #[pyo3(signature = (value, timeout=300.0))]
+    fn put_async<'py>(
+        &self,
+        py: Python<'py>,
+        value: &Bound<'_, pyo3::PyAny>,
+        timeout: f64,
+    ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
+        let value_str = python_value_to_pvput_string(value)?;
+        let client = self.client.clone();
+        let name = self.pvname.clone();
+        let dur = Duration::from_secs_f64(timeout);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let result = tokio::time::timeout(dur, client.pvput(&name, &value_str)).await;
+            Ok(matches!(result, Ok(Ok(()))))
+        })
     }
 
     fn __repr__(&self) -> String {

@@ -363,11 +363,11 @@ impl EpicsRsPV {
                 Ok(Some(snapshot_to_pydict(py, &snapshot)))
             }
             Ok(Err(e)) => {
-                eprintln!("get_with_metadata({}) failed: {e}", self.pvname);
+                tracing::warn!(target: "ophyd_epicsrs::ca", pv = %self.pvname, "get_with_metadata failed: {e}");
                 Ok(None)
             }
             Err(_) => {
-                eprintln!("get_with_metadata({}) timed out", self.pvname);
+                tracing::warn!(target: "ophyd_epicsrs::ca", pv = %self.pvname, "get_with_metadata timed out");
                 Ok(None)
             }
         }
@@ -425,11 +425,11 @@ impl EpicsRsPV {
                 let success = match tokio::time::timeout(dur, channel.put(&epics_val)).await {
                     Ok(Ok(())) => true,
                     Ok(Err(e)) => {
-                        eprintln!("[put] {pvname} error: {e}");
+                        tracing::warn!(target: "ophyd_epicsrs::ca", pv = %pvname, "put error: {e}");
                         false
                     }
                     Err(_) => {
-                        eprintln!("[put] {pvname} timed out");
+                        tracing::warn!(target: "ophyd_epicsrs::ca", pv = %pvname, "put timed out");
                         false
                     }
                 };
@@ -446,7 +446,7 @@ impl EpicsRsPV {
             let pvname = self.pvname.clone();
             self.runtime.spawn(async move {
                 if let Err(e) = channel.put_nowait(&epics_val).await {
-                    eprintln!("[put] {pvname} error: {e}");
+                    tracing::warn!(target: "ophyd_epicsrs::ca", pv = %pvname, "put_nowait error: {e}");
                 }
             });
         }

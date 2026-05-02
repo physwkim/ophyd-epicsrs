@@ -156,6 +156,14 @@ class EpicsRsShimPV:
         self._pv.set_access_callback(self._on_access_change)
 
     def _on_connection_change(self, connected):
+        # Deduplicate: the Rust layer fires this from both
+        # emit_current_connection_state (one-shot probe) and the
+        # connection_events() stream, plus wait_for_connection's
+        # explicit invocation when self.connected is False. Without
+        # this guard the user's connection_callback could be called
+        # 2-3x for a single physical connect.
+        if self.connected == connected:
+            return
         self.connected = connected
         if connected and self.auto_monitor:
             self._pv.add_monitor_callback(self._on_monitor_update)
@@ -171,7 +179,7 @@ class EpicsRsShimPV:
         if result and not self.connected:
             self._on_connection_change(True)
         if result:
-            if not self._args.get("value") is not None:
+            if self._args.get("value") is None:
                 md = self._pv.get_with_metadata(timeout=timeout or 2.0, form=self.form)
                 if md:
                     self._args.update(md)

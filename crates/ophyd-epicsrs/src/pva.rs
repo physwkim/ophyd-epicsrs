@@ -177,11 +177,11 @@ impl EpicsRsPvaPV {
         match result {
             Ok(Ok(field)) => Ok(Some(pvfield_to_metadata(py, &field))),
             Ok(Err(e)) => {
-                eprintln!("pvget({}) failed: {e}", self.pvname);
+                tracing::warn!(target: "ophyd_epicsrs::pva", pv = %self.pvname, "pvget failed: {e}");
                 Ok(None)
             }
             Err(_) => {
-                eprintln!("pvget({}) timed out", self.pvname);
+                tracing::warn!(target: "ophyd_epicsrs::pva", pv = %self.pvname, "pvget timed out");
                 Ok(None)
             }
         }
@@ -268,11 +268,11 @@ impl EpicsRsPvaPV {
                     match tokio::time::timeout(dur, client.pvput(&pvname, &value_str)).await {
                         Ok(Ok(())) => true,
                         Ok(Err(e)) => {
-                            eprintln!("[pvput] {pvname} error: {e}");
+                            tracing::warn!(target: "ophyd_epicsrs::pva", pv = %pvname, "pvput error: {e}");
                             false
                         }
                         Err(_) => {
-                            eprintln!("[pvput] {pvname} timed out");
+                            tracing::warn!(target: "ophyd_epicsrs::pva", pv = %pvname, "pvput timed out");
                             false
                         }
                     };
@@ -284,7 +284,7 @@ impl EpicsRsPvaPV {
             let pvname = self.pvname.clone();
             self.runtime.spawn(async move {
                 if let Err(e) = tokio::time::timeout(dur, client.pvput(&pvname, &value_str)).await {
-                    eprintln!("[pvput] {pvname} error: {e}");
+                    tracing::warn!(target: "ophyd_epicsrs::pva", pv = %pvname, "pvput error: {e}");
                 }
             });
         }
@@ -381,7 +381,7 @@ impl EpicsRsPvaPV {
                     }
                 }
                 Err(e) => {
-                    eprintln!("[pvmonitor_handle] {pvname_for_call}: subscribe failed: {e}");
+                    tracing::warn!(target: "ophyd_epicsrs::pva", pv = %pvname_for_call, "pvmonitor_handle subscribe failed: {e}");
                 }
             }
         });

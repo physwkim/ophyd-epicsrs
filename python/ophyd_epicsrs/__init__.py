@@ -3,9 +3,20 @@
 import logging
 import types
 
-from ophyd_epicsrs._native import EpicsRsContext, EpicsRsPV
+from ophyd_epicsrs._native import (
+    EpicsRsContext,
+    EpicsRsPV,
+    caught_panic_count,
+    reset_log_cache,
+)
 
-__all__ = ["EpicsRsContext", "EpicsRsPV", "use_epicsrs"]
+__all__ = [
+    "EpicsRsContext",
+    "EpicsRsPV",
+    "caught_panic_count",
+    "reset_log_cache",
+    "use_epicsrs",
+]
 
 
 def use_epicsrs(*, logger=None):

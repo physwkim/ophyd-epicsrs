@@ -610,11 +610,26 @@ impl EpicsRsPvaPV {
         let name = self.pvname.clone();
         let dur = Duration::from_secs_f64(timeout);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            // PyErr::new_err is GIL-free at construction (the message
+            // is realised lazily), so it's safe to use as the
+            // safe_call_or! default — even if the GIL acquisition
+            // itself panics during a finalize race.
+            let panic_err = || {
+                Err::<PyObject, PyErr>(PyRuntimeError::new_err(
+                    "get_field_desc_async: panic in Python::with_gil",
+                ))
+            };
             match tokio::time::timeout(dur, client.pvinfo(&name)).await {
-                Ok(Ok(desc)) => Python::with_gil(|py| {
-                    Ok::<PyObject, PyErr>(field_desc_to_py(py, &desc).into_any().unbind())
-                }),
-                _ => Python::with_gil(|py| Ok::<PyObject, PyErr>(py.None())),
+                Ok(Ok(desc)) => crate::safe_call_or!(
+                    panic_err(),
+                    Python::with_gil(|py| Ok::<PyObject, PyErr>(
+                        field_desc_to_py(py, &desc).into_any().unbind()
+                    ))
+                ),
+                _ => crate::safe_call_or!(
+                    panic_err(),
+                    Python::with_gil(|py| Ok::<PyObject, PyErr>(py.None()))
+                ),
             }
         })
     }
@@ -638,27 +653,32 @@ impl EpicsRsPvaPV {
         let dur = Duration::from_secs_f64(timeout);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             match tokio::time::timeout(dur, client.pvget(&name)).await {
-                Ok(Ok(field)) => Python::with_gil(|py| {
-                    // NTEnum handling: top-level Structure with a
-                    // `value` substructure containing {index, choices}.
-                    // Surface the int index (consistent with monitor).
-                    if let epics_rs::pva::pvdata::PvField::Structure(s) = &field {
-                        if let Some((idx, _choices)) = crate::pva_convert::try_extract_ntenum(s) {
-                            return Ok::<PyObject, PyErr>(
-                                idx.into_pyobject(py).unwrap().into_any().unbind(),
-                            );
+                Ok(Ok(field)) => crate::safe_call_or!(
+                    Err(PyRuntimeError::new_err(format!(
+                        "pvget on {pvname}: panic in Python::with_gil during value conversion"
+                    ))),
+                    Python::with_gil(|py| {
+                        // NTEnum handling: top-level Structure with a
+                        // `value` substructure containing {index, choices}.
+                        // Surface the int index (consistent with monitor).
+                        if let epics_rs::pva::pvdata::PvField::Structure(s) = &field {
+                            if let Some((idx, _choices)) = crate::pva_convert::try_extract_ntenum(s)
+                            {
+                                return Ok::<PyObject, PyErr>(
+                                    idx.into_pyobject(py).unwrap().into_any().unbind(),
+                                );
+                            }
                         }
-                    }
-                    // NTScalar: extract `value`; otherwise the whole field.
-                    let value_field = match &field {
-                        epics_rs::pva::pvdata::PvField::Structure(s) => s
-                            .get_field("value")
-                            .cloned()
-                            .unwrap_or_else(|| field.clone()),
-                        _ => field.clone(),
-                    };
-                    Ok::<PyObject, PyErr>(pvfield_to_py(py, &value_field))
-                }),
+                        let value_field = match &field {
+                            epics_rs::pva::pvdata::PvField::Structure(s) => s
+                                .get_field("value")
+                                .cloned()
+                                .unwrap_or_else(|| field.clone()),
+                            _ => field.clone(),
+                        };
+                        Ok::<PyObject, PyErr>(pvfield_to_py(py, &value_field))
+                    })
+                ),
                 Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
                     "pvget on {pvname} failed: {e}"
                 ))),
@@ -685,9 +705,14 @@ impl EpicsRsPvaPV {
         let dur = Duration::from_secs_f64(timeout);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             match tokio::time::timeout(dur, client.pvget(&name)).await {
-                Ok(Ok(field)) => Python::with_gil(|py| {
-                    Ok::<PyObject, PyErr>(crate::pva_convert::pvfield_to_metadata(py, &field))
-                }),
+                Ok(Ok(field)) => crate::safe_call_or!(
+                    Err(PyRuntimeError::new_err(format!(
+                        "pvget on {pvname}: panic in Python::with_gil during reading conversion"
+                    ))),
+                    Python::with_gil(|py| Ok::<PyObject, PyErr>(
+                        crate::pva_convert::pvfield_to_metadata(py, &field)
+                    ))
+                ),
                 Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
                     "pvget on {pvname} failed: {e}"
                 ))),

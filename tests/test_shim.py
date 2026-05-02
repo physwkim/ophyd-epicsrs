@@ -104,9 +104,10 @@ def test_create_and_drop_loop_does_not_leak_threads():
     one dispatch_thread; Drop aborts all spawned tokio tasks AND lets
     the dispatch thread exit cleanly when its rx Sender is dropped).
 
-    Threshold is conservative — typical leak would add ~one thread per
-    cycle (500+) so a >50 delta over 500 iterations would flag a
-    regression with high confidence.
+    Threshold is tight — < 5 thread delta over 500 cycles. Even a 1 %
+    leak rate (one thread per 100 PVs) would push delta to ~5 and
+    flag this as a regression. Earlier revisions used a much looser
+    threshold that would pass even with substantial leaks.
     """
     import threading
 
@@ -137,10 +138,30 @@ def test_create_and_drop_loop_does_not_leak_threads():
 
 
 def test_release_pvs_clears_handlers():
-    """release_pvs() should be idempotent and accept any number of PVs."""
+    """release_pvs() actually clears the registered callbacks and the
+    auto-monitor flag, and is idempotent across repeated calls.
+    """
     _ensure_setup()
-    pv1 = get_pv("RELEASE:1")
-    pv2 = get_pv("pva://RELEASE:2")
-    shim.release_pvs(pv1, pv2)
-    # Calling again must not raise
-    shim.release_pvs(pv1, pv2)
+    cb = Mock()
+    pv = get_pv("RELEASE:1", connection_callback=cb)
+    cb.reset_mock()  # ignore any setup-time fires
+
+    # Drive a state transition so we can verify cb is wired.
+    pv._on_connection_change(True)
+    assert cb.call_count == 1, "callback should have fired once before release"
+
+    shim.release_pvs(pv)
+
+    # After release: connection callbacks are cleared, auto_monitor is off.
+    assert pv._conn_callbacks == [], "release should clear conn callbacks"
+    assert pv._callbacks == {}, "release should clear monitor callbacks"
+    assert pv.auto_monitor is None, "release should clear auto_monitor"
+
+    # Subsequent state transitions must NOT reach the user callback.
+    cb.reset_mock()
+    pv._on_connection_change(False)  # transition to dedupe-False
+    pv._on_connection_change(True)   # transition back
+    assert cb.call_count == 0, "callback must not fire after release"
+
+    # Idempotency: repeated release must not raise.
+    shim.release_pvs(pv)

@@ -769,7 +769,14 @@ impl EpicsRsPV {
     ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
         let _ = timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Ok(Python::with_gil(|py| py.None()))
+            // safe_call_or! around the with_gil so a finalize race
+            // (rare here — the awaitable would normally be dropped
+            // first) doesn't unwind the future. py.None() is the
+            // semantically correct fallback for the no-op CA stub.
+            Ok(crate::safe_call_or!(
+                Python::with_gil(|py| py.None()),
+                Python::with_gil(|py| py.None())
+            ))
         })
     }
 
@@ -839,9 +846,14 @@ impl EpicsRsPV {
             match tokio::time::timeout(dur, channel.get()).await {
                 Ok(Ok((_dbr, val))) => {
                     *cache.lock() = Some(val.dbr_type());
-                    Python::with_gil(|py| {
-                        Ok::<PyObject, PyErr>(crate::convert::epics_value_to_py(py, &val))
-                    })
+                    crate::safe_call_or!(
+                        Err(PyRuntimeError::new_err(format!(
+                            "get on {pvname}: panic in Python::with_gil during value conversion"
+                        ))),
+                        Python::with_gil(|py| Ok::<PyObject, PyErr>(
+                            crate::convert::epics_value_to_py(py, &val)
+                        ))
+                    )
                 }
                 Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
                     "get on {pvname} failed: {e}"
@@ -874,9 +886,14 @@ impl EpicsRsPV {
             match tokio::time::timeout(dur, channel.get_with_metadata(class)).await {
                 Ok(Ok(snapshot)) => {
                     *cache.lock() = Some(snapshot.value.dbr_type());
-                    Python::with_gil(|py| {
-                        Ok::<PyObject, PyErr>(crate::convert::snapshot_to_pydict(py, &snapshot))
-                    })
+                    crate::safe_call_or!(
+                        Err(PyRuntimeError::new_err(format!(
+                            "get_reading on {pvname}: panic in Python::with_gil during snapshot conversion"
+                        ))),
+                        Python::with_gil(|py| Ok::<PyObject, PyErr>(
+                            crate::convert::snapshot_to_pydict(py, &snapshot)
+                        ))
+                    )
                 }
                 Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
                     "get_reading on {pvname} failed: {e}"
@@ -928,10 +945,15 @@ impl EpicsRsPV {
                     )));
                 }
             };
-            let epics_val = Python::with_gil(|py| {
-                let v = value_owned.bind(py);
-                crate::convert::py_to_epics_value(v, native)
-            })?;
+            let epics_val = crate::safe_call_or!(
+                Err(PyRuntimeError::new_err(format!(
+                    "put on {pvname}: panic in Python::with_gil during value conversion"
+                ))),
+                Python::with_gil(|py| {
+                    let v = value_owned.bind(py);
+                    crate::convert::py_to_epics_value(v, native)
+                })
+            )?;
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 return Err(pyo3::exceptions::PyTimeoutError::new_err(format!(
@@ -986,10 +1008,15 @@ impl EpicsRsPV {
                     )));
                 }
             };
-            let epics_val = Python::with_gil(|py| {
-                let v = value_owned.bind(py);
-                crate::convert::py_to_epics_value(v, native)
-            })?;
+            let epics_val = crate::safe_call_or!(
+                Err(PyRuntimeError::new_err(format!(
+                    "put_nowait on {pvname}: panic in Python::with_gil during value conversion"
+                ))),
+                Python::with_gil(|py| {
+                    let v = value_owned.bind(py);
+                    crate::convert::py_to_epics_value(v, native)
+                })
+            )?;
             // Raise on definitive errors — silently swallowing made
             // bluesky plans proceed against unwritten PVs.
             match channel.put_nowait(&epics_val).await {

@@ -47,10 +47,17 @@ fn ophyd_epicsrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
 /// Clear the pyo3-log level cache. Call after changing Python logger
 /// levels at runtime so the next `tracing::*!` from Rust re-checks
 /// the Python side instead of using stale cached levels (~30 s TTL).
+///
+/// Returns True if the reset was applied; False if pyo3-log was not
+/// installed (typically because a sibling pyo3 crate beat us to
+/// `try_init`). False is informational, not an error.
 #[pyfunction]
-fn reset_log_cache() {
+fn reset_log_cache() -> bool {
     if let Some(handle) = LOG_RESET.get() {
         handle.reset();
+        true
+    } else {
+        false
     }
 }
 

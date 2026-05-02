@@ -33,6 +33,10 @@ struct PvaMonitorEvent {
 }
 
 /// Shared PVA context — Runtime + PvaClient.
+///
+/// Do NOT construct this directly. Use ``ophyd_epicsrs.get_pva_context()``
+/// — see the symmetric note on ``EpicsRsContext`` for the singleton
+/// rationale (one ``Client`` per protocol per process).
 #[pyclass(name = "EpicsRsPvaContext")]
 pub struct EpicsRsPvaContext {
     pub(crate) runtime: Arc<Runtime>,
@@ -70,6 +74,10 @@ impl EpicsRsPvaContext {
 }
 
 /// Rust-backed PVA PV object for ophyd's control layer.
+///
+/// Returned by ``EpicsRsPvaContext.create_pv(name)``. Do not construct
+/// directly; obtain the parent context via
+/// ``ophyd_epicsrs.get_pva_context()``.
 #[pyclass(name = "EpicsRsPvaPV")]
 pub struct EpicsRsPvaPV {
     runtime: Arc<Runtime>,
@@ -150,6 +158,12 @@ fn detect_ntenum_shape(field: &PvField) -> Option<bool> {
     };
     if s.struct_id.starts_with("epics:nt/NTEnum:") {
         // Covers 1.0 and any future minor bumps (shape-compatible per spec).
+        // NOTE: a hypothetical NTEnum:2.x with a breaking shape change
+        // (e.g. `value.choice` instead of `value.choices`) would still
+        // match this prefix, but the downstream `value.index` put-routing
+        // would silently break against such a server. The PVA spec has
+        // not bumped a major NT version since publication; revisit if
+        // that changes.
         return Some(true);
     }
     if s.struct_id.starts_with("epics:nt/") {

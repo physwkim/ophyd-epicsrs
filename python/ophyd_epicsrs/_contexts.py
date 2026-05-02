@@ -50,3 +50,26 @@ def get_pva_context() -> EpicsRsPvaContext:
             if _pva_context is None:
                 _pva_context = EpicsRsPvaContext()
     return _pva_context
+
+
+def shutdown_all() -> None:
+    """Drop the cached singleton CA / PVA contexts.
+
+    Intended for long-running daemons that import ``ophyd_epicsrs`` early
+    but only use it during a bounded window — calling this after every PV
+    has been released frees the Rust runtime + beacon monitor + repeater
+    socket. The Rust ``Drop`` impls handle background-task teardown.
+
+    **Caveat**: any subsequent ``get_ca_context()`` / ``get_pva_context()``
+    call will construct a *new* ``CaClient`` / ``PvaClient``. The new
+    client's empty beacon ``servers`` map will fire ``first_sighting``
+    anomalies on every IOC's next beacon — re-triggering the disconnect
+    storm we share singletons to avoid. Only call this when you mean
+    "I'm done with epics-rs entirely for now". Active PVs continue to
+    work because they hold their own ``Arc<Runtime>`` references; they
+    just keep the dropped client alive until they too are released.
+    """
+    global _ca_context, _pva_context
+    with _lock:
+        _ca_context = None
+        _pva_context = None

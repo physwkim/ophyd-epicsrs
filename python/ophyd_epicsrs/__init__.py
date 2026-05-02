@@ -13,7 +13,7 @@ healthy TCP circuits. ``EpicsRsPV`` / ``EpicsRsPvaPV`` are exposed for
 import logging
 import types
 
-from ophyd_epicsrs._contexts import get_ca_context, get_pva_context
+from ophyd_epicsrs._contexts import get_ca_context, get_pva_context, shutdown_all
 from ophyd_epicsrs._native import (
     EpicsRsPV,
     EpicsRsPvaPV,
@@ -28,6 +28,7 @@ __all__ = [
     "get_ca_context",
     "get_pva_context",
     "reset_log_cache",
+    "shutdown_all",
     "use_epicsrs",
 ]
 

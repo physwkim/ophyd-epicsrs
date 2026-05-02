@@ -13,6 +13,11 @@ use crate::pv::EpicsRsPV;
 
 /// Shared EPICS CA context — holds a tokio Runtime and CaClient.
 ///
+/// Do NOT construct this directly. Use ``ophyd_epicsrs.get_ca_context()``
+/// — multiple ``CaClient`` instances per process trip spurious
+/// ``first_sighting`` beacon anomalies (epics-ca-rs/beacon_monitor.rs)
+/// that drop healthy TCP circuits under load.
+///
 /// The runtime is kept alive for the lifetime of this context.
 /// CaClient's background tasks (coordinator, transport, search) run
 /// as spawned tasks on this runtime and must stay alive between

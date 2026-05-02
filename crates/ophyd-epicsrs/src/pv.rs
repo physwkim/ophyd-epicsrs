@@ -82,6 +82,10 @@ pub(crate) struct PrefetchResult {
 
 /// Rust-backed PV object for ophyd's control layer.
 ///
+/// Returned by ``EpicsRsContext.create_pv(name)``. Do not construct
+/// directly; the channel + runtime references must come from the
+/// process-wide singleton context (``ophyd_epicsrs.get_ca_context()``).
+///
 /// Monitor events are queued via std::sync::mpsc (no GIL needed in tokio)
 /// and dispatched to Python callbacks from a dedicated Python thread.
 #[pyclass(name = "EpicsRsPV")]

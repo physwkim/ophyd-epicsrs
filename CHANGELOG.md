@@ -1,5 +1,96 @@
 # Changelog
 
+## v0.6.0 (2026-05-03)
+
+### New features
+
+- **PVA backend** (`EpicsRsPvaContext`, `EpicsRsPvaPV`): full pvAccess
+  support alongside the existing CA path. The legacy shim's `get_pv`
+  dispatches on `pva://` prefix; bare names and `ca://` continue to use
+  the CA backend. PVA classes are now re-exported from the package root.
+- **Async surface** via `pyo3-async-runtimes` on a shared tokio runtime:
+  every blocking native method now has an `_async` sibling
+  (`get_async`, `put_async`, `connect_and_prefetch_async`,
+  `get_field_desc_async`, …) returning a Python awaitable. Sync and async
+  paths share one runtime so there is no extra thread overhead.
+- **`ophyd_epicsrs.detector` adapter**: `EpicsRsSignalBackend`, an
+  `ophyd-async` `SignalBackend` implementation that lets ophyd-async
+  Devices drive PVs through epics-rs with no fork. Includes datatype-
+  aware converters (`Bool`, `Int`, `Float`, `Str`, `Enum` /
+  `StrictEnum` / `SubsetEnum` / `SupersetEnum`, `NumpyArray`,
+  `Sequence`, `Table`) and IOC schema validation at connect time via
+  PVA `pvinfo`.
+- **Typed `PvField` writes**: `Table → NTTable` round-trip uses
+  `Table.__annotations__` to produce correctly-typed `PvField` columns
+  on the wire (no more dtype-loss through Python lists).
+- **Long-string and StrictEnum handling**: long-string CA channels and
+  the full `ophyd-async` enum hierarchy are recognised and routed to
+  the appropriate converter at connect time.
+
+### Reliability
+
+- **Panic-safe spawned tasks** (`safe_warn!`, `safe_call!`,
+  `safe_call_or!` in `safe_log.rs`): every spawned tokio task that
+  reaches Python (callback dispatch, monitor delivery, pyo3-log
+  forwarding) is wrapped so a `Python::with_gil` panic during
+  interpreter finalize cannot crash the process. Caught panics are
+  counted (`caught_panic_count()`) and the first one writes a single-
+  line stderr notice. `panic = "unwind"` is enforced at compile time
+  by a `#[cfg(panic = "abort")] compile_error!` so a downstream
+  `Cargo.toml` cannot silently disarm the guards.
+- **Drop semantics**: every native PV's `Drop` impl now aborts spawned
+  tokio tasks and lets the dispatch thread exit cleanly when its rx
+  Sender is dropped. Verified by a 500-cycle leak test that fails on
+  even a 1 % thread-leak rate.
+- **Monitor generation tokens**: monitor dispatch threads check an
+  atomic generation counter so a late delivery from a previous
+  subscription cannot fire callbacks against the new generation.
+- **Connection callback dedupe**: the shim's `_on_connection_change`
+  now drops duplicate same-state events, fixing a long-standing
+  flapping-callback issue under reconnection storms.
+- **Self-healing PVA monitors**: `pva.rs` matches the CA-side resubscribe
+  pattern so PVA monitors recover after IOC restart / network blip.
+
+### Bug fixes
+
+- **`get_field_desc_async` (CA stub)**: previous implementation called
+  `Python::with_gil` in both the body and the `safe_call_or!` default;
+  the default would re-trigger the same finalize panic the guard was
+  meant to absorb. Default is now a GIL-free `PyErr`.
+- **PVA put silent-corruption holes**: closed four cases where a
+  failed put returned `True` or a missing field returned `None`
+  instead of raising.
+- **`asyncio` loop blocking**: `resolve_native_type` no longer runs
+  inside the asyncio thread; sync inspection moved to a tokio
+  blocking task.
+- **NTEnum bidirectional mapping**: `to_wire` resolves label → index
+  and `to_python` returns the `NTEnum` dict shape ophyd-async expects.
+- **Busy-record honor `EpicsOptions.wait`**: prevents the well-known
+  busy-record deadlock when a put is dispatched against a record that
+  is already processing.
+
+### Tests
+
+- 60 unit tests across `test_converter.py`, `test_factory.py`, and
+  `test_shim.py` — covers protocol prefix routing, get_pv dispatch,
+  connection-change dedupe, Drop / leak quantification (500-cycle
+  thread-count delta), and `release_pvs` semantics.
+- New `test_safe_call_or_default_is_gil_free` greps the Rust source
+  for the exact `safe_call_or!(Python::with_gil(...), …)` misuse that
+  was caught in review, so the regression cannot silently return.
+
+### Internal
+
+- Rust logging path standardised on `tracing` (with the `log` feature)
+  bridged to Python's `logging` via `pyo3-log`. No process-wide stderr
+  subscriber, no Jupyter red-box noise, no double-reporting alongside
+  `PyRuntimeError`.
+- `reset_log_cache()` exposed so runtime changes to Python logger
+  levels are picked up immediately by Rust-side `tracing` events
+  instead of waiting for `pyo3-log`'s ~30 s TTL.
+- `caught_panic_count()` (and `_native.caught_panic_count()` for the
+  mid-import case) added for telemetry on the panic-guard counter.
+
 ## v0.5.2 (2026-05-01)
 
 ### Fixes

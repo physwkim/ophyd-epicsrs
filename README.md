@@ -237,17 +237,53 @@ Total: ~2ms (Python free), MongoDB insert continues in background
 
 ## Performance
 
-Measured against pyepics on the same IOC (EPICS motor record, LAN):
+### Versus pyepics
+
+Original benchmark against pyepics on the same IOC (EPICS motor record, LAN):
 
 | Operation | pyepics | epicsrs | Speedup |
 |-----------|---------|---------|---------|
-| CA get (no monitor) | 0.33 ms | **0.09 ms** | 3.7x |
+| CA get (no monitor) | 0.33 ms | **0.09 ms** | 3.7× |
 | CA get (with monitor) | 0.01 ms | **0.00 ms** | — |
-| CA put → immediate get | 0.85 ms | **0.44 ms** | 1.9x |
-| bulk_caget (50 PVs) | ~1500 ms | **~1 ms** | 1500x |
-| Device connect (200 PVs) | ~2 s | **~0.16 s** | 12x |
+| CA put → immediate get | 0.85 ms | **0.44 ms** | 1.9× |
+| bulk_caget (50 PVs) | ~1500 ms | **~1 ms** | 1500× |
+| Device connect (200 PVs) | ~2 s | **~0.16 s** | 12× |
 
-The put→get improvement comes from the single-owner writer task architecture in epics-rs, which pipelines write and read requests on the same TCP connection without mutex contention. Combined with `TCP_NODELAY`, this eliminates the ~45ms head-of-line blocking that occurred when reads waited for writes to flush.
+The put→get improvement comes from the single-owner writer task
+architecture in epics-rs, which pipelines write and read requests on
+the same TCP connection without mutex contention. Combined with
+`TCP_NODELAY`, this eliminates the ~45 ms head-of-line blocking that
+occurred when reads waited for writes to flush.
+
+### Reproducible mini-beamline measurements
+
+The integration suite (`tests/integration/test_performance.py`)
+measures a fixed set of operations against the mini-beamline IOC from
+[epics-rs/examples/mini-beamline](https://github.com/epics-rs/epics-rs/tree/main/examples/mini-beamline).
+Anyone can reproduce these numbers — just run the integration suite
+locally with the IOC up, or trigger the nightly CI workflow. Numbers
+below are local Apple Silicon, IOC and tests on the same host:
+
+| Operation | Result |
+|-----------|--------|
+| Single `get_with_metadata` latency (200 samples) | p50 **54 µs** · p95 **81 µs** · p99 **135 µs** |
+| `bulk_caget(10)` | **0.63 ms** (63 µs/PV) |
+| `bulk_caget(25)` | **1.32 ms** (53 µs/PV) |
+| `bulk_caget(48)` | **2.63 ms** (55 µs/PV) |
+| ophyd-async parallel connect (30 PVs) | **4.1 ms** |
+| ophyd-async parallel connect (3 × StandardReadable, 9 PVs) | **3.4 ms** |
+| ophyd sync `Device` connect (4 components) | **55 ms** |
+| ophyd sync `Device` connect (DCM, 9 PVs incl. 3 motors) | **51 ms** |
+| ophyd sync `Device` connect (areaDetector cam, 11 PVs) | **52 ms** |
+
+Note the ~15× gap between ophyd-async parallel connect (4 ms for 30
+PVs) and ophyd sync `Device.wait_for_connection` (~50 ms for 9–11 PVs):
+both go through the same `_native` backend, but the sync path issues
+per-PV `wait_for_connection` calls serialised by the GIL, while the
+async path's `asyncio.gather(...)` overlaps every PV's connect inside
+the single tokio runtime. Mixed sync + async usage works (same
+backend, same circuit per IOC), so the recommended migration path is
+"new device classes in ophyd-async, legacy classes left as-is".
 
 ## Advantages over pyepics backend
 

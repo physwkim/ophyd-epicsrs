@@ -346,8 +346,10 @@ class _SequenceConverter(Converter):
     def __init__(self, elem: Converter):
         self.elem = elem
 
-    def update_metadata(self, metadata: Mapping[str, Any]) -> None:
-        self.elem.update_metadata(metadata)
+    def update_metadata(
+        self, metadata: Mapping[str, Any], source: str = "<unknown>"
+    ) -> None:
+        self.elem.update_metadata(metadata, source=source)
 
     def to_python(self, raw, metadata=None):
         if raw is None:

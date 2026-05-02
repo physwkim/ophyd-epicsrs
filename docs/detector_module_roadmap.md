@@ -10,6 +10,14 @@ The next step for ophyd-epicsrs: introduce a new `ophyd_epicsrs.detector` module
 - Performance gains: GIL-free I/O, `bulk_caget` (~1500x), `bulk_connect_and_prefetch`
 - Limitation: still inherits ophyd's `ADBase` / `ADComponent` / Plugin tree, so adding a new detector carries heavy boilerplate and plugin-chain rewiring
 
+### Backend readiness (epics-rs, post 2026-04-29 closeout)
+The detector module can build on epics-rs without waiting on backend hardening:
+- **CA**: P1–P8 stability overhaul (multi-NIC discovery via per-interface UDP tasks + `if-addrs` beacon fanout, `EPICS_CA_NAME_SERVERS` long-lived TCP, server-side TCP keepalive + inactivity timeout, bounded monitor queue with backpressure, full ECA error table, max-channels / max-subs caps, beacon chained-frame walking) plus G1–G4 closeout — functionally on par with C `libca`/`rsrv` for both single- and multi-subnet deployments.
+- **PVA**: `EPICS_PVA{,S}_*` env vars, multi-NIC beacon fanout, `Channel::alternatives` multi-server failover, NT builders, type cache decode — functionally on par with `pvxs` for production workloads.
+- **Exceeds upstream**: capability tokens with revocation, TLS cert hot reload, signed beacons + verifier, drain mode, chaos harness, differential tests vs `softIoc`, end-to-end benchmarks.
+
+**Implication**: a unified Rust backend covers both CA and PVA from day 1 — the detector module does not need a CA-only first pass followed by a PVA second pass.
+
 ### Where ophyd-async wins on detectors
 ophyd-async's `StandardDetector` decomposes a detector along **three orthogonal axes**:
 
@@ -49,13 +57,14 @@ User code
                   ↓
             EpicsRsPV  (Rust, tokio)
                   ↓
-            epics-rs CA / PVA   [shared Arc<Runtime>]
+            epics-rs   [unified CA + PVA via shared Arc<Runtime>]
 ```
 
 Core principles:
 1. **Single shared Rust runtime** — both entry points (sync `EpicsRsShimPV` and async `EpicsRsPV.*_async`) use the same `Arc<Runtime>`. Avoids runtime fragmentation.
 2. **No PV cache** — the same PV may be accessed concurrently from sync ophyd and the async detector module without conflict; channel sharing is already handled at the transport layer.
 3. **bluesky mixed plans** — `Status` and `AsyncStatus` coexist in a single plan; users do not need to know which protocol a device implements.
+4. **Unified CA + PVA backend** — unlike ophyd-async (which uses `aioca` for CA and `p4p` for PVA, two FFI surfaces with different threading models), ophyd-epicsrs exposes both protocols through one Rust runtime. A `Signal` can be backed by either protocol with no code-shape change in the detector layer; modern detectors (NTNDArray-based areaDetector, PVA-native PandABlocks) work without a parallel binding stack.
 
 ## Build Plan
 
@@ -89,10 +98,12 @@ The following are intentionally **not** ported:
 - ophyd-async's fastcs / PandABlocks integration — evaluate separately later
 - Tango backend — EPICS only
 
+CA and PVA are **both in scope** from day 1 via the shared epics-rs backend.
+
 ## Technical Considerations
 
 ### pyo3-asyncio cancellation
-On Python `task.cancel()`, the corresponding Rust Future must `Drop` cleanly so any in-flight CA request aborts. Verify cancel-safety in epics-rs CA client paths.
+On Python `task.cancel()`, the corresponding Rust Future must `Drop` cleanly so any in-flight CA or PVA request aborts. Verify cancel-safety in epics-rs CA and PVA client paths (one known minor gap: CA G1 "TCP send timeout" SHOULD-FIX from the 2026-04-29 re-audit; tracked separately in epics-rs).
 
 ### Event loop binding
 pyo3-asyncio bridges Python's asyncio loop with the tokio runtime. Awaiting on the wrong thread can deadlock against the GIL. Enforce a convention: every async entry point goes through `pyo3_asyncio::tokio::future_into_py`.
@@ -115,3 +126,5 @@ Match the exact signature of `bluesky.protocols.Status` and `AsyncStatus`. Confi
 - ophyd-async `SignalBackend`: `ophyd-async/src/ophyd_async/core/_signal_backend.py:63`
 - Current ophyd-epicsrs Rust PV: `crates/ophyd-epicsrs/src/pv.rs`
 - Current ophyd-epicsrs Python shim: `python/ophyd_epicsrs/_shim.py`
+- epics-rs CA stability: P1–P8 overhaul commit `d280e1cb` (2026-04-28), G1–G4 closeout commit `5a2c019` (2026-04-29)
+- epics-rs PVA stability: post-2026-04-28 closeout, P-G1..P-G4 closeout commit `3ab410e` (2026-04-29)

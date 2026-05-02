@@ -16,3 +16,4 @@ pyo3-async-runtimes = { version = "0.24", features = ["tokio-runtime"] }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
 parking_lot = "0.12"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

@@ -691,6 +691,7 @@ dependencies = [
  "pyo3-async-runtimes",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

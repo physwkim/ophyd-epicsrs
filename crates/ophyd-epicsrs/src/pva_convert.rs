@@ -153,11 +153,25 @@ pub(crate) fn try_extract_ntenum(s: &PvStructure) -> Option<(i32, Vec<String>)> 
 
 /// Return the NTEnum value field as (index, choices) if `value` is an
 /// `enum_t` substructure, or None otherwise.
+///
+/// Hard-gated by struct_id: top-level `epics:nt/NTEnum:1.0` OR the
+/// inner `value` substructure tagged `enum_t`. Without this guard an
+/// NTTable whose value substructure happens to have columns named
+/// `index` (int) and `choices` (string array) would be misclassified
+/// — get_value_async would surface an int instead of the row dict.
 fn extract_ntenum(s: &PvStructure) -> Option<(i32, Vec<String>)> {
     let enum_struct = match s.get_field("value")? {
         PvField::Structure(es) => es,
         _ => return None,
     };
+    // NT identification: outer struct_id is "epics:nt/NTEnum:1.0" per
+    // the spec, with inner `value` carrying struct_id "enum_t". Either
+    // marker is sufficient — gate on both being unset, then bail.
+    let outer_is_ntenum = s.struct_id == "epics:nt/NTEnum:1.0";
+    let inner_is_enum_t = enum_struct.struct_id == "enum_t";
+    if !(outer_is_ntenum || inner_is_enum_t) {
+        return None;
+    }
     let index = struct_field_scalar(enum_struct, "index").and_then(scalar_as_i64)? as i32;
     let choices = match enum_struct.get_field("choices")? {
         PvField::ScalarArrayTyped(TypedScalarArray::String(arr)) => arr.iter().cloned().collect(),

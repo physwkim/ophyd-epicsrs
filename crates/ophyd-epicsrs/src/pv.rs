@@ -54,6 +54,10 @@ pub struct EpicsRsPV {
     dispatch_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Background prefetch: starts on PV creation, completes before Python asks
     pub(crate) prefetch_handle: Mutex<Option<JoinHandle<Option<PrefetchResult>>>>,
+    /// Fire-and-forget probe tasks spawned by emit_current_*_state.
+    /// Tracked so Drop can abort in-flight `Python::with_gil` after
+    /// interpreter finalize — same teardown race as monitor_setup_task.
+    emit_tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl EpicsRsPV {
@@ -116,6 +120,7 @@ impl EpicsRsPV {
             monitor_tx: Arc::new(Mutex::new(None)),
             dispatch_thread: Mutex::new(None),
             prefetch_handle: Mutex::new(Some(prefetch_handle)),
+            emit_tasks: Mutex::new(Vec::new()),
         }
     }
 
@@ -191,7 +196,7 @@ impl EpicsRsPV {
         let channel = self.channel.clone();
         let conn_cb_ref = self.connection_callback.clone();
 
-        self.runtime.spawn(async move {
+        let handle = self.runtime.spawn(async move {
             if channel.info().await.is_ok() {
                 Python::with_gil(|py| {
                     let guard = conn_cb_ref.lock();
@@ -203,6 +208,7 @@ impl EpicsRsPV {
                 });
             }
         });
+        self.emit_tasks.lock().push(handle);
     }
 
     /// Best-effort injection of the current access-rights state for a newly
@@ -212,7 +218,7 @@ impl EpicsRsPV {
         let channel = self.channel.clone();
         let access_cb_ref = self.access_callback.clone();
 
-        self.runtime.spawn(async move {
+        let handle = self.runtime.spawn(async move {
             if let Ok(info) = channel.info().await {
                 Python::with_gil(|py| {
                     let guard = access_cb_ref.lock();
@@ -225,6 +231,7 @@ impl EpicsRsPV {
                 });
             }
         });
+        self.emit_tasks.lock().push(handle);
     }
 }
 
@@ -834,22 +841,29 @@ impl EpicsRsPV {
         value: &Bound<'_, pyo3::PyAny>,
         timeout: f64,
     ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
-        // Hold an owned ref to the Python value so we can re-bind it
-        // inside the future without holding the GIL across await points.
         let value_owned: Py<pyo3::PyAny> = value.clone().unbind();
         let cache = self.native_type.clone();
         let channel = self.channel.clone();
         let dur = Duration::from_secs_f64(timeout);
+        let pvname = self.pvname.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            // resolve_native_type now lives inside the future — no more
-            // sync block on the asyncio loop while we fetch channel.info().
-            let native = Self::resolve_native_type(cache, channel.clone(), 5.0).await?;
+            // resolve_native_type uses the user-supplied timeout (capped
+            // at the put timeout itself) so a slow IOC immediately
+            // after connect doesn't false-fail.
+            let native = Self::resolve_native_type(cache, channel.clone(), timeout).await?;
             let epics_val = Python::with_gil(|py| {
                 let v = value_owned.bind(py);
                 crate::convert::py_to_epics_value(v, native)
             })?;
-            let result = tokio::time::timeout(dur, channel.put(&epics_val)).await;
-            Ok(matches!(result, Ok(Ok(()))))
+            match tokio::time::timeout(dur, channel.put(&epics_val)).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
+                    "put on {pvname} failed: {e}"
+                ))),
+                Err(_) => Err(pyo3::exceptions::PyTimeoutError::new_err(format!(
+                    "put on {pvname} timed out after {timeout}s"
+                ))),
+            }
         })
     }
 
@@ -869,23 +883,58 @@ impl EpicsRsPV {
         let channel = self.channel.clone();
         let pvname = self.pvname.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            // Async info() resolution — does NOT block the asyncio loop.
             let native = Self::resolve_native_type(cache, channel.clone(), 5.0).await?;
             let epics_val = Python::with_gil(|py| {
                 let v = value_owned.bind(py);
                 crate::convert::py_to_epics_value(v, native)
             })?;
+            // Raise on definitive errors — silently swallowing made
+            // bluesky plans proceed against unwritten PVs.
             match channel.put_nowait(&epics_val).await {
-                Ok(()) => Ok(true),
-                Err(e) => {
-                    tracing::warn!(target: "ophyd_epicsrs::put_nowait", pv = %pvname, "put failed: {e}");
-                    Ok(false)
-                }
+                Ok(()) => Ok(()),
+                Err(e) => Err(PyRuntimeError::new_err(format!(
+                    "put_nowait on {pvname} failed: {e}"
+                ))),
             }
         })
     }
 
     fn __repr__(&self) -> String {
         format!("EpicsRsPV('{}')", self.pvname)
+    }
+}
+
+impl Drop for EpicsRsPV {
+    /// Abort every spawned task and drop monitor channels.
+    ///
+    /// Without this, every PV that the Python wrapper GCs leaks all of
+    /// its background tasks: the connection_task / monitor_task self-
+    /// healing loops never terminate (they retry forever), and any
+    /// fire-and-forget emit_current_*_state probe can outlive the
+    /// interpreter and panic on `Python::with_gil`. Particularly bad
+    /// for the legacy `_shim.caget`/`caput` path which creates a fresh
+    /// EpicsRsShimPV for every call — without this, every caget is a
+    /// permanent task leak.
+    fn drop(&mut self) {
+        // Drop callback Pythons first so any in-flight task that races
+        // through `Python::with_gil` finds the slot empty (no-op call).
+        *self.connection_callback.lock() = None;
+        *self.access_callback.lock() = None;
+        *self.py_monitor_callback.lock() = None;
+        *self.monitor_tx.lock() = None;
+
+        if let Some(h) = self.monitor_task.lock().take() {
+            h.abort();
+        }
+        if let Some(h) = self.connection_task.lock().take() {
+            h.abort();
+        }
+        if let Some(h) = self.prefetch_handle.lock().take() {
+            h.abort();
+        }
+        for h in self.emit_tasks.lock().drain(..) {
+            h.abort();
+        }
+        // dispatch_thread will exit when monitor_tx Sender is dropped.
     }
 }

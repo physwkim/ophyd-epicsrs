@@ -104,15 +104,25 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
         if not (ok_r and ok_w):
             raise NotConnectedError(self.source("", read=True))
 
-        # Populate native_type for the WRITE PV via channel.info() (a
-        # coordinator query — no CA read).  Without this, the first
-        # put_nowait_async call would do a 5s blocking pre-read to
-        # discover the DbFieldType, defeating wait=False semantics on
-        # busy records and failing entirely on write-only PVs.  PVA's
-        # implementation is a no-op (string-form pvput needs no cache).
-        await self._write_pv_native.cache_native_type_async(
-            timeout=min(timeout, 2.0)
-        )
+        # Populate native_type via channel.info() (no CA read) for both
+        # the read AND write PVs. Calling on both ensures each prefetch
+        # task started by EpicsRsPV::new is consumed (no leaked
+        # background work) and that put paths skip the info() round
+        # trip. PVA's cache_native_type_async is a no-op (string-form
+        # pvput needs no cache) so the call is harmless.
+        if self.read_pv != self.write_pv:
+            await asyncio.gather(
+                self._read_pv_native.cache_native_type_async(
+                    timeout=min(timeout, 2.0)
+                ),
+                self._write_pv_native.cache_native_type_async(
+                    timeout=min(timeout, 2.0)
+                ),
+            )
+        else:
+            await self._write_pv_native.cache_native_type_async(
+                timeout=min(timeout, 2.0)
+            )
 
         # Schema validation — for converters that declare typed columns
         # (currently only _TableConverter), fetch the IOC schema and
@@ -168,7 +178,10 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
         # _TableConverter.to_wire produces a marker dict carrying both
         # the column data and per-column dtype hints. Route to the
         # typed pvput_pv_field path on PVA — it builds a properly-typed
-        # PvStructure even from empty columns.
+        # PvStructure even from empty columns. The Rust put methods
+        # raise PyRuntimeError / PyTimeoutError on failure (no more
+        # silent bool result), so we don't need a separate `if not ok`
+        # gate here — exceptions propagate to the user verbatim.
         if _is_typed_pvfield_payload(wire):
             data = wire["data"]
             dtypes = wire.get("dtypes") or None
@@ -179,19 +192,15 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
                     f"{self.source('', read=False)} is not PVA-backed"
                 )
             if wait:
-                ok = await self._write_pv_native.put_pv_field_async(
-                    data, dtypes, struct_id
-                )
+                await self._write_pv_native.put_pv_field_async(data, dtypes, struct_id)
             else:
-                ok = await self._write_pv_native.put_pv_field_nowait_async(
+                await self._write_pv_native.put_pv_field_nowait_async(
                     data, dtypes, struct_id
                 )
         elif wait:
-            ok = await self._write_pv_native.put_async(wire)
+            await self._write_pv_native.put_async(wire)
         else:
-            ok = await self._write_pv_native.put_nowait_async(wire)
-        if not ok:
-            raise RuntimeError(f"put to {self.source('', read=False)} failed")
+            await self._write_pv_native.put_nowait_async(wire)
 
     # Generous backend-level timeout — asyncio.wait_for at the Signal
     # layer is the user-facing gate. We pass a long timeout here so the

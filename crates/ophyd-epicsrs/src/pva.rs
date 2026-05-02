@@ -676,10 +676,18 @@ impl EpicsRsPvaPV {
         let value_str = python_value_to_pvput_string(value)?;
         let client = self.client.clone();
         let name = self.pvname.clone();
+        let pvname = name.clone();
         let dur = Duration::from_secs_f64(timeout);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let result = tokio::time::timeout(dur, client.pvput(&name, &value_str)).await;
-            Ok(matches!(result, Ok(Ok(()))))
+            match tokio::time::timeout(dur, client.pvput(&name, &value_str)).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
+                    "pvput on {pvname} failed: {e}"
+                ))),
+                Err(_) => Err(pyo3::exceptions::PyTimeoutError::new_err(format!(
+                    "pvput on {pvname} timed out after {timeout}s"
+                ))),
+            }
         })
     }
 
@@ -710,15 +718,13 @@ impl EpicsRsPvaPV {
             match tokio::time::timeout(Duration::from_secs(5), client.pvput(&pvname, &value_str))
                 .await
             {
-                Ok(Ok(())) => Ok(true),
-                Ok(Err(e)) => {
-                    tracing::warn!(target: "ophyd_epicsrs::pvput_nowait", pv = %pvname, "put failed: {e}");
-                    Ok(false)
-                }
-                Err(_) => {
-                    tracing::warn!(target: "ophyd_epicsrs::pvput_nowait", pv = %pvname, "timed out (5s)");
-                    Ok(false)
-                }
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
+                    "pvput_nowait on {pvname} failed: {e}"
+                ))),
+                Err(_) => Err(pyo3::exceptions::PyTimeoutError::new_err(format!(
+                    "pvput_nowait on {pvname} timed out (5s bound)"
+                ))),
             }
         })
     }
@@ -758,10 +764,18 @@ impl EpicsRsPvaPV {
         let field = crate::pva_put::py_to_pvfield(value, &hints, struct_id)?;
         let client = self.client.clone();
         let name = self.pvname.clone();
+        let pvname = name.clone();
         let dur = Duration::from_secs_f64(timeout);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let result = tokio::time::timeout(dur, client.pvput_pv_field(&name, &field)).await;
-            Ok(matches!(result, Ok(Ok(()))))
+            match tokio::time::timeout(dur, client.pvput_pv_field(&name, &field)).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
+                    "pvput_pv_field on {pvname} failed: {e}"
+                ))),
+                Err(_) => Err(pyo3::exceptions::PyTimeoutError::new_err(format!(
+                    "pvput_pv_field on {pvname} timed out after {timeout}s"
+                ))),
+            }
         })
     }
 
@@ -789,21 +803,44 @@ impl EpicsRsPvaPV {
             )
             .await
             {
-                Ok(Ok(())) => Ok(true),
-                Ok(Err(e)) => {
-                    tracing::warn!(target: "ophyd_epicsrs::pvput_pv_field_nowait", pv = %pvname, "put failed: {e}");
-                    Ok(false)
-                }
-                Err(_) => {
-                    tracing::warn!(target: "ophyd_epicsrs::pvput_pv_field_nowait", pv = %pvname, "timed out (5s)");
-                    Ok(false)
-                }
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
+                    "pvput_pv_field_nowait on {pvname} failed: {e}"
+                ))),
+                Err(_) => Err(pyo3::exceptions::PyTimeoutError::new_err(format!(
+                    "pvput_pv_field_nowait on {pvname} timed out (5s bound)"
+                ))),
             }
         })
     }
 
     fn __repr__(&self) -> String {
         format!("EpicsRsPvaPV('{}')", self.pvname)
+    }
+}
+
+impl Drop for EpicsRsPvaPV {
+    /// Abort every spawned task and drop monitor channels — same
+    /// rationale as `EpicsRsPV::drop` (see pv.rs). Critical because
+    /// PVA wrappers can be created freely and the connection_task /
+    /// monitor task self-heal loops would otherwise outlive the wrapper
+    /// and pin the runtime indefinitely.
+    fn drop(&mut self) {
+        *self.connection_callback.lock() = None;
+        *self.access_callback.lock() = None;
+        *self.py_monitor_callback.lock() = None;
+        *self.monitor_tx.lock() = None;
+
+        let _ = self.monitor_handle.lock().take();
+        if let Some(h) = self.monitor_setup_task.lock().take() {
+            h.abort();
+        }
+        if let Some(h) = self.access_setup_task.lock().take() {
+            h.abort();
+        }
+        if let Some(h) = self.connection_task.lock().take() {
+            h.abort();
+        }
     }
 }
 
@@ -940,14 +977,18 @@ fn python_value_to_pvput_string(value: &Bound<'_, pyo3::PyAny>) -> PyResult<Stri
             .collect::<PyResult<_>>()?;
         return Ok(parts.join(","));
     }
-    if let Ok(b) = value.extract::<bool>() {
+    // Strict bool check first — `value.is_instance_of::<PyBool>()` is
+    // True only for the singleton True/False, not for arbitrary ints.
+    // Without this guard, `extract::<bool>()` succeeds for any int and
+    // would route int values into the "true"/"false" branch.
+    if value.is_instance_of::<pyo3::types::PyBool>() {
+        let b: bool = value.extract()?;
         return Ok(if b {
             "true".to_string()
         } else {
             "false".to_string()
         });
     }
-    // Strings before integers, since `bool` extracts as int too.
     if let Ok(s) = value.extract::<String>() {
         return Ok(escape_pvput_string(&s));
     }

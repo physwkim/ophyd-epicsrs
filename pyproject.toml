@@ -5,7 +5,11 @@ build-backend = "maturin"
 [project]
 name = "ophyd-epicsrs"
 version = "0.5.2"
-requires-python = ">=3.8"
+# Python 3.8/3.9 are EOL and ophyd-async 0.16 already requires 3.10+.
+# Keep abi3-py38 wheel tag in maturin so older runtimes that link
+# against this build are still binary-compatible, but signal the
+# expected source-level minimum here.
+requires-python = ">=3.10"
 dependencies = ["ophyd>=1.9", "ophyd-async>=0.16", "bluesky>=1.13"]
 readme = "README.md"
 

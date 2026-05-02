@@ -62,8 +62,14 @@ preserved through the wire format). The NTScalar `value`, `alarm.severity`,
 onto the ophyd metadata dict so existing Signals/Devices receive the
 same keys they expect from CA.
 
-NTNDArray (areaDetector image streams over PVA) is **not yet supported**;
-use the CA backend for areaDetector image PVs until the next release.
+NTNDArray (the raw image-carrying PV) is not decoded into a numpy
+array on the Python side. This matches how ophyd-async's standard
+`StandardDetector` pattern uses areaDetector PVs — image bytes go
+from the camera's HDF5 plugin straight to disk, and bluesky receives
+Resource/Datum events rather than ndarrays. The companion control
+PVs (`ArrayCounter_RBV`, `Capture_RBV`, `FilePath`, `AcquireTime`,
+etc.) are NTScalar / NTEnum / string and work today. Live-preview or
+alignment paths that *do* want frames in Python are not yet covered.
 
 ## ophyd-async support (`ophyd_epicsrs.ophyd_async`)
 

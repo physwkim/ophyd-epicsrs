@@ -6,3 +6,15 @@ members = ["crates/ophyd-epicsrs"]
 edition = "2024"
 rust-version = "1.85"
 license = "BSD-3-Clause"
+
+# `panic = "unwind"` is REQUIRED on both profiles so the
+# `safe_warn!` / `safe_call!` panic-guard macros (see safe_log.rs)
+# can actually catch panics from pyo3-log + Python::with_gil during
+# interpreter finalize. Switching to `panic = "abort"` would render
+# every catch_unwind in this crate inert and re-introduce the
+# finalize-time crash class.
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"

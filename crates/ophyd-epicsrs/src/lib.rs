@@ -9,6 +9,12 @@ pub mod runtime;
 pub mod safe_log;
 
 use pyo3::prelude::*;
+use std::sync::OnceLock;
+
+/// Captured at module init so `reset_log_cache()` can clear pyo3-log's
+/// LoggersAndLevels cache on demand. Without this, runtime changes to
+/// Python logger levels are not picked up for ~30 s.
+static LOG_RESET: OnceLock<pyo3_log::ResetHandle> = OnceLock::new();
 
 #[pymodule]
 #[pyo3(name = "_native")]
@@ -26,10 +32,34 @@ fn ophyd_epicsrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     //
     // try_init so a sibling pyo3 crate that already initialised the
     // logger keeps its handler — failure here is benign.
-    let _ = pyo3_log::try_init();
+    if let Ok(reset) = pyo3_log::try_init() {
+        let _ = LOG_RESET.set(reset);
+    }
     m.add_class::<context::EpicsRsContext>()?;
     m.add_class::<pv::EpicsRsPV>()?;
     m.add_class::<pva::EpicsRsPvaContext>()?;
     m.add_class::<pva::EpicsRsPvaPV>()?;
+    m.add_function(wrap_pyfunction!(reset_log_cache, m)?)?;
+    m.add_function(wrap_pyfunction!(caught_panic_count, m)?)?;
     Ok(())
+}
+
+/// Clear the pyo3-log level cache. Call after changing Python logger
+/// levels at runtime so the next `tracing::*!` from Rust re-checks
+/// the Python side instead of using stale cached levels (~30 s TTL).
+#[pyfunction]
+fn reset_log_cache() {
+    if let Some(handle) = LOG_RESET.get() {
+        handle.reset();
+    }
+}
+
+/// Number of panics caught by `safe_warn!` / `safe_call!` since
+/// process start. Useful for telemetry — if this is non-zero, the
+/// pyo3-log → Python::with_gil bridge has hit interpreter-finalize
+/// races (or another panic source). The first such panic also writes
+/// a one-line notice to stderr; subsequent ones only increment.
+#[pyfunction]
+fn caught_panic_count() -> u64 {
+    safe_log::caught_panic_count()
 }

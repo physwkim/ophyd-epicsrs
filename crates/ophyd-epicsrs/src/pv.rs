@@ -20,6 +20,15 @@ struct MonitorEvent {
     snapshot: Snapshot,
 }
 
+/// Why `resolve_native_type` failed. Lets `put_async` distinguish a
+/// timeout (caller should warm the cache or extend the budget) from a
+/// channel-level failure (PV disconnected / protocol error — telling
+/// the user "extend timeout" would be wrong advice).
+enum ResolveError {
+    Timeout,
+    ChannelFailure(String),
+}
+
 /// Background prefetch result: channel info + full CTRL metadata.
 pub(crate) struct PrefetchResult {
     pub(crate) native_type: DbFieldType,
@@ -181,14 +190,16 @@ impl EpicsRsPV {
     /// caller's `await pv.put_async(...)` actually yields while we
     /// fetch channel info.
     ///
-    /// Caller is responsible for the timeout budget — the helper does
-    /// not impose its own ceiling. (Earlier revisions had a redundant
-    /// `min(5.0)` cap here on top of caller-side caps.)
+    /// Returns `ResolveError::Timeout` and `ResolveError::ChannelFailure`
+    /// as distinct variants so callers (e.g. `put_async`) can produce
+    /// accurate user-facing diagnostics rather than blaming the user's
+    /// timeout budget for what was actually a disconnect / protocol
+    /// error.
     async fn resolve_native_type(
         cache: Arc<Mutex<Option<DbFieldType>>>,
         channel: Arc<CaChannel>,
         timeout_secs: f64,
-    ) -> Result<DbFieldType, PyErr> {
+    ) -> Result<DbFieldType, ResolveError> {
         if let Some(t) = *cache.lock() {
             return Ok(t);
         }
@@ -198,9 +209,8 @@ impl EpicsRsPV {
                 *cache.lock() = Some(i.native_type);
                 Ok(i.native_type)
             }
-            _ => Err(PyRuntimeError::new_err(
-                "cannot determine PV native type for put (channel.info() failed)",
-            )),
+            Ok(Err(e)) => Err(ResolveError::ChannelFailure(e.to_string())),
+            Err(_) => Err(ResolveError::Timeout),
         }
     }
 
@@ -214,14 +224,14 @@ impl EpicsRsPV {
 
         let handle = self.runtime.spawn(async move {
             if channel.info().await.is_ok() {
-                Python::with_gil(|py| {
+                crate::safe_call!(Python::with_gil(|py| {
                     let guard = conn_cb_ref.lock();
                     if let Some(cb) = &*guard {
                         let callback = cb.clone_ref(py);
                         drop(guard);
                         let _ = callback.call1(py, (true,));
                     }
-                });
+                }));
             }
         });
         self.emit_tasks.lock().push(handle);
@@ -236,7 +246,7 @@ impl EpicsRsPV {
 
         let handle = self.runtime.spawn(async move {
             if let Ok(info) = channel.info().await {
-                Python::with_gil(|py| {
+                crate::safe_call!(Python::with_gil(|py| {
                     let guard = access_cb_ref.lock();
                     if let Some(cb) = &*guard {
                         let callback = cb.clone_ref(py);
@@ -244,7 +254,7 @@ impl EpicsRsPV {
                         let _ =
                             callback.call1(py, (info.access_rights.read, info.access_rights.write));
                     }
-                });
+                }));
             }
         });
         self.emit_tasks.lock().push(handle);
@@ -456,9 +466,9 @@ impl EpicsRsPV {
                         false
                     }
                 };
-                Python::with_gil(|py| {
+                crate::safe_call!(Python::with_gil(|py| {
                     let _ = cb.call1(py, (success,));
-                });
+                }));
             });
         } else {
             // Fire-and-forget put (CA_PROTO_WRITE) — spawn and return immediately.
@@ -520,7 +530,7 @@ impl EpicsRsPV {
                 if gen_ref.load(std::sync::atomic::Ordering::SeqCst) != generation {
                     continue;
                 }
-                Python::with_gil(|py| {
+                crate::safe_call!(Python::with_gil(|py| {
                     let guard = cb_ref.lock();
                     let callback = match &*guard {
                         Some(cb) => cb.clone_ref(py),
@@ -572,7 +582,7 @@ impl EpicsRsPV {
                     }
 
                     let _ = callback.call(py, (), Some(&kwargs));
-                });
+                }));
             }
         });
         // Replace the previous dispatch thread handle. The race between
@@ -664,34 +674,34 @@ impl EpicsRsPV {
                     use epics_rs::ca::client::ConnectionEvent;
                     match event {
                         ConnectionEvent::Connected => {
-                            Python::with_gil(|py| {
+                            crate::safe_call!(Python::with_gil(|py| {
                                 let guard = conn_cb_ref.lock();
                                 if let Some(cb) = &*guard {
                                     let callback = cb.clone_ref(py);
                                     drop(guard);
                                     let _ = callback.call1(py, (true,));
                                 }
-                            });
+                            }));
                         }
                         ConnectionEvent::Disconnected => {
-                            Python::with_gil(|py| {
+                            crate::safe_call!(Python::with_gil(|py| {
                                 let guard = conn_cb_ref.lock();
                                 if let Some(cb) = &*guard {
                                     let callback = cb.clone_ref(py);
                                     drop(guard);
                                     let _ = callback.call1(py, (false,));
                                 }
-                            });
+                            }));
                         }
                         ConnectionEvent::AccessRightsChanged { read, write } => {
-                            Python::with_gil(|py| {
+                            crate::safe_call!(Python::with_gil(|py| {
                                 let guard = access_cb_ref.lock();
                                 if let Some(cb) = &*guard {
                                     let callback = cb.clone_ref(py);
                                     drop(guard);
                                     let _ = callback.call1(py, (read, write));
                                 }
-                            });
+                            }));
                         }
                         ConnectionEvent::Unresponsive => {
                             // Echo timed out — TCP still up, no callback emitted
@@ -900,15 +910,24 @@ impl EpicsRsPV {
             let resolve_budget = (deadline - std::time::Instant::now())
                 .as_secs_f64()
                 .min(5.0);
-            let native = Self::resolve_native_type(cache, channel.clone(), resolve_budget)
+            let native = match Self::resolve_native_type(cache, channel.clone(), resolve_budget)
                 .await
-                .map_err(|_| {
-                    pyo3::exceptions::PyTimeoutError::new_err(format!(
+            {
+                Ok(t) => t,
+                Err(ResolveError::Timeout) => {
+                    return Err(pyo3::exceptions::PyTimeoutError::new_err(format!(
                         "put on {pvname}: native-type resolution exhausted the {timeout}s budget \
                          before the put could be issued (consider warming the cache via \
                          cache_native_type_async at connect, or pass a larger timeout)"
-                    ))
-                })?;
+                    )));
+                }
+                Err(ResolveError::ChannelFailure(msg)) => {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "put on {pvname}: channel.info() failed before put could be issued: {msg} \
+                         (PV likely disconnected — verify the IOC is reachable)"
+                    )));
+                }
+            };
             let epics_val = Python::with_gil(|py| {
                 let v = value_owned.bind(py);
                 crate::convert::py_to_epics_value(v, native)
@@ -953,7 +972,20 @@ impl EpicsRsPV {
             // Most callers either pre-warm via cache_native_type_async
             // at connect or don't care; the rare cache-miss path
             // accepts a 1 s ceiling rather than the previous 5 s.
-            let native = Self::resolve_native_type(cache, channel.clone(), 1.0).await?;
+            let native = match Self::resolve_native_type(cache, channel.clone(), 1.0).await {
+                Ok(t) => t,
+                Err(ResolveError::Timeout) => {
+                    return Err(pyo3::exceptions::PyTimeoutError::new_err(format!(
+                        "put_nowait on {pvname}: native-type resolution exceeded 1 s \
+                         (warm the cache via cache_native_type_async at connect)"
+                    )));
+                }
+                Err(ResolveError::ChannelFailure(msg)) => {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "put_nowait on {pvname}: channel.info() failed: {msg}"
+                    )));
+                }
+            };
             let epics_val = Python::with_gil(|py| {
                 let v = value_owned.bind(py);
                 crate::convert::py_to_epics_value(v, native)

@@ -282,9 +282,9 @@ impl EpicsRsPvaPV {
                             false
                         }
                     };
-                Python::with_gil(|py| {
+                crate::safe_call!(Python::with_gil(|py| {
                     let _ = cb.call1(py, (success,));
-                });
+                }));
             });
         } else {
             let pvname = self.pvname.clone();
@@ -336,7 +336,7 @@ impl EpicsRsPvaPV {
                 if gen_ref.load(std::sync::atomic::Ordering::SeqCst) != generation {
                     continue;
                 }
-                Python::with_gil(|py| {
+                crate::safe_call!(Python::with_gil(|py| {
                     let guard = cb_ref.lock();
                     let callback = match &*guard {
                         Some(cb) => cb.clone_ref(py),
@@ -352,7 +352,7 @@ impl EpicsRsPvaPV {
                         let _ = kwargs.set_item(k, v);
                     }
                     let _ = callback.call(py, (), Some(&kwargs));
-                });
+                }));
             }
         });
         // Reap any previous dispatch thread on a background join — the
@@ -395,18 +395,21 @@ impl EpicsRsPvaPV {
                 Ok(handle) => {
                     *handle_slot.lock() = Some(handle);
                     *connected_ref.lock() = true;
-                    // Only acquire the GIL if there's actually a callback to fire.
-                    // After clear_monitors / interpreter shutdown, conn_cb_ref may
-                    // be empty — skipping with_gil avoids panics during teardown.
-                    let cb = conn_cb_ref
-                        .lock()
-                        .as_ref()
-                        .map(|c| Python::with_gil(|py| c.clone_ref(py)));
-                    if let Some(cb) = cb {
-                        Python::with_gil(|py| {
-                            let _ = cb.call1(py, (true,));
-                        });
-                    }
+                    // Skip with_gil entirely if no callback is registered.
+                    // Even when one is registered, wrap with_gil itself in
+                    // safe_call! so a finalising interpreter doesn't kill
+                    // the runtime.
+                    crate::safe_call!({
+                        let cb = conn_cb_ref
+                            .lock()
+                            .as_ref()
+                            .map(|c| Python::with_gil(|py| c.clone_ref(py)));
+                        if let Some(cb) = cb {
+                            Python::with_gil(|py| {
+                                let _ = cb.call1(py, (true,));
+                            });
+                        }
+                    });
                 }
                 Err(e) => {
                     crate::safe_warn!(target: "ophyd_epicsrs.pva", pv = %pvname_for_call, "pvmonitor_handle subscribe failed: {e}");
@@ -446,14 +449,14 @@ impl EpicsRsPvaPV {
                     .and_then(|r| r.ok())
                     .is_some();
             *connected_ref.lock() = connected;
-            Python::with_gil(|py| {
+            crate::safe_call!(Python::with_gil(|py| {
                 let guard = cb_ref.lock();
                 if let Some(cb) = &*guard {
                     let cb_clone = cb.clone_ref(py);
                     drop(guard);
                     let _ = cb_clone.call1(py, (connected,));
                 }
-            });
+            }));
         });
         *self.connection_task.lock() = Some(handle);
     }
@@ -484,17 +487,19 @@ impl EpicsRsPvaPV {
 
             // Atomically read+clone the callback under the same lock.
             // If disconnect() cleared the slot during the await, this
-            // returns None and we skip Python::with_gil entirely
-            // (avoids interpreter-finalize panics).
-            let cb = cb_ref
-                .lock()
-                .as_ref()
-                .map(|c| Python::with_gil(|py| c.clone_ref(py)));
-            if let Some(cb) = cb {
-                Python::with_gil(|py| {
-                    let _ = cb.call1(py, (true, true));
-                });
-            }
+            // returns None and we skip Python::with_gil entirely.
+            // safe_call! also guards against interpreter-finalize panic.
+            crate::safe_call!({
+                let cb = cb_ref
+                    .lock()
+                    .as_ref()
+                    .map(|c| Python::with_gil(|py| c.clone_ref(py)));
+                if let Some(cb) = cb {
+                    Python::with_gil(|py| {
+                        let _ = cb.call1(py, (true, true));
+                    });
+                }
+            });
         });
         // Abort any previous probe so a re-registration cannot leave
         // an orphan firing into a stale callback.

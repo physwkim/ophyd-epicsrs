@@ -289,13 +289,14 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
         # the dispatch thread keeps receiving events at the IOC's monitor
         # rate. Calling the user callback would touch asyncio.Event /
         # Queue inside ophyd-async's cache without a running loop — UB.
-        # Drop further events, warn ONCE, and proactively clear the
+        # Drop further events, log ONCE, and proactively clear the
         # underlying monitor so the IOC stops streaming to us at all.
-        loop_closed_handled = [False]
+        loop_closed_handled = False
         native_pv = self._read_pv_native
         source = self.source("", read=True)
 
         def _wrapped(**kwargs):
+            nonlocal loop_closed_handled
             severity = kwargs.get("severity", 0)
             reading: Reading = {
                 "value": converter.to_python(kwargs.get("value"), kwargs),
@@ -314,8 +315,8 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
                     _logger.exception(
                         "monitor callback for %s raised", source
                     )
-            elif not loop_closed_handled[0]:
-                loop_closed_handled[0] = True
+            elif not loop_closed_handled:
+                loop_closed_handled = True
                 _logger.debug(
                     "monitor event for %s arrived after the registered "
                     "asyncio loop closed — clearing the subscription "

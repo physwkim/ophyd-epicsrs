@@ -128,7 +128,9 @@ def test_create_and_drop_loop_does_not_leak_threads():
 
     after = threading.active_count()
     delta = after - baseline
-    assert delta < 50, (
+    # Tight threshold: if even 1% of PVs leaked a thread, delta would
+    # be 5 — well within range. Drop should keep thread count flat.
+    assert delta < 5, (
         f"thread count grew by {delta} over 500 PV cycles "
         f"(baseline={baseline}, after={after}) — possible leak in Drop"
     )

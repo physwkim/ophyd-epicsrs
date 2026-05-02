@@ -34,9 +34,10 @@ jobs:
           fetch-depth: 1
 
       - name: Setup Rust
+        # No `toolchain` pin — track stable so transitive deps that
+        # bump their MSRV don't break us out of nowhere. Cargo.toml's
+        # rust-version = "1.88" still rejects too-old local toolchains.
         uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: '1.85'
 
       - name: Cache cargo registry + epics-rs target dir
         uses: actions/cache@v4

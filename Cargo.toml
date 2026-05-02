@@ -4,7 +4,10 @@ members = ["crates/ophyd-epicsrs"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+# 1.88 — let-chains (`if let X && let Y`) used by epics-base-rs 0.13.0.
+# Earlier rust-version = "1.85" was a lie; CI builds at 1.85 hit E0658
+# in record_instance.rs.
+rust-version = "1.88"
 license = "BSD-3-Clause"
 
 # `panic = "unwind"` is REQUIRED on both profiles so the

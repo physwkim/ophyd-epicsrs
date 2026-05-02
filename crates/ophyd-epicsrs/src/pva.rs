@@ -133,12 +133,23 @@ pub struct EpicsRsPvaPV {
 /// a cached `Some(true)` to `Some(false)` — monitor deltas can arrive
 /// as partial structures (e.g. `value` sub-field absent) that look
 /// non-NTEnum even though the channel is NTEnum.
+/// Write the result of `detect_ntenum_shape` into `slot`.
+///
+/// Extracted so both the `&self` sync path and `async move` async paths
+/// (which cannot borrow `self`) share a single call-site pattern.
+fn record_ntenum_into(slot: &Mutex<Option<bool>>, field: &PvField) {
+    if let Some(detected) = detect_ntenum_shape(field) {
+        *slot.lock() = Some(detected);
+    }
+}
+
 fn detect_ntenum_shape(field: &PvField) -> Option<bool> {
     let s = match field {
         PvField::Structure(s) => s,
         _ => return None,
     };
-    if s.struct_id == "epics:nt/NTEnum:1.0" {
+    if s.struct_id.starts_with("epics:nt/NTEnum:") {
+        // Covers 1.0 and any future minor bumps (shape-compatible per spec).
         return Some(true);
     }
     if s.struct_id.starts_with("epics:nt/") {
@@ -193,9 +204,7 @@ impl EpicsRsPvaPV {
 
     /// Update `is_ntenum` from a freshly-read PvField.
     fn record_ntenum_shape(&self, field: &PvField) {
-        if let Some(detected) = detect_ntenum_shape(field) {
-            *self.is_ntenum.lock() = Some(detected);
-        }
+        record_ntenum_into(&self.is_ntenum, field);
     }
 }
 
@@ -420,9 +429,7 @@ impl EpicsRsPvaPV {
                 // and only then puts — so the first read may already
                 // be a monitor delivery rather than an explicit
                 // get_value_async.
-                if let Some(detected) = detect_ntenum_shape(&event.field) {
-                    *is_ntenum_ref.lock() = Some(detected);
-                }
+                record_ntenum_into(&is_ntenum_ref, &event.field);
                 crate::safe_call!(Python::with_gil(|py| {
                     let guard = cb_ref.lock();
                     let callback = match &*guard {
@@ -673,13 +680,26 @@ impl EpicsRsPvaPV {
         let dur = Duration::from_secs_f64(timeout);
         let is_ntenum = self.is_ntenum.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            if let Ok(Ok(field)) = tokio::time::timeout(dur, client.pvget(&name)).await {
-                if let Some(detected) = detect_ntenum_shape(&field) {
-                    *is_ntenum.lock() = Some(detected);
-                }
+            // Skip the pvget if a prior read (monitor / get_value_async /
+            // get_reading_async) already populated the cache. This avoids
+            // a redundant round-trip on reconnect and on non-NTEnum PVs
+            // where the overhead buys nothing.
+            if is_ntenum.lock().is_some() {
+                return Ok(true);
             }
-            // Always succeed — cache warm-up is best-effort; callers
-            // handle a cold cache gracefully (put falls back to pvput).
+            match tokio::time::timeout(dur, client.pvget(&name)).await {
+                Ok(Ok(field)) => record_ntenum_into(&is_ntenum, &field),
+                Ok(Err(e)) => tracing::warn!(
+                    pv = %name,
+                    "cache_native_type_async pvget failed — is_ntenum stays unknown, \
+                     NTEnum put routing may fall back to plain pvput: {e}"
+                ),
+                Err(_) => tracing::warn!(
+                    pv = %name,
+                    "cache_native_type_async pvget timed out after {timeout}s — \
+                     is_ntenum stays unknown, NTEnum put routing may fall back to plain pvput"
+                ),
+            }
             Ok(true)
         })
     }
@@ -762,9 +782,7 @@ impl EpicsRsPvaPV {
                     // put_async(int) routes through pvput_field. The
                     // sync get's cache update isn't reached when the
                     // user only ever uses the async surface.
-                    if let Some(detected) = detect_ntenum_shape(&field) {
-                        *is_ntenum.lock() = Some(detected);
-                    }
+                    record_ntenum_into(&is_ntenum, &field);
                     crate::safe_call_or!(
                         Err(PyRuntimeError::new_err(format!(
                             "pvget on {pvname}: panic in Python::with_gil during value conversion"
@@ -822,9 +840,7 @@ impl EpicsRsPvaPV {
             match tokio::time::timeout(dur, client.pvget(&name)).await {
                 Ok(Ok(field)) => {
                     // Feed is_ntenum cache (same reason as get_value_async).
-                    if let Some(detected) = detect_ntenum_shape(&field) {
-                        *is_ntenum.lock() = Some(detected);
-                    }
+                    record_ntenum_into(&is_ntenum, &field);
                     crate::safe_call_or!(
                         Err(PyRuntimeError::new_err(format!(
                             "pvget on {pvname}: panic in Python::with_gil during reading conversion"

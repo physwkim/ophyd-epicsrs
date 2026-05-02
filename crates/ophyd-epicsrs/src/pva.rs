@@ -73,7 +73,13 @@ pub struct EpicsRsPvaPV {
     #[pyo3(get)]
     pub(crate) pvname: String,
     /// Stored monitor handle so dropping the PV aborts the subscription.
-    monitor_handle: Mutex<Option<SubscriptionHandle>>,
+    /// Wrapped in Arc so the spawned subscribe task can install it
+    /// asynchronously without blocking the calling Python thread.
+    monitor_handle: Arc<Mutex<Option<SubscriptionHandle>>>,
+    /// JoinHandle for the spawned subscribe task — aborted by
+    /// clear_monitors so an in-flight subscribe does not later try to
+    /// re-acquire the GIL after Python has finalized.
+    monitor_setup_task: Mutex<Option<JoinHandle<()>>>,
     /// Python dispatch thread for monitor callbacks.
     dispatch_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Sender to dispatch thread; None = no monitor active.
@@ -94,7 +100,8 @@ impl EpicsRsPvaPV {
             runtime,
             client,
             pvname,
-            monitor_handle: Mutex::new(None),
+            monitor_handle: Arc::new(Mutex::new(None)),
+            monitor_setup_task: Mutex::new(None),
             dispatch_thread: Mutex::new(None),
             monitor_tx: Arc::new(Mutex::new(None)),
             py_monitor_callback: Arc::new(Mutex::new(None)),
@@ -320,38 +327,42 @@ impl EpicsRsPvaPV {
         let connected_ref = self.connected.clone();
         let conn_cb_ref = self.connection_callback.clone();
 
-        // Spawn the monitor + capture its SubscriptionHandle synchronously.
-        let (handle_tx, handle_rx) = std::sync::mpsc::channel();
+        // Spawn the subscribe asynchronously and install the resulting
+        // SubscriptionHandle from inside the spawned task. We do NOT
+        // block the calling Python thread waiting for it — a slow IOC
+        // or unresolvable PV would otherwise hang add_monitor_callback
+        // indefinitely. The handle slot uses Arc so the spawned task
+        // can write to it without lifetime gymnastics.
         let pvname_for_call = pvname.clone();
         let pvname_for_event = pvname.clone();
-        self.runtime.spawn(async move {
-            let result = client.pvmonitor_handle(&pvname_for_call, move |_desc, value| {
+        let handle_slot = self.monitor_handle.clone();
+        let setup = self.runtime.spawn(async move {
+            match client.pvmonitor_handle(&pvname_for_call, move |_desc, value| {
                 let event = PvaMonitorEvent {
                     pvname: pvname_for_event.clone(),
                     field: value.clone(),
                 };
                 let _ = tx.send(event);
-            }).await;
-            let _ = handle_tx.send(result);
-
-            // After successful subscribe, mark connected and fire connection cb.
-            // Note: pvmonitor_handle returns immediately with the handle; the
-            // subscription stays alive via SubscriptionHandle held by Python.
-        });
-
-        if let Ok(Ok(handle)) = handle_rx.recv() {
-            *self.monitor_handle.lock() = Some(handle);
-            *connected_ref.lock() = true;
-            // Fire connection callback if set
-            Python::with_gil(|py| {
-                let guard = conn_cb_ref.lock();
-                if let Some(cb) = &*guard {
-                    let cb_clone = cb.clone_ref(py);
-                    drop(guard);
-                    let _ = cb_clone.call1(py, (true,));
+            }).await {
+                Ok(handle) => {
+                    *handle_slot.lock() = Some(handle);
+                    *connected_ref.lock() = true;
+                    // Only acquire the GIL if there's actually a callback to fire.
+                    // After clear_monitors / interpreter shutdown, conn_cb_ref may
+                    // be empty — skipping with_gil avoids panics during teardown.
+                    let cb = conn_cb_ref.lock().as_ref().map(|c| Python::with_gil(|py| c.clone_ref(py)));
+                    if let Some(cb) = cb {
+                        Python::with_gil(|py| {
+                            let _ = cb.call1(py, (true,));
+                        });
+                    }
                 }
-            });
-        }
+                Err(e) => {
+                    eprintln!("[pvmonitor_handle] {pvname_for_call}: subscribe failed: {e}");
+                }
+            }
+        });
+        *self.monitor_setup_task.lock() = Some(setup);
     }
 
     /// Set a connection callback. Best-effort: PVA's connect builder
@@ -417,7 +428,14 @@ impl EpicsRsPvaPV {
     fn clear_monitors(&self) {
         *self.py_monitor_callback.lock() = None;
         *self.monitor_tx.lock() = None;
-        // Drop the SubscriptionHandle to abort the monitor task.
+        // Abort the spawned subscribe task before it can install a
+        // SubscriptionHandle (or fire the connection callback) — this
+        // prevents a teardown race where pvmonitor_handle resolves
+        // after Python is finalized and Python::with_gil panics.
+        if let Some(task) = self.monitor_setup_task.lock().take() {
+            task.abort();
+        }
+        // Drop any installed SubscriptionHandle to stop the subscription.
         let _ = self.monitor_handle.lock().take();
         // Dispatch thread will exit when rx sender is dropped.
     }

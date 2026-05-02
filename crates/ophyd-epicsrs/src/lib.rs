@@ -1,6 +1,8 @@
 pub mod context;
 pub mod convert;
 pub mod pv;
+pub mod pva;
+pub mod pva_convert;
 
 use pyo3::prelude::*;
 
@@ -9,5 +11,7 @@ use pyo3::prelude::*;
 fn ophyd_epicsrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<context::EpicsRsContext>()?;
     m.add_class::<pv::EpicsRsPV>()?;
+    m.add_class::<pva::EpicsRsPvaContext>()?;
+    m.add_class::<pva::EpicsRsPvaPV>()?;
     Ok(())
 }

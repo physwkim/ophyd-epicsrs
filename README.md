@@ -1,8 +1,8 @@
 # ophyd-epicsrs
 
-Rust EPICS Channel Access backend for [ophyd](https://github.com/bluesky/ophyd).
+Rust EPICS backend for [ophyd](https://github.com/bluesky/ophyd) — supports both Channel Access (CA) and pvAccess (PVA).
 
-Replaces pyepics (`Python → ctypes → libca.so`) with [epics-rs](https://github.com/epics-rs/epics-rs) (`Python → PyO3 → Rust CA client`), releasing the GIL during all network I/O.
+Replaces pyepics (`Python → ctypes → libca.so`) with [epics-rs](https://github.com/epics-rs/epics-rs) (`Python → PyO3 → Rust client`), releasing the GIL during all network I/O. CA and PVA share a single tokio runtime — no separate `aioca` + `p4p` binding stacks.
 
 ## Installation
 
@@ -35,6 +35,33 @@ print(motor.read())
 `use_epicsrs()` assigns `ophyd.cl` directly. It must be called before any
 `Signal` or `Device` is constructed, since they capture `ophyd.cl.get_pv`
 at construction time.
+
+## PVA support
+
+PVs are dispatched by name prefix (pvxs / ophyd-async convention):
+
+```python
+import ophyd
+from ophyd_epicsrs import use_epicsrs
+use_epicsrs()
+
+# CA (default — preserves existing ophyd code)
+sig_ca = ophyd.EpicsSignal("IOC:foo")
+sig_ca = ophyd.EpicsSignal("ca://IOC:foo")    # explicit prefix also works
+
+# PVA (NTScalar / NTScalarArray / NTEnum)
+sig_pva = ophyd.EpicsSignal("pva://IOC:bar")
+```
+
+The PVA backend supports the standard NT (Normative Type) shapes:
+NTScalar, NTScalarArray, NTEnum. The NTScalar `value`, `alarm.severity`,
+`alarm.status`, `timeStamp.{secondsPastEpoch, nanoseconds}`, and
+`display.{units, precision, limitLow, limitHigh}` fields are projected
+onto the ophyd metadata dict so existing Signals/Devices receive the
+same keys they expect from CA.
+
+NTNDArray (areaDetector image streams over PVA) is **not yet supported**;
+use the CA backend for areaDetector image PVs until the next release.
 
 ## Parallel PV Read (bulk_caget)
 

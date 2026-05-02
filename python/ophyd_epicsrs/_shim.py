@@ -12,7 +12,7 @@ import threading
 
 from ophyd._dispatch import EventDispatcher, _CallbackThread, wrap_callback
 
-from ophyd_epicsrs._native import EpicsRsContext
+from ophyd_epicsrs._native import EpicsRsContext, EpicsRsPvaContext
 
 name = "epicsrs"
 thread_class = threading.Thread
@@ -20,15 +20,34 @@ thread_class = threading.Thread
 module_logger = logging.getLogger(__name__)
 
 _context = None
+_pva_context = None
 _dispatcher = None
 
 
+# Protocol prefixes follow pvxs / ophyd-async convention:
+#   "pva://NAME" → PVA backend
+#   "ca://NAME"  → CA backend (prefix stripped)
+#   "NAME"       → CA backend (default — preserves ophyd backward compat)
+_PVA_PREFIX = "pva://"
+_CA_PREFIX = "ca://"
+
+
+def _split_protocol(pvname):
+    """Return (protocol, bare_name) for a possibly-prefixed PV name."""
+    if pvname.startswith(_PVA_PREFIX):
+        return "pva", pvname[len(_PVA_PREFIX):]
+    if pvname.startswith(_CA_PREFIX):
+        return "ca", pvname[len(_CA_PREFIX):]
+    return "ca", pvname
+
+
 def _cleanup():
-    global _context, _dispatcher
+    global _context, _pva_context, _dispatcher
     if _dispatcher is not None and _dispatcher.is_alive():
         _dispatcher.stop()
     _dispatcher = None
     _context = None
+    _pva_context = None
 
 
 def get_dispatcher():
@@ -44,6 +63,8 @@ def setup(logger):
         return _dispatcher
 
     _context = EpicsRsContext()
+    # PVA context is created lazily on first use to avoid spawning a
+    # second runtime when the user only uses CA.
 
     if logger:
         logger.debug("Installing epicsrs event dispatcher")
@@ -55,6 +76,14 @@ def setup(logger):
     )
     atexit.register(_cleanup)
     return _dispatcher
+
+
+def _get_pva_context():
+    """Lazily construct the PVA context on first use."""
+    global _pva_context
+    if _pva_context is None:
+        _pva_context = EpicsRsPvaContext()
+    return _pva_context
 
 
 def _process_pending(dispatcher, timeout=2.0):
@@ -96,8 +125,11 @@ class EpicsRsShimPV:
         access_callback=None,
         verbose=False,
         monitor_delta=None,
+        _native_pv=None,
     ):
-        self._pv = _context.create_pv(pvname)
+        # _native_pv lets get_pv() inject a pre-created PVA channel so this
+        # class can wrap either CA or PVA backends with the same surface.
+        self._pv = _native_pv if _native_pv is not None else _context.create_pv(pvname)
         self.pvname = pvname
         self.form = form
         self.auto_monitor = auto_monitor
@@ -307,17 +339,29 @@ def get_pv(
     monitor_delta=None,
     **kwargs,
 ):
-    """Create a fresh EpicsRsShimPV. Unlike pyepics we do NOT cache PV
-    objects, because the Rust runtime already shares one TCP virtual
-    circuit per IOC. Skipping the cache avoids subscription-resolution
-    bugs when multiple ophyd Devices reference the same PV name.
+    """Create a fresh EpicsRsShimPV.
+
+    The protocol is selected by PV-name prefix:
+      * ``pva://NAME`` → PVA backend
+      * ``ca://NAME``  → CA backend (prefix stripped)
+      * ``NAME``       → CA backend (default — preserves backward compat)
+
+    Unlike pyepics we do NOT cache PV objects, because the Rust runtime
+    already shares one transport circuit per IOC. Skipping the cache
+    avoids subscription-resolution bugs when multiple ophyd Devices
+    reference the same PV name.
     """
     connection_callback = wrap_callback(_dispatcher, "metadata", connection_callback)
     callback = wrap_callback(_dispatcher, "monitor", callback)
     access_callback = wrap_callback(_dispatcher, "metadata", access_callback)
 
+    protocol, bare_name = _split_protocol(pvname)
+    native_pv = None
+    if protocol == "pva":
+        native_pv = _get_pva_context().create_pv(bare_name)
+
     pv = EpicsRsShimPV(
-        pvname,
+        bare_name,
         form=form,
         auto_monitor=auto_monitor,
         connection_callback=connection_callback,
@@ -327,6 +371,7 @@ def get_pv(
         access_callback=access_callback,
         verbose=verbose,
         monitor_delta=monitor_delta,
+        _native_pv=native_pv,
     )
     if connect:
         pv.wait_for_connection(timeout=timeout)

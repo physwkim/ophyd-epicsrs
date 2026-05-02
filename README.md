@@ -237,23 +237,48 @@ Total: ~2ms (Python free), MongoDB insert continues in background
 
 ## Performance
 
-### Versus pyepics
+### Versus pyepics — honest like-for-like benchmark
 
-Original benchmark against pyepics on the same IOC (EPICS motor record, LAN):
+Run on the same machine, same mini-beamline IOC, same PV pool, same
+connection state (warm). Reproducible from
+`tests/integration/bench_vs_pyepics.py`:
 
-| Operation | pyepics | epicsrs | Speedup |
+| Operation | pyepics | epicsrs | Comment |
 |-----------|---------|---------|---------|
-| CA get (no monitor) | 0.33 ms | **0.09 ms** | 3.7× |
-| CA get (with monitor) | 0.01 ms | **0.00 ms** | — |
-| CA put → immediate get | 0.85 ms | **0.44 ms** | 1.9× |
-| bulk_caget (50 PVs) | ~1500 ms | **~1 ms** | 1500× |
-| Device connect (200 PVs) | ~2 s | **~0.16 s** | 12× |
+| Single PV cached get (`PV.get()` after monitor) | **p50 2 µs** | p50 61 µs | pyepics returns the cached monitor value with no network round-trip; `EpicsRsPV.get_with_metadata` always issues a fresh CA read. Different semantics. |
+| Single PV fresh CA read | ~100 µs avg (`epics.caget()`) | **p50 61 µs** | Same network round-trip; epicsrs releases the GIL during the read. |
+| Sequential fresh reads, 48 PVs (`caget` loop) | 4.71 ms | **2.28 ms** | 2.1× — fewer C↔Python crossings + per-call GIL releases. |
+| `bulk_caget(48)` | n/a (no bulk primitive) | **2.60 ms** | Same wall time as the sequential loop above because the IOC + LAN are fast enough that the per-PV GIL drops dominate; the *real* `bulk_caget` win is at higher latencies (see flyer scenario below). |
 
-The put→get improvement comes from the single-owner writer task
-architecture in epics-rs, which pipelines write and read requests on
-the same TCP connection without mutex contention. Combined with
-`TCP_NODELAY`, this eliminates the ~45 ms head-of-line blocking that
-occurred when reads waited for writes to flush.
+**Where the much larger speedups show up:**
+
+- **Sluggish IOC / WAN link, 50 PVs.** Sequential pyepics adds N
+  round-trip latencies; `bulk_caget` adds one. At 30 ms RTT this is
+  the difference between ~1.5 s and ~30 ms — the original "1500×"
+  number in earlier README revisions came from this regime, but it
+  was not labelled honestly.
+- **Device connect with many PVs.** The legacy ophyd path issues
+  per-PV `wait_for_connection` calls serialised by the GIL.
+  `bulk_connect_and_prefetch` collects all unconnected PVs and
+  connects them concurrently in a single tokio call — see
+  *Device-level bulk connect* below.
+- **Mixed sync + async usage in the same process.** With pyepics +
+  aioca/p4p, you pay for two separate EPICS stacks (separate
+  channels, separate threads). With epicsrs both surfaces share one
+  backend.
+
+**Where pyepics wins:** the cached-monitor `PV.get()` path. If your
+hot loop is reading a value that already has an active monitor and
+you don't need fresh metadata, pyepics's in-process cache is hard to
+beat. `EpicsRsShimPV.get` (the legacy-ophyd surface) does cache
+monitor values too, so the gap mostly closes when you go through the
+ophyd Signal layer rather than calling `_native.get_with_metadata`
+directly.
+
+The put→get improvement (single-owner writer task + `TCP_NODELAY`)
+remains unchanged from earlier releases — it eliminates the ~45 ms
+head-of-line blocking that occurred when reads waited for writes to
+flush.
 
 ### Reproducible mini-beamline measurements
 

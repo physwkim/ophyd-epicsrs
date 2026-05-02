@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.6.6 (2026-05-02)
+
+### Bug fixes — PVA NTEnum robustness (10th-pass review)
+
+- **Write-PV NTEnum detection** (`cache_native_type_async`): was a
+  no-op for PVA. For split read/write signals
+  (`epicsrs_signal_rw(MyEnum, "pva://X_rbv", "pva://X_cmd")`) the
+  write PV's `is_ntenum` flag was never set, so `put_async(int)` fell
+  through to plain `pvput` and was silently rejected by the IOC.
+  `cache_native_type_async` now does a one-shot `pvget` to detect
+  the channel shape at connect time (failures are non-fatal).
+
+- **Monitor-delta false negative** (`detect_ntenum_shape`): monitor
+  events in epics-pva-rs deliver full structures, but as a defensive
+  measure the detection logic now uses `struct_id` as the authoritative
+  classifier. Previously, a partial structure (value sub-field absent
+  from a delta) made `try_extract_ntenum` return `None`, which flipped
+  the cache from `Some(true)` → `Some(false)` and broke the next
+  `put_async(int)`. Now: `"epics:nt/NTEnum:1.0"` → confirmed NTEnum,
+  other `"epics:nt/…"` → confirmed non-NTEnum, empty/unknown struct_id
+  with failed extraction → `None` (no new information, cache preserved).
+
+- **Code de-duplication**: extracted `detect_ntenum_shape(field: &PvField)`
+  free function; all five detection sites now call it instead of
+  inlining the pattern.
+
+### Fixes
+
+- Stale cross-reference in `test_pva_ntenum_put_index` docstring
+  corrected to `test_async_pva_ntenum_via_ophyd_async_strict_enum`.
+
 ## v0.6.5 (2026-05-03)
 
 ### Bug fixes — async path completeness for the v0.6.4 changes

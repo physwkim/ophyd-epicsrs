@@ -15,5 +15,11 @@ pyo3 = { version = "0.24", features = ["extension-module", "abi3-py38"] }
 pyo3-async-runtimes = { version = "0.24", features = ["tokio-runtime"] }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
 parking_lot = "0.12"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# tracing's "log" feature: when no Subscriber is registered, every
+# tracing event is emitted as a log::Record so pyo3-log can forward it
+# to the user's Python logging configuration. No process-wide stderr
+# subscriber → no Jupyter red-box noise, no double-reporting alongside
+# PyRuntimeError, and library users keep full control through their
+# normal `logging.getLogger("ophyd_epicsrs.ca").setLevel(...)` patterns.
+tracing = { version = "0.1", features = ["log"] }
+pyo3-log = "0.12"

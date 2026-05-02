@@ -45,6 +45,13 @@ pub struct EpicsRsPV {
     native_type: Arc<Mutex<Option<DbFieldType>>>,
     monitor_task: Mutex<Option<JoinHandle<()>>>,
     py_monitor_callback: Arc<Mutex<Option<PyObject>>>,
+    /// Generation token incremented per `add_monitor_callback`. Each
+    /// dispatch thread captures its expected token at spawn time and
+    /// refuses to fire the callback once the canonical token has
+    /// advanced — so a slow OLD dispatch thread cannot deliver
+    /// stale-rx events into the NEW callback during a `set_callback`
+    /// resubscribe.
+    monitor_generation: Arc<std::sync::atomic::AtomicU64>,
     connection_callback: Arc<Mutex<Option<PyObject>>>,
     access_callback: Arc<Mutex<Option<PyObject>>>,
     connection_task: Mutex<Option<JoinHandle<()>>>,
@@ -114,6 +121,7 @@ impl EpicsRsPV {
             native_type: Arc::new(Mutex::new(None)),
             monitor_task: Mutex::new(None),
             py_monitor_callback: Arc::new(Mutex::new(None)),
+            monitor_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             connection_callback: Arc::new(Mutex::new(None)),
             access_callback: Arc::new(Mutex::new(None)),
             connection_task: Mutex::new(None),
@@ -370,11 +378,11 @@ impl EpicsRsPV {
                 Ok(Some(snapshot_to_pydict(py, &snapshot)))
             }
             Ok(Err(e)) => {
-                tracing::warn!(target: "ophyd_epicsrs::ca", pv = %self.pvname, "get_with_metadata failed: {e}");
+                tracing::warn!(target: "ophyd_epicsrs.ca", pv = %self.pvname, "get_with_metadata failed: {e}");
                 Ok(None)
             }
             Err(_) => {
-                tracing::warn!(target: "ophyd_epicsrs::ca", pv = %self.pvname, "get_with_metadata timed out");
+                tracing::warn!(target: "ophyd_epicsrs.ca", pv = %self.pvname, "get_with_metadata timed out");
                 Ok(None)
             }
         }
@@ -432,11 +440,11 @@ impl EpicsRsPV {
                 let success = match tokio::time::timeout(dur, channel.put(&epics_val)).await {
                     Ok(Ok(())) => true,
                     Ok(Err(e)) => {
-                        tracing::warn!(target: "ophyd_epicsrs::ca", pv = %pvname, "put error: {e}");
+                        tracing::warn!(target: "ophyd_epicsrs.ca", pv = %pvname, "put error: {e}");
                         false
                     }
                     Err(_) => {
-                        tracing::warn!(target: "ophyd_epicsrs::ca", pv = %pvname, "put timed out");
+                        tracing::warn!(target: "ophyd_epicsrs.ca", pv = %pvname, "put timed out");
                         false
                     }
                 };
@@ -453,7 +461,7 @@ impl EpicsRsPV {
             let pvname = self.pvname.clone();
             self.runtime.spawn(async move {
                 if let Err(e) = channel.put_nowait(&epics_val).await {
-                    tracing::warn!(target: "ophyd_epicsrs::ca", pv = %pvname, "put_nowait error: {e}");
+                    tracing::warn!(target: "ophyd_epicsrs.ca", pv = %pvname, "put_nowait error: {e}");
                 }
             });
         }
@@ -478,14 +486,32 @@ impl EpicsRsPV {
             }
         }
 
+        // Bump the generation BEFORE creating the new dispatch thread.
+        // Any old dispatch thread that's still draining its rx will see
+        // its own captured generation differ from this one and bail
+        // before invoking the (potentially new) callback. (`gen` is a
+        // reserved keyword in edition 2024, hence `generation`.)
+        let generation = self
+            .monitor_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+
         // Create the event queue
         let (tx, rx) = std::sync::mpsc::channel::<MonitorEvent>();
         *self.monitor_tx.lock() = Some(tx.clone());
 
         // Start Python dispatch thread — reads from queue, calls Python callback
         let cb_ref = self.py_monitor_callback.clone();
+        let gen_ref = self.monitor_generation.clone();
         let dispatch = std::thread::spawn(move || {
             while let Ok(event) = rx.recv() {
+                // Race guard: if a NEW set_callback ran while we still
+                // had pending events, the canonical generation has
+                // advanced past ours — the new dispatch thread owns
+                // the callback now. Drop without firing.
+                if gen_ref.load(std::sync::atomic::Ordering::SeqCst) != generation {
+                    continue;
+                }
                 Python::with_gil(|py| {
                     let guard = cb_ref.lock();
                     let callback = match &*guard {
@@ -541,6 +567,18 @@ impl EpicsRsPV {
                 });
             }
         });
+        // Replace the previous dispatch thread handle. The race between
+        // an OLD dispatch thread still draining rx and the NEW callback
+        // is closed by the generation check above; here we just reap
+        // the old JoinHandle (in a background thread, since the OLD
+        // thread might have queued events to process before exiting).
+        if let Some(old) = self.dispatch_thread.lock().take() {
+            let _ = std::thread::Builder::new()
+                .name("ophyd-epicsrs-dispatch-join".into())
+                .spawn(move || {
+                    let _ = old.join();
+                });
+        }
         *self.dispatch_thread.lock() = Some(dispatch);
 
         // Start tokio monitor task with auto-resubscribe.
@@ -844,24 +882,29 @@ impl EpicsRsPV {
         let value_owned: Py<pyo3::PyAny> = value.clone().unbind();
         let cache = self.native_type.clone();
         let channel = self.channel.clone();
-        let dur = Duration::from_secs_f64(timeout);
         let pvname = self.pvname.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            // resolve_native_type uses the user-supplied timeout (capped
-            // at the put timeout itself) so a slow IOC immediately
-            // after connect doesn't false-fail.
-            let native = Self::resolve_native_type(cache, channel.clone(), timeout).await?;
+            // Deadline-based budget: total wall-clock time for resolve+put
+            // must fit inside `timeout`. Without this, a cache miss could
+            // burn 5 s on resolve_native_type AND another `timeout` s on
+            // the put itself.
+            let deadline = std::time::Instant::now() + Duration::from_secs_f64(timeout);
+            let resolve_budget = (deadline - std::time::Instant::now())
+                .as_secs_f64()
+                .min(5.0);
+            let native = Self::resolve_native_type(cache, channel.clone(), resolve_budget).await?;
             let epics_val = Python::with_gil(|py| {
                 let v = value_owned.bind(py);
                 crate::convert::py_to_epics_value(v, native)
             })?;
-            match tokio::time::timeout(dur, channel.put(&epics_val)).await {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(remaining, channel.put(&epics_val)).await {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
                     "put on {pvname} failed: {e}"
                 ))),
                 Err(_) => Err(pyo3::exceptions::PyTimeoutError::new_err(format!(
-                    "put on {pvname} timed out after {timeout}s"
+                    "put on {pvname} exceeded total budget {timeout}s"
                 ))),
             }
         })
@@ -883,7 +926,12 @@ impl EpicsRsPV {
         let channel = self.channel.clone();
         let pvname = self.pvname.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let native = Self::resolve_native_type(cache, channel.clone(), 5.0).await?;
+            // Tight 1 s cap on resolve_native_type — "nowait" semantics
+            // mean the caller does NOT want to block on a slow IOC.
+            // Most callers either pre-warm via cache_native_type_async
+            // at connect or don't care; the rare cache-miss path
+            // accepts a 1 s ceiling rather than the previous 5 s.
+            let native = Self::resolve_native_type(cache, channel.clone(), 1.0).await?;
             let epics_val = Python::with_gil(|py| {
                 let v = value_owned.bind(py);
                 crate::convert::py_to_epics_value(v, native)

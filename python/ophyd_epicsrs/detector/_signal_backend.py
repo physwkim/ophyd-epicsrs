@@ -93,6 +93,14 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
         return f"{scheme}://{pv}"
 
     async def connect(self, timeout: float):
+        # Wrap the entire connect sequence in asyncio.wait_for so the
+        # user-supplied timeout becomes the absolute wall-clock budget,
+        # not a per-phase budget. Without this, four sequential phases
+        # (connect, cache native_type, schema fetch, initial metadata)
+        # each capped at `timeout` would let connect take up to 4×timeout.
+        await asyncio.wait_for(self._connect_inner(timeout), timeout=timeout)
+
+    async def _connect_inner(self, timeout: float) -> None:
         if self.read_pv != self.write_pv:
             ok_r, ok_w = await asyncio.gather(
                 self._read_pv_native.connect_async(timeout),
@@ -106,52 +114,40 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
 
         # Populate native_type via channel.info() (no CA read) for both
         # the read AND write PVs. Calling on both ensures each prefetch
-        # task started by EpicsRsPV::new is consumed (no leaked
-        # background work) and that put paths skip the info() round
-        # trip. PVA's cache_native_type_async is a no-op (string-form
-        # pvput needs no cache) so the call is harmless.
+        # task started by EpicsRsPV::new is consumed and that put paths
+        # skip the info() round trip. PVA's cache_native_type_async is
+        # a no-op (string-form pvput needs no cache) so safe to call.
+        # Per-phase cap is small because the outer wait_for is the
+        # real budget — these are best-effort fast-paths.
+        phase_to = min(timeout, 2.0)
         if self.read_pv != self.write_pv:
             await asyncio.gather(
-                self._read_pv_native.cache_native_type_async(
-                    timeout=min(timeout, 2.0)
-                ),
-                self._write_pv_native.cache_native_type_async(
-                    timeout=min(timeout, 2.0)
-                ),
+                self._read_pv_native.cache_native_type_async(timeout=phase_to),
+                self._write_pv_native.cache_native_type_async(timeout=phase_to),
             )
         else:
-            await self._write_pv_native.cache_native_type_async(
-                timeout=min(timeout, 2.0)
-            )
+            await self._write_pv_native.cache_native_type_async(timeout=phase_to)
 
         # Schema validation — for converters that declare typed columns
         # (currently only _TableConverter), fetch the IOC schema and
-        # check column names + dtypes match. Mismatch raises TypeError
-        # at connect time so the user gets an immediate, clear error
-        # rather than a confusing server-side reject when they later put.
+        # check column names + dtypes match.
         if hasattr(self._converter, "validate_against_schema"):
             try:
                 schema = await self._read_pv_native.get_field_desc_async(
-                    timeout=min(timeout, 2.0)
+                    timeout=phase_to
                 )
             except Exception:  # noqa: BLE001 — transient I/O
                 schema = None
             if schema is not None:
-                # propagate TypeError (schema mismatch is a user-side
-                # declaration error and connect should fail fast)
                 self._converter.validate_against_schema(
                     schema, source=self.source("", read=True)
                 )
 
         # Pull initial metadata so the converter can cache enum_strs,
-        # Table column types, etc. Transient I/O errors here are OK
-        # (we just degrade to runtime fetch later), but if metadata IS
-        # received and the converter rejects it (e.g. StrictEnum choices
-        # mismatch) that TypeError propagates as a connect failure —
-        # caller is asking for a typed signal that does not match the IOC.
+        # Table column types, etc.
         try:
             md = await self._read_pv_native.get_reading_async(
-                timeout=min(timeout, 2.0), form="ctrl"
+                timeout=phase_to, form="ctrl"
             )
         except Exception:  # noqa: BLE001 — transient I/O, retry on next get
             md = None
@@ -300,13 +296,29 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
             }
             if loop is not None and not loop.is_closed():
                 loop.call_soon_threadsafe(callback, reading)
-            else:
-                # Best-effort direct call (no loop captured / loop closed)
+            elif loop is None:
+                # set_callback was called from a sync context — caller
+                # accepts that the callback runs on the Rust dispatch
+                # thread. Best-effort direct call.
                 try:
                     callback(reading)
                 except Exception:  # noqa: BLE001
                     _logger.exception(
                         "monitor callback for %s raised", self.source("", read=True)
                     )
+            else:
+                # Loop captured at registration time but has since
+                # closed (typical: asyncio.run() exited). Calling the
+                # callback directly from this Rust dispatch thread
+                # would touch asyncio.Event / asyncio.Queue inside the
+                # ophyd-async signal cache — those are not thread-safe
+                # without a running loop. Drop the event; warn once at
+                # the source level so the user can spot stale monitors.
+                _logger.warning(
+                    "monitor event for %s arrived after the registered "
+                    "asyncio loop closed — dropping (call set_callback(None) "
+                    "before exiting the loop to silence this)",
+                    self.source("", read=True),
+                )
 
         self._read_pv_native.add_monitor_callback(_wrapped)

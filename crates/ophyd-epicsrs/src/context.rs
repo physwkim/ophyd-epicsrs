@@ -111,11 +111,11 @@ impl EpicsRsContext {
             let _ = tx.send(results);
         });
 
-        // Wait for all results (GIL released)
-        let rx = parking_lot::Mutex::new(rx);
-        let results = py.allow_threads(|| {
-            rx.lock()
-                .recv()
+        // Wait for all results (GIL released). `py.allow_threads`'s
+        // closure must be `Send`, and `&Receiver` is not. Move `rx` in
+        // so the closure owns it — no Mutex needed.
+        let results = py.allow_threads(move || {
+            rx.recv()
                 .map_err(|_| PyRuntimeError::new_err("bulk_caget failed"))
         })?;
 
@@ -213,11 +213,10 @@ impl EpicsRsContext {
             let _ = tx.send(results);
         });
 
-        // Wait for all results (GIL released)
-        let rx = parking_lot::Mutex::new(rx);
-        let results = py.allow_threads(|| {
-            rx.lock()
-                .recv()
+        // Wait for all results (GIL released) — same `move` pattern as
+        // bulk_caget; closure owns rx, no Mutex needed.
+        let results = py.allow_threads(move || {
+            rx.recv()
                 .map_err(|_| PyRuntimeError::new_err("bulk_connect_and_prefetch failed"))
         })?;
 

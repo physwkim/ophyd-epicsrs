@@ -670,6 +670,22 @@ impl EpicsRsPV {
         })
     }
 
+    /// Async no-op for CA — provided for symmetry with EpicsRsPvaPV so
+    /// callers can invoke the same method on both protocol wrappers.
+    /// CA has no introspection equivalent to PVA's pvinfo (DBR types
+    /// are scalar/scalar-array only), so this returns None.
+    #[pyo3(signature = (timeout=2.0))]
+    fn get_field_desc_async<'py>(
+        &self,
+        py: Python<'py>,
+        timeout: f64,
+    ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
+        let _ = timeout;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            Ok(Python::with_gil(|py| py.None()))
+        })
+    }
+
     /// Async: populate the cached native_type by reading the channel's
     /// metadata via `CaChannel::info()` — a coordinator query that does
     /// NOT issue a CA read. Returns True on success, False on timeout.

@@ -22,7 +22,7 @@ use tokio::task::JoinHandle;
 
 use epics_rs::pva::client_native::context::PvaClient;
 use epics_rs::pva::client_native::ops_v2::SubscriptionHandle;
-use epics_rs::pva::pvdata::PvField;
+use epics_rs::pva::pvdata::{FieldDesc, PvField, ScalarType};
 
 use crate::pva_convert::{pvfield_to_metadata, pvfield_to_py};
 
@@ -548,6 +548,44 @@ impl EpicsRsPvaPV {
         pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(true) })
     }
 
+    /// Async: introspect the PV's structure via PvaClient::pvinfo.
+    ///
+    /// Returns a Python nested dict mirroring the PVA `FieldDesc`:
+    ///
+    /// ```text
+    /// {"kind": "structure", "struct_id": "epics:nt/NTTable:1.0",
+    ///  "fields": [
+    ///    ("labels", {"kind": "scalar_array", "scalar_type": "string"}),
+    ///    ("value",  {"kind": "structure", "struct_id": "",
+    ///                "fields": [("a", {"kind": "scalar_array",
+    ///                                  "scalar_type": "byte"}), ...]}),
+    ///    ...
+    ///  ]}
+    /// ```
+    ///
+    /// Used by EpicsRsSignalBackend.connect to validate typed-PvField
+    /// payloads (Table column names + dtypes) against the IOC schema
+    /// at connect time, before any put hits the wire. Returns None on
+    /// pvinfo timeout / error.
+    #[pyo3(signature = (timeout=2.0))]
+    fn get_field_desc_async<'py>(
+        &self,
+        py: Python<'py>,
+        timeout: f64,
+    ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
+        let client = self.client.clone();
+        let name = self.pvname.clone();
+        let dur = Duration::from_secs_f64(timeout);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            match tokio::time::timeout(dur, client.pvinfo(&name)).await {
+                Ok(Ok(desc)) => Python::with_gil(|py| {
+                    Ok::<PyObject, PyErr>(field_desc_to_py(py, &desc).into_any().unbind())
+                }),
+                _ => Python::with_gil(|py| Ok::<PyObject, PyErr>(py.None())),
+            }
+        })
+    }
+
     /// Async: read the PV value (NTScalar value field, or whole PvField).
     /// Returns Python value, or None on failure/timeout.
     #[pyo3(signature = (timeout=2.0))]
@@ -712,6 +750,91 @@ impl EpicsRsPvaPV {
 
     fn __repr__(&self) -> String {
         format!("EpicsRsPvaPV('{}')", self.pvname)
+    }
+}
+
+/// Convert a `FieldDesc` to a Python nested dict for schema introspection.
+fn field_desc_to_py<'py>(py: Python<'py>, desc: &FieldDesc) -> Bound<'py, PyDict> {
+    let dict = PyDict::new(py);
+    match desc {
+        FieldDesc::Scalar(st) => {
+            let _ = dict.set_item("kind", "scalar");
+            let _ = dict.set_item("scalar_type", scalar_type_name(*st));
+        }
+        FieldDesc::ScalarArray(st) => {
+            let _ = dict.set_item("kind", "scalar_array");
+            let _ = dict.set_item("scalar_type", scalar_type_name(*st));
+        }
+        FieldDesc::Structure { struct_id, fields } => {
+            let _ = dict.set_item("kind", "structure");
+            let _ = dict.set_item("struct_id", struct_id.as_str());
+            let pairs: Vec<(String, Bound<'py, PyDict>)> = fields
+                .iter()
+                .map(|(n, f)| (n.clone(), field_desc_to_py(py, f)))
+                .collect();
+            let _ = dict.set_item("fields", pairs);
+        }
+        FieldDesc::StructureArray { struct_id, fields } => {
+            let _ = dict.set_item("kind", "structure_array");
+            let _ = dict.set_item("struct_id", struct_id.as_str());
+            let pairs: Vec<(String, Bound<'py, PyDict>)> = fields
+                .iter()
+                .map(|(n, f)| (n.clone(), field_desc_to_py(py, f)))
+                .collect();
+            let _ = dict.set_item("fields", pairs);
+        }
+        FieldDesc::Union {
+            struct_id,
+            variants,
+        } => {
+            let _ = dict.set_item("kind", "union");
+            let _ = dict.set_item("struct_id", struct_id.as_str());
+            let pairs: Vec<(String, Bound<'py, PyDict>)> = variants
+                .iter()
+                .map(|(n, f)| (n.clone(), field_desc_to_py(py, f)))
+                .collect();
+            let _ = dict.set_item("variants", pairs);
+        }
+        FieldDesc::UnionArray {
+            struct_id,
+            variants,
+        } => {
+            let _ = dict.set_item("kind", "union_array");
+            let _ = dict.set_item("struct_id", struct_id.as_str());
+            let pairs: Vec<(String, Bound<'py, PyDict>)> = variants
+                .iter()
+                .map(|(n, f)| (n.clone(), field_desc_to_py(py, f)))
+                .collect();
+            let _ = dict.set_item("variants", pairs);
+        }
+        FieldDesc::Variant => {
+            let _ = dict.set_item("kind", "variant");
+        }
+        FieldDesc::VariantArray => {
+            let _ = dict.set_item("kind", "variant_array");
+        }
+        FieldDesc::BoundedString(max_len) => {
+            let _ = dict.set_item("kind", "bounded_string");
+            let _ = dict.set_item("max_len", *max_len);
+        }
+    }
+    dict
+}
+
+fn scalar_type_name(st: ScalarType) -> &'static str {
+    match st {
+        ScalarType::Boolean => "boolean",
+        ScalarType::Byte => "byte",
+        ScalarType::Short => "short",
+        ScalarType::Int => "int",
+        ScalarType::Long => "long",
+        ScalarType::UByte => "ubyte",
+        ScalarType::UShort => "ushort",
+        ScalarType::UInt => "uint",
+        ScalarType::ULong => "ulong",
+        ScalarType::Float => "float",
+        ScalarType::Double => "double",
+        ScalarType::String => "string",
     }
 }
 

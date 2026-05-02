@@ -357,6 +357,97 @@ class _TableConverter(Converter):
                     out[name] = "string"
         return out
 
+    # Mapping numpy dtype string → epics-rs ScalarType name. Used by
+    # validate_against_schema to check user dtype hints against IOC.
+    _NUMPY_TO_PVA: Mapping[str, str] = {
+        "|b1": "boolean",
+        "|i1": "byte",
+        "|u1": "ubyte",
+        "<i2": "short",
+        ">i2": "short",
+        "<u2": "ushort",
+        ">u2": "ushort",
+        "<i4": "int",
+        ">i4": "int",
+        "<u4": "uint",
+        ">u4": "uint",
+        "<i8": "long",
+        ">i8": "long",
+        "<u8": "ulong",
+        ">u8": "ulong",
+        "<f4": "float",
+        ">f4": "float",
+        "<f8": "double",
+        ">f8": "double",
+        "string": "string",
+    }
+
+    def validate_against_schema(self, schema: Mapping[str, Any], source: str) -> None:
+        """Compare ``self._column_dtypes`` against the IOC's PVA schema.
+
+        ``schema`` is the dict returned by
+        ``EpicsRsPvaPV.get_field_desc_async`` — the top-level PvField
+        description. For NTTable PVs we expect a structure containing a
+        ``value`` substructure whose fields are the columns.
+
+        Raises ``TypeError`` (with ``source`` in the message) if any
+        declared column is missing from the IOC, or if a column's
+        declared dtype does not match the IOC scalar type.
+        """
+        # Locate the column container — for NTTable it's `value`; for
+        # bare structured PVs the top-level fields are columns directly.
+        cols = self._extract_columns_from_schema(schema)
+        if cols is None:
+            # Non-structured target — caller probably has the wrong
+            # datatype hint; skip silently rather than blocking.
+            return
+        errors: list[str] = []
+        for col_name, col_dtype in self._column_dtypes.items():
+            if col_name not in cols:
+                errors.append(
+                    f"column {col_name!r} declared on {self.table_cls.__name__} "
+                    f"is not present in the IOC schema (available: {sorted(cols)})"
+                )
+                continue
+            ioc_field = cols[col_name]
+            ioc_kind = ioc_field.get("kind")
+            ioc_st = ioc_field.get("scalar_type")
+            expected_pva = self._NUMPY_TO_PVA.get(col_dtype)
+            if expected_pva is None:
+                # Unknown dtype hint — can't validate, skip.
+                continue
+            if ioc_kind not in ("scalar_array", "scalar"):
+                errors.append(
+                    f"column {col_name!r}: IOC reports kind={ioc_kind!r}, "
+                    "expected scalar_array"
+                )
+                continue
+            if ioc_st != expected_pva:
+                errors.append(
+                    f"column {col_name!r}: declared dtype {col_dtype!r} "
+                    f"({expected_pva}) does not match IOC scalar_type {ioc_st!r}"
+                )
+        if errors:
+            joined = "\n  - ".join(errors)
+            raise TypeError(
+                f"Table schema mismatch for {source}:\n  - {joined}"
+            )
+
+    @staticmethod
+    def _extract_columns_from_schema(
+        schema: Mapping[str, Any],
+    ) -> dict[str, Mapping[str, Any]] | None:
+        """Find the column-bearing dict from an NTTable / bare structure schema."""
+        if schema.get("kind") != "structure":
+            return None
+        fields = dict(schema.get("fields") or [])
+        # NTTable shape: {labels, value: {col1, col2, ...}}
+        value = fields.get("value")
+        if isinstance(value, Mapping) and value.get("kind") == "structure":
+            return dict(value.get("fields") or [])
+        # Bare structured PV: top-level fields ARE the columns.
+        return fields
+
     def to_python(self, raw, _metadata=None):
         if raw is None:
             return None

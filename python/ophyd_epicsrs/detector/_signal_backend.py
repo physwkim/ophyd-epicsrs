@@ -114,6 +114,25 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
             timeout=min(timeout, 2.0)
         )
 
+        # Schema validation — for converters that declare typed columns
+        # (currently only _TableConverter), fetch the IOC schema and
+        # check column names + dtypes match. Mismatch raises TypeError
+        # at connect time so the user gets an immediate, clear error
+        # rather than a confusing server-side reject when they later put.
+        if hasattr(self._converter, "validate_against_schema"):
+            try:
+                schema = await self._read_pv_native.get_field_desc_async(
+                    timeout=min(timeout, 2.0)
+                )
+            except Exception:  # noqa: BLE001 — transient I/O
+                schema = None
+            if schema is not None:
+                # propagate TypeError (schema mismatch is a user-side
+                # declaration error and connect should fail fast)
+                self._converter.validate_against_schema(
+                    schema, source=self.source("", read=True)
+                )
+
         # Pull initial metadata so the converter can cache enum_strs,
         # Table column types, etc. Transient I/O errors here are OK
         # (we just degrade to runtime fetch later), but if metadata IS

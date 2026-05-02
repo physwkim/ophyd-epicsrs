@@ -166,7 +166,7 @@ class EpicsRsShimPV:
             return
         self.connected = connected
         if connected and self.auto_monitor:
-            self._pv.add_monitor_callback(self._on_monitor_update)
+            self._pv.set_monitor_callback(self._on_monitor_update)
         for cb in self._conn_callbacks:
             cb(pvname=self.pvname, conn=connected, pv=self)
 
@@ -255,7 +255,7 @@ class EpicsRsShimPV:
             index = self._next_cb_index
             self._next_cb_index += 1
         self._callbacks[index] = callback
-        self._pv.add_monitor_callback(self._on_monitor_update)
+        self._pv.set_monitor_callback(self._on_monitor_update)
         if run_now and self.connected and self._args:
             callback(pvname=self.pvname, **self._args)
         return index

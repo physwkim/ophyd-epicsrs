@@ -154,6 +154,27 @@ impl EpicsRsPvaPV {
         rx.recv()
             .map_err(|_| PyRuntimeError::new_err("runtime task failed"))
     }
+
+    /// Update `is_ntenum` from a freshly-read PvField. Called from
+    /// every read path (sync get, async get/get_reading, monitor
+    /// dispatch) so any code path that touches the channel feeds the
+    /// cache that `put` / `put_async` / `put_nowait_async` consult to
+    /// decide whether to route through `pvput_field("value.index", ...)`.
+    fn record_ntenum_shape(&self, field: &PvField) {
+        if let PvField::Structure(s) = field {
+            if crate::pva_convert::try_extract_ntenum(s).is_some() {
+                *self.is_ntenum.lock() = Some(true);
+            } else {
+                // Top-level structure but not NTEnum — record so we
+                // don't keep retrying detection on every read.
+                *self.is_ntenum.lock() = Some(false);
+            }
+        }
+        // Non-structure (plain scalar / array) — leave the cache at
+        // whatever was previously seen; the value alone doesn't tell
+        // us the channel isn't NTEnum (a partial-field response could
+        // arrive with just the scalar).
+    }
 }
 
 #[pymethods]
@@ -192,18 +213,7 @@ impl EpicsRsPvaPV {
         })?;
         match result {
             Ok(Ok(field)) => {
-                // Cache NTEnum-shape so a subsequent put(int) can use
-                // pvput_field("value.index", ...) instead of plain
-                // pvput, which the IOC silently rejects for NTEnum.
-                if let PvField::Structure(s) = &field
-                    && crate::pva_convert::try_extract_ntenum(s).is_some()
-                {
-                    *self.is_ntenum.lock() = Some(true);
-                } else if matches!(&field, PvField::Structure(_)) {
-                    // Top-level structure but not NTEnum — record it so
-                    // we don't keep retrying detection on every read.
-                    *self.is_ntenum.lock() = Some(false);
-                }
+                self.record_ntenum_shape(&field);
                 Ok(Some(pvfield_to_metadata(py, &field)))
             }
             Ok(Err(e)) => {
@@ -377,10 +387,23 @@ impl EpicsRsPvaPV {
         // Python dispatch thread
         let cb_ref = self.py_monitor_callback.clone();
         let gen_ref = self.monitor_generation.clone();
+        let is_ntenum_ref = self.is_ntenum.clone();
         let dispatch = std::thread::spawn(move || {
             while let Ok(event) = rx.recv() {
                 if gen_ref.load(std::sync::atomic::Ordering::SeqCst) != generation {
                     continue;
+                }
+                // Feed is_ntenum cache from monitor events too. An
+                // ophyd-async setup typically connects, subscribes,
+                // and only then puts — so the first read may already
+                // be a monitor delivery rather than an explicit
+                // get_value_async.
+                if let PvField::Structure(s) = &event.field {
+                    if crate::pva_convert::try_extract_ntenum(s).is_some() {
+                        *is_ntenum_ref.lock() = Some(true);
+                    } else {
+                        *is_ntenum_ref.lock() = Some(false);
+                    }
                 }
                 crate::safe_call!(Python::with_gil(|py| {
                     let guard = cb_ref.lock();
@@ -697,34 +720,49 @@ impl EpicsRsPvaPV {
         let name = self.pvname.clone();
         let pvname = name.clone();
         let dur = Duration::from_secs_f64(timeout);
+        let is_ntenum = self.is_ntenum.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             match tokio::time::timeout(dur, client.pvget(&name)).await {
-                Ok(Ok(field)) => crate::safe_call_or!(
-                    Err(PyRuntimeError::new_err(format!(
-                        "pvget on {pvname}: panic in Python::with_gil during value conversion"
-                    ))),
-                    Python::with_gil(|py| {
-                        // NTEnum handling: top-level Structure with a
-                        // `value` substructure containing {index, choices}.
-                        // Surface the int index (consistent with monitor).
-                        if let epics_rs::pva::pvdata::PvField::Structure(s) = &field {
-                            if let Some((idx, _choices)) = crate::pva_convert::try_extract_ntenum(s)
-                            {
-                                return Ok::<PyObject, PyErr>(
-                                    idx.into_pyobject(py).unwrap().into_any().unbind(),
-                                );
-                            }
+                Ok(Ok(field)) => {
+                    // Feed is_ntenum cache so a subsequent
+                    // put_async(int) routes through pvput_field. The
+                    // sync get's cache update isn't reached when the
+                    // user only ever uses the async surface.
+                    if let PvField::Structure(s) = &field {
+                        if crate::pva_convert::try_extract_ntenum(s).is_some() {
+                            *is_ntenum.lock() = Some(true);
+                        } else {
+                            *is_ntenum.lock() = Some(false);
                         }
-                        let value_field = match &field {
-                            epics_rs::pva::pvdata::PvField::Structure(s) => s
-                                .get_field("value")
-                                .cloned()
-                                .unwrap_or_else(|| field.clone()),
-                            _ => field.clone(),
-                        };
-                        Ok::<PyObject, PyErr>(pvfield_to_py(py, &value_field))
-                    })
-                ),
+                    }
+                    crate::safe_call_or!(
+                        Err(PyRuntimeError::new_err(format!(
+                            "pvget on {pvname}: panic in Python::with_gil during value conversion"
+                        ))),
+                        Python::with_gil(|py| {
+                            // NTEnum handling: top-level Structure with a
+                            // `value` substructure containing {index, choices}.
+                            // Surface the int index (consistent with monitor).
+                            if let epics_rs::pva::pvdata::PvField::Structure(s) = &field {
+                                if let Some((idx, _choices)) =
+                                    crate::pva_convert::try_extract_ntenum(s)
+                                {
+                                    return Ok::<PyObject, PyErr>(
+                                        idx.into_pyobject(py).unwrap().into_any().unbind(),
+                                    );
+                                }
+                            }
+                            let value_field = match &field {
+                                epics_rs::pva::pvdata::PvField::Structure(s) => s
+                                    .get_field("value")
+                                    .cloned()
+                                    .unwrap_or_else(|| field.clone()),
+                                _ => field.clone(),
+                            };
+                            Ok::<PyObject, PyErr>(pvfield_to_py(py, &value_field))
+                        })
+                    )
+                }
                 Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
                     "pvget on {pvname} failed: {e}"
                 ))),
@@ -749,16 +787,27 @@ impl EpicsRsPvaPV {
         let name = self.pvname.clone();
         let pvname = name.clone();
         let dur = Duration::from_secs_f64(timeout);
+        let is_ntenum = self.is_ntenum.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             match tokio::time::timeout(dur, client.pvget(&name)).await {
-                Ok(Ok(field)) => crate::safe_call_or!(
-                    Err(PyRuntimeError::new_err(format!(
-                        "pvget on {pvname}: panic in Python::with_gil during reading conversion"
-                    ))),
-                    Python::with_gil(|py| Ok::<PyObject, PyErr>(
-                        crate::pva_convert::pvfield_to_metadata(py, &field)
-                    ))
-                ),
+                Ok(Ok(field)) => {
+                    // Feed is_ntenum cache (same reason as get_value_async).
+                    if let PvField::Structure(s) = &field {
+                        if crate::pva_convert::try_extract_ntenum(s).is_some() {
+                            *is_ntenum.lock() = Some(true);
+                        } else {
+                            *is_ntenum.lock() = Some(false);
+                        }
+                    }
+                    crate::safe_call_or!(
+                        Err(PyRuntimeError::new_err(format!(
+                            "pvget on {pvname}: panic in Python::with_gil during reading conversion"
+                        ))),
+                        Python::with_gil(|py| Ok::<PyObject, PyErr>(
+                            crate::pva_convert::pvfield_to_metadata(py, &field)
+                        ))
+                    )
+                }
                 Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
                     "pvget on {pvname} failed: {e}"
                 ))),
@@ -770,6 +819,13 @@ impl EpicsRsPvaPV {
     }
 
     /// Async: write a value via string-form pvput. Returns True on success.
+    ///
+    /// NTEnum routing matches the sync `put`: when the channel is
+    /// known (from a prior get) to be NTEnum and the Python value is
+    /// int / bool, the write is dispatched via
+    /// `pvput_field("value.index", ...)` so the IOC actually accepts
+    /// it. Without this, every ophyd-async `await sig.set(MyEnum.X)`
+    /// against a PVA NTEnum signal would silently no-op.
     #[pyo3(signature = (value, timeout=300.0))]
     fn put_async<'py>(
         &self,
@@ -777,13 +833,20 @@ impl EpicsRsPvaPV {
         value: &Bound<'_, pyo3::PyAny>,
         timeout: f64,
     ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
+        let route_ntenum_index = *self.is_ntenum.lock() == Some(true) && py_value_is_intlike(value);
         let value_str = python_value_to_pvput_string(value)?;
         let client = self.client.clone();
         let name = self.pvname.clone();
         let pvname = name.clone();
         let dur = Duration::from_secs_f64(timeout);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            match tokio::time::timeout(dur, client.pvput(&name, &value_str)).await {
+            let result = if route_ntenum_index {
+                tokio::time::timeout(dur, client.pvput_field(&name, "value.index", &value_str))
+                    .await
+            } else {
+                tokio::time::timeout(dur, client.pvput(&name, &value_str)).await
+            };
+            match result {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
                     "pvput on {pvname} failed: {e}"
@@ -814,14 +877,22 @@ impl EpicsRsPvaPV {
         py: Python<'py>,
         value: &Bound<'_, pyo3::PyAny>,
     ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
+        // Same NTEnum routing as put / put_async — see put_async for
+        // the rationale. ophyd-async's `set(wait=False)` lands here.
+        let route_ntenum_index = *self.is_ntenum.lock() == Some(true) && py_value_is_intlike(value);
         let value_str = python_value_to_pvput_string(value)?;
         let client = self.client.clone();
         let name = self.pvname.clone();
         let pvname = name.clone();
+        let bound = Duration::from_secs(5);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            match tokio::time::timeout(Duration::from_secs(5), client.pvput(&pvname, &value_str))
-                .await
-            {
+            let result = if route_ntenum_index {
+                tokio::time::timeout(bound, client.pvput_field(&name, "value.index", &value_str))
+                    .await
+            } else {
+                tokio::time::timeout(bound, client.pvput(&name, &value_str)).await
+            };
+            match result {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
                     "pvput_nowait on {pvname} failed: {e}"

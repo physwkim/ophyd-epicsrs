@@ -121,8 +121,69 @@ def test_pva_monitor_callback_delivers(pva_ctx):
     def cb(**kwargs):
         received.append(kwargs.get("value"))
 
-    pv.add_monitor_callback(cb)
+    pv.set_monitor_callback(cb)
     time.sleep(1.0)
     pv.clear_monitors()
     print(f"\n  PVA monitor callbacks in 1s: {len(received)}")
     assert len(received) >= 3
+
+
+@pytest.mark.asyncio
+async def test_async_pva_ntenum_int_put_routes_via_field_path(pva_ctx):
+    """The async write path (`put_async`) must apply the same NTEnum
+    routing as sync `put`. Without it, `await pv.put_async(int)` on
+    an NTEnum channel silently no-ops because string-form pvput can't
+    reach the `value.index` field — and ophyd-async's `set()` lands
+    here, so every `await sig.set(MyEnum.X)` would silently fail.
+
+    Drives the cache via `get_value_async` (also an async-only path),
+    then performs the put via `put_async`, then verifies the IOC
+    actually accepted the new value."""
+    pv = pva_ctx.create_pv("mini:KohzuModeBO")
+    assert pv.wait_for_connection(timeout=3.0)
+
+    # Async-only flow — no sync get_with_metadata anywhere. This is
+    # what an ophyd-async SignalBackend.connect → set sequence looks
+    # like at the Rust boundary.
+    initial = await pv.get_value_async(timeout=2.0)  # populates is_ntenum cache
+    target = 1 if initial == 0 else 0
+
+    await pv.put_async(target, timeout=2.0)
+    await asyncio.sleep(0.3)
+    after = await pv.get_value_async(timeout=2.0)
+    assert after == target, (
+        f"async NTEnum int put: expected index {target}, got {after} — "
+        f"the put was probably routed through plain pvput instead of "
+        f"pvput_field('value.index', ...)"
+    )
+
+    # Restore.
+    await pv.put_async(initial, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_async_pva_ntenum_via_ophyd_async_strict_enum():
+    """The full ophyd-async path: a `StrictEnum` typed `SignalRW`
+    bound to a PVA NTEnum PV. `await sig.set(KohzuMode.AUTO)` goes
+    through the EpicsRsSignalBackend's `_EnumConverter.to_wire`
+    (label string → int index) and then `EpicsRsPvaPV.put_async(int)`
+    — both layers must agree, otherwise the set silently no-ops."""
+    from ophyd_async.core import StrictEnum
+    from ophyd_epicsrs.ophyd_async import epicsrs_signal_rw
+
+    class KohzuMode(StrictEnum):
+        MANUAL = "Manual"
+        AUTO = "Auto"
+
+    sig = epicsrs_signal_rw(KohzuMode, "pva://mini:KohzuModeBO")
+    await sig.connect()
+
+    initial = await sig.get_value()
+    target = KohzuMode.AUTO if initial == KohzuMode.MANUAL else KohzuMode.MANUAL
+
+    await sig.set(target)
+    await asyncio.sleep(0.3)
+    assert (await sig.get_value()) is target
+
+    # Restore for following tests.
+    await sig.set(initial)

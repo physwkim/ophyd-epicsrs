@@ -62,7 +62,7 @@ def test_ca_monitor_callback(ca_ctx):
     def cb(**kwargs):
         received.append(kwargs["value"])
 
-    pv.add_monitor_callback(cb)
+    pv.set_monitor_callback(cb)
     # Beam current updates every BEAM_UPDATE_MS=100ms; wait 1s for ≥5 updates.
     deadline = time.time() + 2.0
     while len(received) < 5 and time.time() < deadline:

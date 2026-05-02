@@ -332,4 +332,4 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
                     pass
             # else: silently drop — handler already cleaned up.
 
-        self._read_pv_native.add_monitor_callback(_wrapped)
+        self._read_pv_native.set_monitor_callback(_wrapped)

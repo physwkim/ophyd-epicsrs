@@ -109,6 +109,15 @@ pub struct EpicsRsPvaPV {
     connection_task: Mutex<Option<JoinHandle<()>>>,
     /// Cached connection state — exposed to Python as a fast read.
     connected: Arc<Mutex<bool>>,
+    /// NTEnum-shape detection result, populated from the first pvget
+    /// (or any subsequent get/monitor that sees a structure carrying
+    /// the `epics:nt/NTEnum:1.0` `struct_id` plus a `value.{index,
+    /// choices}` substructure). `None` = not yet known. Used by `put`
+    /// to route an int / bool value through `pvput_field("value.index",
+    /// ...)` instead of plain `pvput` — string-form pvput on NTEnum is
+    /// silently rejected by the server (the field path tells the
+    /// server precisely where to write).
+    is_ntenum: Arc<Mutex<Option<bool>>>,
 }
 
 impl EpicsRsPvaPV {
@@ -128,6 +137,7 @@ impl EpicsRsPvaPV {
             access_callback: Arc::new(Mutex::new(None)),
             connection_task: Mutex::new(None),
             connected: Arc::new(Mutex::new(false)),
+            is_ntenum: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -181,7 +191,21 @@ impl EpicsRsPvaPV {
             self.spawn_wait(async move { tokio::time::timeout(dur, client.pvget(&name)).await })
         })?;
         match result {
-            Ok(Ok(field)) => Ok(Some(pvfield_to_metadata(py, &field))),
+            Ok(Ok(field)) => {
+                // Cache NTEnum-shape so a subsequent put(int) can use
+                // pvput_field("value.index", ...) instead of plain
+                // pvput, which the IOC silently rejects for NTEnum.
+                if let PvField::Structure(s) = &field
+                    && crate::pva_convert::try_extract_ntenum(s).is_some()
+                {
+                    *self.is_ntenum.lock() = Some(true);
+                } else if matches!(&field, PvField::Structure(_)) {
+                    // Top-level structure but not NTEnum — record it so
+                    // we don't keep retrying detection on every read.
+                    *self.is_ntenum.lock() = Some(false);
+                }
+                Ok(Some(pvfield_to_metadata(py, &field)))
+            }
             Ok(Err(e)) => {
                 tracing::warn!(target: "ophyd_epicsrs.pva", pv = %self.pvname, "pvget failed: {e}");
                 Ok(None)
@@ -235,6 +259,13 @@ impl EpicsRsPvaPV {
     /// parses into the destination type — works for scalars and string-
     /// formatted arrays. For typed put without string round-trip, use
     /// `put_typed` (TODO).
+    ///
+    /// NTEnum special case: when the channel is known (from a prior
+    /// get) to be NTEnum and the value is a Python int / bool, the
+    /// write is dispatched via `pvput_field("value.index", ...)`.
+    /// String-form pvput on NTEnum is silently rejected by the server
+    /// because the top-level value is a structure, not a scalar — the
+    /// dotted-path form tells the server precisely where to write.
     #[pyo3(signature = (value, wait=false, timeout=300.0, callback=None))]
     fn put(
         &self,
@@ -244,21 +275,28 @@ impl EpicsRsPvaPV {
         timeout: f64,
         callback: Option<PyObject>,
     ) -> PyResult<()> {
-        // Convert Python value to a string the PVA server can parse.
-        // For lists/arrays we serialize as comma-separated values, which
-        // pvxs / pvput accept for ScalarArray.
+        // NTEnum int-put: route through value.index field-path.
+        let route_ntenum_index = *self.is_ntenum.lock() == Some(true) && py_value_is_intlike(value);
         let value_str = python_value_to_pvput_string(value)?;
 
         let client = self.client.clone();
         let name = self.pvname.clone();
         let dur = Duration::from_secs_f64(timeout);
 
+        // Closure capturing the routing decision so the wait/cb/fire-
+        // and-forget arms below stay short. tokio runtime is free to
+        // pick which to invoke.
+        let do_put = move |client: PvaClient, name: String, value_str: String| async move {
+            if route_ntenum_index {
+                tokio::time::timeout(dur, client.pvput_field(&name, "value.index", &value_str))
+                    .await
+            } else {
+                tokio::time::timeout(dur, client.pvput(&name, &value_str)).await
+            }
+        };
+
         if wait {
-            let result = py.allow_threads(|| {
-                self.spawn_wait(async move {
-                    tokio::time::timeout(dur, client.pvput(&name, &value_str)).await
-                })
-            })?;
+            let result = py.allow_threads(|| self.spawn_wait(do_put(client, name, value_str)))?;
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => return Err(PyRuntimeError::new_err(format!("pvput failed: {e}"))),
@@ -270,18 +308,17 @@ impl EpicsRsPvaPV {
         } else if let Some(cb) = callback {
             let pvname = self.pvname.clone();
             self.runtime.spawn(async move {
-                let success =
-                    match tokio::time::timeout(dur, client.pvput(&pvname, &value_str)).await {
-                        Ok(Ok(())) => true,
-                        Ok(Err(e)) => {
-                            crate::safe_warn!(target: "ophyd_epicsrs.pva", pv = %pvname, "pvput error: {e}");
-                            false
-                        }
-                        Err(_) => {
-                            crate::safe_warn!(target: "ophyd_epicsrs.pva", pv = %pvname, "pvput timed out");
-                            false
-                        }
-                    };
+                let success = match do_put(client, pvname.clone(), value_str).await {
+                    Ok(Ok(())) => true,
+                    Ok(Err(e)) => {
+                        crate::safe_warn!(target: "ophyd_epicsrs.pva", pv = %pvname, "pvput error: {e}");
+                        false
+                    }
+                    Err(_) => {
+                        crate::safe_warn!(target: "ophyd_epicsrs.pva", pv = %pvname, "pvput timed out");
+                        false
+                    }
+                };
                 crate::safe_call!(Python::with_gil(|py| {
                     let _ = cb.call1(py, (success,));
                 }));
@@ -289,7 +326,7 @@ impl EpicsRsPvaPV {
         } else {
             let pvname = self.pvname.clone();
             self.runtime.spawn(async move {
-                if let Err(e) = tokio::time::timeout(dur, client.pvput(&pvname, &value_str)).await {
+                if let Err(e) = do_put(client, pvname.clone(), value_str).await {
                     crate::safe_warn!(target: "ophyd_epicsrs.pva", pv = %pvname, "pvput error: {e}");
                 }
             });
@@ -297,7 +334,16 @@ impl EpicsRsPvaPV {
         Ok(())
     }
 
-    /// Register a monitor callback. Replaces any previous callback.
+    /// Register the monitor callback.
+    ///
+    /// **Set semantics, not add**: only one callback at a time —
+    /// matches the CA-side wrapper. Multi-callback fan-out belongs at
+    /// the shim layer, which keeps a Python-side dict and registers
+    /// one dispatcher with the native PV.
+    fn set_monitor_callback(&self, py: Python<'_>, callback: PyObject) {
+        self.add_monitor_callback(py, callback);
+    }
+
     fn add_monitor_callback(&self, py: Python<'_>, callback: PyObject) {
         // Always swap the callback first — the dispatch thread reads
         // through this Arc<Mutex>, so subsequent monitor events will
@@ -1004,6 +1050,32 @@ fn extract_dtype_hints(
 /// pvxs accepts comma-separated values for arrays. Strings containing
 /// commas, quotes, or whitespace are JSON-escaped + quoted so the
 /// pvxs parser sees a single element instead of splitting them.
+/// Cheap "is this value an integer-shaped scalar?" check used to decide
+/// whether `put` should route through `pvput_field("value.index", ...)`
+/// for an NTEnum channel. Accepts plain Python int + bool, plus numpy
+/// 0-d int / bool scalars. Floats and strings deliberately fall through
+/// to plain `pvput` — passing 1.5 to NTEnum would be wrong, and a string
+/// label is meant for the choices array, not the index.
+fn py_value_is_intlike(value: &Bound<'_, pyo3::PyAny>) -> bool {
+    use pyo3::types::{PyBool, PyInt};
+    if value.is_instance_of::<PyBool>() || value.is_instance_of::<PyInt>() {
+        return true;
+    }
+    // numpy 0-d int / bool — call .item() and re-check.
+    if value.hasattr("dtype").unwrap_or(false)
+        && value.hasattr("ndim").unwrap_or(false)
+        && value
+            .getattr("ndim")
+            .and_then(|v| v.extract::<i32>())
+            .unwrap_or(0)
+            == 0
+        && let Ok(native) = value.call_method0("item")
+    {
+        return native.is_instance_of::<PyBool>() || native.is_instance_of::<PyInt>();
+    }
+    false
+}
+
 fn python_value_to_pvput_string(value: &Bound<'_, pyo3::PyAny>) -> PyResult<String> {
     // numpy scalar → Python scalar
     if value.hasattr("dtype").unwrap_or(false) && value.hasattr("ndim").unwrap_or(false) {

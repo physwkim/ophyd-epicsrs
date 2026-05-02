@@ -9,6 +9,7 @@ via the ``protocol`` constructor arg. Internally it dispatches to either
 from __future__ import annotations
 
 import asyncio
+import logging
 from enum import Enum
 from typing import Any
 
@@ -20,6 +21,8 @@ from ophyd_async.core import (
     SignalDatatypeT,
 )
 from ophyd_async.epics.core._util import EpicsOptions, EpicsSignalBackend
+
+_logger = logging.getLogger(__name__)
 
 from ophyd_epicsrs._native import (
     EpicsRsContext,
@@ -207,6 +210,18 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
         self._monitor_callback = callback
 
         converter = self._converter
+        # Capture the asyncio event loop at registration time. The Rust
+        # monitor dispatch fires _wrapped from a Rust-owned OS thread, but
+        # ophyd-async's Signal cache callback touches asyncio.Event /
+        # asyncio.Queue, which are not thread-safe. Bridge via
+        # call_soon_threadsafe so the user callback runs on the loop thread.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop: caller is using this backend outside an
+            # asyncio context. Fall back to direct invocation; if the
+            # callback later schedules onto a loop it must do so itself.
+            loop = None
 
         def _wrapped(**kwargs):
             severity = kwargs.get("severity", 0)
@@ -215,6 +230,15 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
                 "timestamp": kwargs.get("timestamp", 0.0),
                 "alarm_severity": -1 if severity > 2 else severity,
             }
-            callback(reading)
+            if loop is not None and not loop.is_closed():
+                loop.call_soon_threadsafe(callback, reading)
+            else:
+                # Best-effort direct call (no loop captured / loop closed)
+                try:
+                    callback(reading)
+                except Exception:  # noqa: BLE001
+                    _logger.exception(
+                        "monitor callback for %s raised", self.source("", read=True)
+                    )
 
         self._read_pv_native.add_monitor_callback(_wrapped)

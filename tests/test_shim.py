@@ -4,8 +4,8 @@ Offline (no IOC). Covers:
 - protocol prefix splitting (`pva://` / `ca://` / naked)
 - _on_connection_change deduplicates same-state calls
 - get_pv() dispatch wires the right native PV class
-- Drop semantics: 200x create+drop on legacy caget/caput pattern does
-  not leak Python objects (proxy for the Rust task leak fix in c1ec52b)
+- Drop semantics: 500x create+drop on legacy caget/caput pattern does
+  not leak Python OS threads (proxy for the Rust task leak fix in c1ec52b)
 """
 
 from __future__ import annotations
@@ -172,3 +172,44 @@ def test_release_pvs_clears_handlers():
 
     # Idempotency: repeated release must not raise.
     shim.release_pvs(pv)
+
+
+# ---------- safe_call_or! misuse guard ----------
+
+
+def test_safe_call_or_default_is_gil_free():
+    """`safe_call_or!`'s `$default` is evaluated OUTSIDE the
+    `catch_unwind` guard. A default that calls `Python::with_gil` will
+    re-trigger the same finalize-time panic the guard was meant to
+    absorb. The macro docstring warns about this, but docs alone don't
+    stop a future contributor from reintroducing the bug.
+
+    This test greps the Rust source for the misuse pattern. It is
+    intentionally narrow — it only catches the literal
+    `safe_call_or!(Python::with_gil(...), Python::with_gil(...))`
+    shape that bit us once; cleverer obfuscations will still slip
+    through. It exists so the *exact* mistake we caught in review
+    can't silently come back.
+    """
+    import re
+    from pathlib import Path
+
+    src_dir = Path(__file__).parent.parent / "crates" / "ophyd-epicsrs" / "src"
+    pattern = re.compile(
+        r"safe_call_or!\s*\(\s*Python::with_gil",
+        re.MULTILINE,
+    )
+    offenders = []
+    for rs in src_dir.rglob("*.rs"):
+        # Skip the macro definition itself — the docstring legitimately
+        # mentions `Python::with_gil` near `safe_call_or!`.
+        if rs.name == "safe_log.rs":
+            continue
+        text = rs.read_text()
+        if pattern.search(text):
+            offenders.append(str(rs.relative_to(src_dir.parent.parent.parent)))
+    assert not offenders, (
+        f"safe_call_or!'s `default` must not call Python::with_gil "
+        f"(it would re-trigger the finalize panic). Offending files: "
+        f"{offenders}"
+    )

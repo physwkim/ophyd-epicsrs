@@ -58,13 +58,14 @@ pub fn caught_panic_count() -> u64 {
 ///
 /// `payload` is the Box returned by `catch_unwind`'s Err arm. We
 /// downcast to the common types (`&'static str`, `String`); for any
-/// other payload type we surface the type name so a `panic_any(...)`
-/// custom payload at least leaves a forensic trail.
+/// other payload type we record `<unknown panic payload>`. We do NOT
+/// try to surface the concrete type via `type_name_of_val` because
+/// `&*payload` has trait type `dyn Any + Send` and would only print
+/// `"dyn core::any::Any + core::marker::Send"` — a false promise.
 ///
-/// `track totals via …` cites two paths because, if the panic fires
-/// while `ophyd_epicsrs/__init__.py` is still importing, the package
-/// re-export won't be reachable yet — the underlying `_native.*`
-/// always is.
+/// The single-line stderr format is intentional: log-aggregation
+/// pipelines (Loki, Splunk, journald) split on newlines, and a
+/// multi-line panic notice ends up fragmented across events.
 pub fn record_panic(payload: Box<dyn std::any::Any + Send>) {
     let prev = PANIC_COUNT.fetch_add(1, Ordering::Relaxed);
     if prev == 0 {
@@ -74,20 +75,12 @@ pub fn record_panic(payload: Box<dyn std::any::Any + Send>) {
             .copied()
             .map(|s| s.to_string())
             .or_else(|| payload.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| {
-                format!(
-                    "<unknown panic payload: type {}>",
-                    std::any::type_name_of_val(&*payload)
-                )
-            });
+            .unwrap_or_else(|| "<unknown panic payload>".to_string());
         let _ = writeln!(
             std::io::stderr(),
-            "[ophyd-epicsrs] caught panic in spawned task: {msg}\n\
-             (typically a Python interpreter finalize race; if you see \
-             this during normal operation it may be a real bug — track \
-             totals via `ophyd_epicsrs.caught_panic_count()` (or \
-             `ophyd_epicsrs._native.caught_panic_count()` if package \
-             import is incomplete))"
+            "[ophyd-epicsrs] caught spawned-task panic: {msg} \
+             (track via ophyd_epicsrs.caught_panic_count(); \
+             use _native.caught_panic_count if mid-import)"
         );
     }
 }

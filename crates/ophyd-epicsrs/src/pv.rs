@@ -779,7 +779,11 @@ impl EpicsRsPV {
             // message realisation until display).
             crate::safe_call_or!(
                 Err::<PyObject, PyErr>(PyRuntimeError::new_err(
-                    "get_field_desc_async (CA stub): panic in Python::with_gil",
+                    "get_field_desc_async on CA: Python::with_gil panicked \
+                     while constructing the no-op None return (CA has no \
+                     pvinfo equivalent — this is an intentional no-op; \
+                     the panic itself is most likely an interpreter \
+                     finalize race)",
                 )),
                 Python::with_gil(|py| Ok::<PyObject, PyErr>(py.None()))
             )

@@ -1,4 +1,4 @@
-"""ophyd-epicsrs: Rust EPICS Channel Access backend for ophyd."""
+"""ophyd-epicsrs: Rust EPICS backend for ophyd (Channel Access + pvAccess)."""
 
 import logging
 import types

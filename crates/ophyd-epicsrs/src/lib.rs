@@ -3,6 +3,7 @@ pub mod convert;
 pub mod pv;
 pub mod pva;
 pub mod pva_convert;
+pub mod pva_put;
 pub mod runtime;
 
 use pyo3::prelude::*;

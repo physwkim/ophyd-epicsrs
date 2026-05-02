@@ -29,7 +29,7 @@ from ophyd_epicsrs._native import (
     EpicsRsPvaContext,
 )
 
-from ._converter import Converter, make_converter
+from ._converter import Converter, _is_typed_pvfield_payload, make_converter
 
 
 class EpicsRsProtocol(Enum):
@@ -145,7 +145,29 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
         else:
             wait = bool(wait_opt)
 
-        if wait:
+        # Typed-PvField payload (e.g. Table → NTTable wire structure):
+        # _TableConverter.to_wire produces a marker dict carrying both
+        # the column data and per-column dtype hints. Route to the
+        # typed pvput_pv_field path on PVA — it builds a properly-typed
+        # PvStructure even from empty columns.
+        if _is_typed_pvfield_payload(wire):
+            data = wire["data"]
+            dtypes = wire.get("dtypes") or None
+            struct_id = wire.get("struct_id", "")
+            if not hasattr(self._write_pv_native, "put_pv_field_async"):
+                raise RuntimeError(
+                    "Typed-PvField writes require the PVA backend; "
+                    f"{self.source('', read=False)} is not PVA-backed"
+                )
+            if wait:
+                ok = await self._write_pv_native.put_pv_field_async(
+                    data, dtypes, struct_id
+                )
+            else:
+                ok = await self._write_pv_native.put_pv_field_nowait_async(
+                    data, dtypes, struct_id
+                )
+        elif wait:
             ok = await self._write_pv_native.put_async(wire)
         else:
             ok = await self._write_pv_native.put_nowait_async(wire)

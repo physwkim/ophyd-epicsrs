@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence as AbcSequence
 from enum import Enum
-from typing import Any, Mapping, get_args, get_origin
+from typing import Any, Mapping, get_args, get_origin, get_type_hints
 
 import numpy as np
 
@@ -35,6 +35,17 @@ try:
     from ophyd_async.epics.core._util import get_supported_values
 except ImportError:  # pragma: no cover
     get_supported_values = None  # type: ignore[assignment]
+
+
+# Sentinel marker dict produced by _TableConverter.to_wire and
+# recognised by EpicsRsSignalBackend.put — carries the column data
+# along with dtype hints / struct_id so the Rust pvput_pv_field path
+# can build a properly-typed PvStructure even from empty columns.
+_TYPED_PVFIELD_MARKER = "__epicsrs_typed_pvfield__"
+
+
+def _is_typed_pvfield_payload(value: Any) -> bool:
+    return isinstance(value, dict) and value.get(_TYPED_PVFIELD_MARKER) is True
 
 
 class Converter:
@@ -299,12 +310,52 @@ class _NumpyArrayConverter(Converter):
 class _TableConverter(Converter):
     """Convert PVA NTTable structure ↔ ``ophyd_async.core.Table`` subclass.
 
-    Wire format from PVA: ``{"col1": [...], "col2": [...], ...}`` (the
-    ``value`` substructure of NTTable, projected by our pva_convert layer).
+    Reads: NTTable wire dict ``{"col1": [...], "col2": [...]}`` →
+    ``TableSubclass`` instance.
+
+    Writes: ``Table`` instance → marker dict carrying both column data
+    and the column dtype hints extracted from ``__annotations__``.
+    Backend.put recognises the marker and routes to the typed
+    ``put_pv_field_async`` path so empty columns still get the right
+    ``ScalarArrayTyped`` variant on the wire.
     """
+
+    NTTABLE_STRUCT_ID = "epics:nt/NTTable:1.0"
 
     def __init__(self, table_cls: type):
         self.table_cls = table_cls
+        # Pre-compute per-column dtype strings from the Table subclass
+        # annotations. This is what closes the empty-column ambiguity:
+        # an empty list with no value-side dtype info still becomes the
+        # right ScalarArrayTyped variant in Rust because the hint comes
+        # from the type declaration.
+        self._column_dtypes: dict[str, str] = self._extract_column_dtypes(table_cls)
+
+    @staticmethod
+    def _extract_column_dtypes(table_cls: type) -> dict[str, str]:
+        out: dict[str, str] = {}
+        try:
+            hints = get_type_hints(table_cls)
+        except Exception:  # noqa: BLE001 — pydantic may raise on partial subclasses
+            return out
+        for name, anno in hints.items():
+            origin = get_origin(anno)
+            if origin is np.ndarray or anno is np.ndarray:
+                # Array1D[np.float64] etc. — find the inner numpy scalar type
+                for arg in get_args(anno):
+                    inner = get_args(arg)
+                    for sub in inner:
+                        if isinstance(sub, type) and issubclass(sub, np.generic):
+                            out[name] = np.dtype(sub).str
+                            break
+                    if name in out:
+                        break
+            elif origin is AbcSequence:
+                # Sequence[str] is by far the common case for NTTable
+                args = get_args(anno)
+                if args and args[0] is str:
+                    out[name] = "string"
+        return out
 
     def to_python(self, raw, _metadata=None):
         if raw is None:
@@ -317,22 +368,23 @@ class _TableConverter(Converter):
         return raw
 
     def to_wire(self, value):
-        # Honest gap: ophyd-epicsrs cannot yet build a typed PVA PvField
-        # from a Table — the Rust pvput path serialises via a string
-        # parser (python_value_to_pvput_string) which would emit Python
-        # repr syntax for a dict and the IOC would reject it.
-        #
-        # Reads (NTTable PV → Table instance) work via to_python; only
-        # writes are blocked. Until typed put is wired through, surface
-        # a clear error instead of producing invalid wire bytes.
         if value is None:
             return None
-        raise NotImplementedError(
-            "Writing a Table to a PVA NTTable PV is not yet supported by "
-            "ophyd-epicsrs. Use field-by-field puts on individual columns, "
-            "or construct the put with a typed PvField via the upstream "
-            "p4p backend until typed PvField construction is wired here."
-        )
+        if isinstance(value, dict):
+            data = dict(value)
+        elif hasattr(value, "model_dump"):
+            data = value.model_dump()
+        else:
+            data = value
+        # Wrap as a marker payload that Backend.put recognises and routes
+        # to put_pv_field_async with the dtype hints we extracted from
+        # the Table subclass annotations.
+        return {
+            _TYPED_PVFIELD_MARKER: True,
+            "data": data,
+            "dtypes": dict(self._column_dtypes),
+            "struct_id": self.NTTABLE_STRUCT_ID,
+        }
 
     def datakey_dtype(self, value):
         if value is None:

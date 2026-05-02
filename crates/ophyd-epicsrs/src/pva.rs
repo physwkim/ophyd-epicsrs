@@ -643,9 +643,89 @@ impl EpicsRsPvaPV {
         pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(true) })
     }
 
+    /// Async: typed put for structured PVA targets (e.g. NTTable).
+    /// Unlike `put_async` (string-form pvput), this constructs a
+    /// properly-typed `PvField` from the Python value using
+    /// `pva_put::py_to_pvfield`, then dispatches via `pvput_pv_field`.
+    ///
+    /// Parameters
+    /// ----------
+    /// value : dict | list | scalar
+    ///     The value to write. Dicts become PvStructure with the given
+    ///     `struct_id`; lists become ScalarArrayTyped using `dtype_hints`
+    ///     (column → numpy dtype string / "string") to resolve the
+    ///     element type — critical for empty columns where no inference
+    ///     is possible.
+    /// dtype_hints : dict[str, str], optional
+    ///     Per-field dtype overrides. Keys match field names in the
+    ///     value dict; values are numpy dtype strings (e.g. "<i1",
+    ///     "<f8") or the literal "string".
+    /// struct_id : str, optional
+    ///     PVA struct_id stamped onto the top-level PvStructure
+    ///     (e.g. "epics:nt/NTTable:1.0"). Empty string leaves it unset.
+    /// timeout : float, optional
+    ///     pvput timeout in seconds (default 300.0).
+    #[pyo3(signature = (value, dtype_hints=None, struct_id="", timeout=300.0))]
+    fn put_pv_field_async<'py>(
+        &self,
+        py: Python<'py>,
+        value: &Bound<'_, pyo3::PyAny>,
+        dtype_hints: Option<&Bound<'_, PyDict>>,
+        struct_id: &str,
+        timeout: f64,
+    ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
+        let hints = extract_dtype_hints(dtype_hints)?;
+        let field = crate::pva_put::py_to_pvfield(value, &hints, struct_id)?;
+        let client = self.client.clone();
+        let name = self.pvname.clone();
+        let dur = Duration::from_secs_f64(timeout);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let result = tokio::time::timeout(dur, client.pvput_pv_field(&name, &field)).await;
+            Ok(matches!(result, Ok(Ok(()))))
+        })
+    }
+
+    /// Async: fire-and-forget typed put. Same shape as
+    /// `put_pv_field_async` but the PVA pvput is spawned and the
+    /// Python awaitable resolves to True immediately. Use for busy
+    /// records where waiting for ack causes deadlock.
+    #[pyo3(signature = (value, dtype_hints=None, struct_id=""))]
+    fn put_pv_field_nowait_async<'py>(
+        &self,
+        py: Python<'py>,
+        value: &Bound<'_, pyo3::PyAny>,
+        dtype_hints: Option<&Bound<'_, PyDict>>,
+        struct_id: &str,
+    ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
+        let hints = extract_dtype_hints(dtype_hints)?;
+        let field = crate::pva_put::py_to_pvfield(value, &hints, struct_id)?;
+        let client = self.client.clone();
+        let name = self.pvname.clone();
+        let pvname = name.clone();
+        self.runtime.spawn(async move {
+            if let Err(e) = client.pvput_pv_field(&pvname, &field).await {
+                eprintln!("[pvput_pv_field_nowait_async] {pvname} error: {e}");
+            }
+        });
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(true) })
+    }
+
     fn __repr__(&self) -> String {
         format!("EpicsRsPvaPV('{}')", self.pvname)
     }
+}
+
+/// Extract the optional dtype-hint Python dict into a Rust HashMap.
+fn extract_dtype_hints(
+    hints: Option<&Bound<'_, PyDict>>,
+) -> PyResult<std::collections::HashMap<String, String>> {
+    let mut out = std::collections::HashMap::new();
+    if let Some(d) = hints {
+        for (k, v) in d.iter() {
+            out.insert(k.extract()?, v.extract()?);
+        }
+    }
+    Ok(out)
 }
 
 /// Convert a Python value to a string suitable for `PvaClient::pvput`.

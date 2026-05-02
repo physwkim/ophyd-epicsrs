@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.6.1 (2026-05-03)
+
+### CI
+
+- **aarch64-linux wheel build**: inject
+  `CFLAGS_aarch64_unknown_linux_gnu="-D__ARM_ARCH=8"` so the manylinux
+  aarch64 cross-toolchain can assemble `ring`'s pregenerated ARM ASM.
+  v0.6.0's release workflow failed on the aarch64-linux matrix entry
+  because `ring 0.17` (transitive via PVA → rustls → ring, new since
+  v0.5.x) ships pregenerated ASM that `#error`s out without
+  `__ARM_ARCH` defined, and the cross-toolchain doesn't set it.
+  v0.6.0 was therefore never published to PyPI; v0.6.1 is the first
+  installable release of the v0.6 line.
+
 ## v0.6.0 (2026-05-03)
 
 ### New features

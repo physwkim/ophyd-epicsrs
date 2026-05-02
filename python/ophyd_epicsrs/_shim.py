@@ -368,8 +368,15 @@ def get_pv(
     if protocol == "pva":
         native_pv = _get_pva_context().create_pv(bare_name)
 
+    # Keep the ORIGINAL pvname (with `pva://` / `ca://` prefix) on the
+    # shim wrapper. ophyd indexes per-pv state (``_received_first_metadata``,
+    # ``_signals``) by the pvname string ophyd was originally handed; if
+    # the shim reported the stripped name, those lookups would KeyError
+    # the moment the connection callback fires. The native PV underneath
+    # is created from ``bare_name`` so the actual EPICS request goes to
+    # the right place.
     pv = EpicsRsShimPV(
-        bare_name,
+        pvname,
         form=form,
         auto_monitor=auto_monitor,
         connection_callback=connection_callback,

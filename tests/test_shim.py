@@ -57,17 +57,22 @@ def test_get_pv_ca_default():
     assert type(pv._pv).__name__ == "EpicsRsPV"
 
 
-def test_get_pv_pva_prefix_strips():
+def test_get_pv_pva_prefix_preserved():
+    """The shim's pvname must match the original string (incl. prefix).
+    ophyd indexes ``_received_first_metadata`` / ``_signals`` by the
+    pvname it was originally handed; reporting the stripped version
+    breaks the connection-callback bookkeeping. The bare name only
+    needs to reach the underlying native PV."""
     _ensure_setup()
     pv = get_pv("pva://FAKE:PVA:1")
-    assert pv.pvname == "FAKE:PVA:1"  # prefix removed
+    assert pv.pvname == "pva://FAKE:PVA:1"  # original preserved
     assert type(pv._pv).__name__ == "EpicsRsPvaPV"
 
 
-def test_get_pv_ca_explicit_prefix():
+def test_get_pv_ca_explicit_prefix_preserved():
     _ensure_setup()
     pv = get_pv("ca://FAKE:CA:2")
-    assert pv.pvname == "FAKE:CA:2"
+    assert pv.pvname == "ca://FAKE:CA:2"  # original preserved
     assert type(pv._pv).__name__ == "EpicsRsPV"
 
 

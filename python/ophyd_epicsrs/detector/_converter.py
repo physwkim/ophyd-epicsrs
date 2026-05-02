@@ -317,13 +317,22 @@ class _TableConverter(Converter):
         return raw
 
     def to_wire(self, value):
+        # Honest gap: ophyd-epicsrs cannot yet build a typed PVA PvField
+        # from a Table — the Rust pvput path serialises via a string
+        # parser (python_value_to_pvput_string) which would emit Python
+        # repr syntax for a dict and the IOC would reject it.
+        #
+        # Reads (NTTable PV → Table instance) work via to_python; only
+        # writes are blocked. Until typed put is wired through, surface
+        # a clear error instead of producing invalid wire bytes.
         if value is None:
             return None
-        if hasattr(value, "model_dump"):
-            return value.model_dump()
-        if isinstance(value, dict):
-            return value
-        return value
+        raise NotImplementedError(
+            "Writing a Table to a PVA NTTable PV is not yet supported by "
+            "ophyd-epicsrs. Use field-by-field puts on individual columns, "
+            "or construct the put with a typed PvField via the upstream "
+            "p4p backend until typed PvField construction is wired here."
+        )
 
     def datakey_dtype(self, value):
         if value is None:

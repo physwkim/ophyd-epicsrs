@@ -134,6 +134,31 @@ impl EpicsRsPV {
             .map_err(|_| PyRuntimeError::new_err("runtime task failed"))
     }
 
+    /// Resolve the PV's native DbFieldType, populating the cache if empty.
+    /// Falls back to `channel.info()` (a coordinator query — NO CA read)
+    /// rather than `get_with_metadata`, so write-only PVs and busy
+    /// records work without paying for or failing on a synchronous read.
+    /// `timeout_secs` bounds the info() call.
+    fn resolve_native_type_sync(&self, py: Python<'_>, timeout_secs: f64) -> PyResult<DbFieldType> {
+        if let Some(t) = *self.native_type.lock() {
+            return Ok(t);
+        }
+        let channel = self.channel.clone();
+        let dur = Duration::from_secs_f64(timeout_secs.min(5.0));
+        let info = py.allow_threads(|| {
+            self.spawn_wait(async move { tokio::time::timeout(dur, channel.info()).await })
+        })?;
+        match info {
+            Ok(Ok(i)) => {
+                *self.native_type.lock() = Some(i.native_type);
+                Ok(i.native_type)
+            }
+            _ => Err(PyRuntimeError::new_err(
+                "cannot determine PV native type for put (channel.info() failed)",
+            )),
+        }
+    }
+
     /// Best-effort injection of the current connection state for a newly
     /// registered callback. This avoids blocking Python startup while still
     /// covering the race where prefetch connected the channel before callback
@@ -344,36 +369,7 @@ impl EpicsRsPV {
         timeout: f64,
         callback: Option<PyObject>,
     ) -> PyResult<()> {
-        let native = {
-            let cached = self.native_type.lock();
-            match *cached {
-                Some(t) => t,
-                None => {
-                    drop(cached);
-                    let channel = self.channel.clone();
-                    let dur = Duration::from_secs_f64(timeout.min(5.0));
-                    let snap = py.allow_threads(|| {
-                        self.spawn_wait(async move {
-                            tokio::time::timeout(dur, channel.get_with_metadata(DbrClass::Plain))
-                                .await
-                        })
-                    })?;
-                    match snap {
-                        Ok(Ok(s)) => {
-                            let t = s.value.dbr_type();
-                            *self.native_type.lock() = Some(t);
-                            t
-                        }
-                        _ => {
-                            return Err(PyRuntimeError::new_err(
-                                "cannot determine PV native type for put",
-                            ));
-                        }
-                    }
-                }
-            }
-        };
-
+        let native = self.resolve_native_type_sync(py, timeout)?;
         let epics_val = py_to_epics_value(value, native)?;
         let channel = self.channel.clone();
         let dur = Duration::from_secs_f64(timeout);
@@ -762,36 +758,9 @@ impl EpicsRsPV {
         value: &Bound<'_, pyo3::PyAny>,
         timeout: f64,
     ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
-        // Resolve native type once (sync path) so we can convert the value.
-        let native = {
-            let cached = self.native_type.lock();
-            match *cached {
-                Some(t) => t,
-                None => {
-                    drop(cached);
-                    let channel = self.channel.clone();
-                    let dur = Duration::from_secs_f64(timeout.min(5.0));
-                    let snap = py.allow_threads(|| {
-                        self.spawn_wait(async move {
-                            tokio::time::timeout(dur, channel.get_with_metadata(DbrClass::Plain))
-                                .await
-                        })
-                    })?;
-                    match snap {
-                        Ok(Ok(s)) => {
-                            let t = s.value.dbr_type();
-                            *self.native_type.lock() = Some(t);
-                            t
-                        }
-                        _ => {
-                            return Err(PyRuntimeError::new_err(
-                                "cannot determine PV native type for put",
-                            ));
-                        }
-                    }
-                }
-            }
-        };
+        // Resolve native type via channel.info() (no CA read) — works
+        // for write-only PVs and avoids any get latency on the put path.
+        let native = self.resolve_native_type_sync(py, timeout)?;
         let epics_val = crate::convert::py_to_epics_value(value, native)?;
         let channel = self.channel.clone();
         let dur = Duration::from_secs_f64(timeout);
@@ -812,38 +781,10 @@ impl EpicsRsPV {
         py: Python<'py>,
         value: &Bound<'_, pyo3::PyAny>,
     ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
-        // Resolve native type once (sync) so we can convert the value.
-        let native = {
-            let cached = self.native_type.lock();
-            match *cached {
-                Some(t) => t,
-                None => {
-                    drop(cached);
-                    let channel = self.channel.clone();
-                    let snap = py.allow_threads(|| {
-                        self.spawn_wait(async move {
-                            tokio::time::timeout(
-                                Duration::from_secs(5),
-                                channel.get_with_metadata(DbrClass::Plain),
-                            )
-                            .await
-                        })
-                    })?;
-                    match snap {
-                        Ok(Ok(s)) => {
-                            let t = s.value.dbr_type();
-                            *self.native_type.lock() = Some(t);
-                            t
-                        }
-                        _ => {
-                            return Err(PyRuntimeError::new_err(
-                                "cannot determine PV native type for put_nowait",
-                            ));
-                        }
-                    }
-                }
-            }
-        };
+        // Resolve native type via channel.info() — coordinator query, no
+        // CA read. Critical for write-only PVs and busy records where
+        // a synchronous get would defeat wait=False semantics.
+        let native = self.resolve_native_type_sync(py, 5.0)?;
         let epics_val = crate::convert::py_to_epics_value(value, native)?;
         let channel = self.channel.clone();
         let pvname = self.pvname.clone();

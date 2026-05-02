@@ -95,6 +95,11 @@ pub struct EpicsRsPvaPV {
     py_monitor_callback: Arc<Mutex<Option<PyObject>>>,
     /// Connection callback set from Python side.
     connection_callback: Arc<Mutex<Option<PyObject>>>,
+    /// Access-rights callback set from Python side. Stored in Arc so the
+    /// access-setup task reads through it — disconnect can clear the
+    /// slot and the post-await callback fire becomes a no-op even if
+    /// the spawned task survived past the abort signal.
+    access_callback: Arc<Mutex<Option<PyObject>>>,
     /// Background task watching the connect handle for state changes.
     connection_task: Mutex<Option<JoinHandle<()>>>,
     /// Cached connection state — exposed to Python as a fast read.
@@ -114,6 +119,7 @@ impl EpicsRsPvaPV {
             monitor_tx: Arc::new(Mutex::new(None)),
             py_monitor_callback: Arc::new(Mutex::new(None)),
             connection_callback: Arc::new(Mutex::new(None)),
+            access_callback: Arc::new(Mutex::new(None)),
             connection_task: Mutex::new(None),
             connected: Arc::new(Mutex::new(false)),
         }
@@ -287,10 +293,20 @@ impl EpicsRsPvaPV {
 
     /// Register a monitor callback. Replaces any previous callback.
     fn add_monitor_callback(&self, py: Python<'_>, callback: PyObject) {
+        // Always swap the callback first — the dispatch thread reads
+        // through this Arc<Mutex>, so subsequent monitor events will
+        // automatically use the new callback even if a setup task is
+        // still in flight.
         *self.py_monitor_callback.lock() = Some(callback.clone_ref(py));
 
-        // If a monitor task already exists, just swap the callback.
-        if self.monitor_handle.lock().is_some() {
+        // Skip starting a new subscription if one is either already
+        // installed (monitor_handle) OR currently being set up
+        // (monitor_setup_task). Checking only monitor_handle would race:
+        // during pvmonitor_handle().await the handle is still None and a
+        // second registration would spawn a duplicate setup task and
+        // overwrite monitor_setup_task — losing the abort handle for
+        // the first one.
+        if self.monitor_handle.lock().is_some() || self.monitor_setup_task.lock().is_some() {
             return;
         }
 
@@ -416,27 +432,44 @@ impl EpicsRsPvaPV {
 
     /// Access rights callback — PVA does not surface separate access
     /// rights, so we fire (true, true) once after connection.
-    /// JoinHandle is stored in access_setup_task and aborted by
-    /// disconnect() so a slow pvconnect does not try to call back into
-    /// Python after the interpreter (or this PV) has been torn down.
+    ///
+    /// Teardown safety:
+    /// - The callback is stored in an Arc<Mutex<Option<PyObject>>> slot,
+    ///   not captured directly into the spawn closure. disconnect()
+    ///   can clear the slot, and the spawned task checks it under lock
+    ///   before reaching Python::with_gil — so a callback already past
+    ///   the pvconnect await still becomes a no-op if disconnect ran.
+    /// - pvconnect is bounded by a 30s timeout so the task cannot live
+    ///   indefinitely waiting for an unresolvable PV.
+    /// - The JoinHandle is stored in access_setup_task and aborted by
+    ///   disconnect (and replaced+aborted by re-registration).
     fn set_access_callback(&self, py: Python<'_>, callback: PyObject) {
-        let cb = callback;
+        *self.access_callback.lock() = Some(callback.clone_ref(py));
+
         let pvname = self.pvname.clone();
         let client = self.client.clone();
+        let cb_ref = self.access_callback.clone();
         let task = self.runtime.spawn(async move {
-            let _ = client.pvconnect(&pvname).await;
-            // Skip with_gil entirely if Python has been finalized — we
-            // can't peek at interpreter state, but acquiring the GIL on
-            // the spawned task path is what panics, so guard the rare
-            // case where the task survives clear/disconnect by deferring
-            // to the abort signal at task level (handled in disconnect).
-            Python::with_gil(|py| {
-                let _ = cb.call1(py, (true, true));
-            });
+            // Bounded probe — a PV that never resolves should not pin
+            // a spawned task forever.
+            let _ = tokio::time::timeout(Duration::from_secs(30), client.pvconnect(&pvname)).await;
+
+            // Atomically read+clone the callback under the same lock.
+            // If disconnect() cleared the slot during the await, this
+            // returns None and we skip Python::with_gil entirely
+            // (avoids interpreter-finalize panics).
+            let cb = cb_ref
+                .lock()
+                .as_ref()
+                .map(|c| Python::with_gil(|py| c.clone_ref(py)));
+            if let Some(cb) = cb {
+                Python::with_gil(|py| {
+                    let _ = cb.call1(py, (true, true));
+                });
+            }
         });
-        // Replace any previous access task and abort it — re-registering
-        // the access callback should not leave an orphaned spawn that may
-        // later try to fire into a now-stale callback.
+        // Abort any previous probe so a re-registration cannot leave
+        // an orphan firing into a stale callback.
         if let Some(prev) = self.access_setup_task.lock().replace(task) {
             prev.abort();
         }
@@ -460,7 +493,11 @@ impl EpicsRsPvaPV {
 
     fn disconnect(&self) {
         self.clear_monitors();
+        // Clear callback slots BEFORE aborting tasks so any task that
+        // is past the abort signal but not yet at with_gil sees the
+        // slot empty and skips the Python call.
         *self.connection_callback.lock() = None;
+        *self.access_callback.lock() = None;
         // Abort spawned probe tasks to prevent post-finalize Python::with_gil
         // panics. Same pattern as monitor_setup_task.
         if let Some(handle) = self.connection_task.lock().take() {

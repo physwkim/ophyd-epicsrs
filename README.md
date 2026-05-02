@@ -65,7 +65,7 @@ same keys they expect from CA.
 NTNDArray (areaDetector image streams over PVA) is **not yet supported**;
 use the CA backend for areaDetector image PVs until the next release.
 
-## ophyd-async support (`ophyd_epicsrs.detector`)
+## ophyd-async support (`ophyd_epicsrs.ophyd_async`)
 
 For [ophyd-async](https://github.com/bluesky/ophyd-async)-based devices,
 the package ships factory functions that return standard ophyd-async
@@ -74,7 +74,7 @@ epics-rs. No fork required — they drop straight into `StandardDetector`,
 `StandardReadable`, plan stubs, etc.
 
 ```python
-from ophyd_epicsrs.detector import (
+from ophyd_epicsrs.ophyd_async import (
     epicsrs_signal_r,
     epicsrs_signal_rw,
     epicsrs_signal_rw_rbv,
@@ -317,7 +317,7 @@ cannot silently disarm the guards.
 ```
 ophyd (sync)              ophyd-async (asyncio)
   │                         │
-  └── ophyd.cl              └── ophyd_epicsrs.detector
+  └── ophyd.cl              └── ophyd_epicsrs.ophyd_async
         │                         │ (EpicsRsSignalBackend)
         └── ophyd_epicsrs._shim   │
               │                   │
@@ -345,7 +345,7 @@ ophyd (sync)              ophyd-async (asyncio)
 
 - **`EpicsRsContext`** / **`EpicsRsPvaContext`** — Shared tokio runtime + CA / PVA client. One of each per session.
 - **`EpicsRsPV`** / **`EpicsRsPvaPV`** — PV channel wrappers. Sync surface (`wait_for_connection`, `get_with_metadata`, `put`, `add_monitor_callback`) plus `*_async` siblings.
-- **`ophyd_epicsrs.detector.EpicsRsSignalBackend`** — `ophyd-async` `SignalBackend` implementation; routes `pva://` / `ca://` / bare names to the appropriate native client and applies the datatype-aware converter for the requested ophyd-async type.
+- **`ophyd_epicsrs.ophyd_async.EpicsRsSignalBackend`** — `ophyd-async` `SignalBackend` implementation; routes `pva://` / `ca://` / bare names to the appropriate native client and applies the datatype-aware converter for the requested ophyd-async type. The factory functions (`epicsrs_signal_rw` etc.) wrap this and are the recommended entry point.
 
 ## Logging
 
@@ -367,7 +367,7 @@ force re-check on the next event.
 
 - Python >= 3.10
 - ophyd >= 1.9 (vanilla PyPI — no fork required)
-- ophyd-async >= 0.16 (only required if you use `ophyd_epicsrs.detector`)
+- ophyd-async >= 0.16 (only required if you use `ophyd_epicsrs.ophyd_async`)
 - bluesky >= 1.13
 - [epics-rs](https://github.com/epics-rs/epics-rs) >= 0.13 (bundled at build time)
 - Rust toolchain >= 1.85 (build-time only)

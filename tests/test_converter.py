@@ -1,4 +1,4 @@
-"""Unit tests for ophyd_epicsrs.detector._converter.
+"""Unit tests for ophyd_epicsrs.ophyd_async._converter.
 
 Offline (no IOC required). Covers the three converter dimensions that
 have caused the most past regressions: enum cache state machine,
@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 from ophyd_async.core import Array1D, StrictEnum, SubsetEnum, SupersetEnum, Table
 
-from ophyd_epicsrs.detector._converter import (
+from ophyd_epicsrs.ophyd_async._converter import (
     Converter,
     _BoolConverter,
     _decode_char_array,

@@ -6,7 +6,7 @@ methods to ophyd-async's :class:`~ophyd_async.core.Signal` interface.
 
 Use the factory functions instead of constructing the backend directly:
 
-    from ophyd_epicsrs.detector import epicsrs_signal_rw
+    from ophyd_epicsrs.ophyd_async import epicsrs_signal_rw
 
     sig = epicsrs_signal_rw(float, "IOC:motor.RBV", "IOC:motor.VAL")
     # or pva://...

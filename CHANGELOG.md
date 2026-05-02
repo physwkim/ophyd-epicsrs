@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.6.2 (2026-05-03)
+
+### Breaking
+
+- **`ophyd_epicsrs.detector` → `ophyd_epicsrs.ophyd_async`**: the
+  subpackage that provides ophyd-async integration (SignalBackend
+  adapter + datatype-aware converters + factory functions) was
+  originally named `detector` based on a planned scope that included
+  porting ophyd-async's `StandardDetector` / `TriggerLogic` /
+  `PathProvider` layers. The actual scope shipped is just the
+  `EpicsSignalBackend` adapter and its converters — pure
+  ophyd-async integration glue, no detector abstractions. Renamed
+  for accuracy.
+
+  Migration: replace `from ophyd_epicsrs.detector import …` with
+  `from ophyd_epicsrs.ophyd_async import …`. The exported names
+  (`EpicsRsSignalBackend`, `epicsrs_signal_r`, `epicsrs_signal_rw`,
+  `epicsrs_signal_rw_rbv`, `epicsrs_signal_w`, `epicsrs_signal_x`,
+  `EpicsRsProtocol`) and their signatures are unchanged.
+
+### Internal
+
+- README updated: section renamed to "ophyd-async support
+  (`ophyd_epicsrs.ophyd_async`)" and all path references updated.
+- Tests updated to import from the new module path.
+
 ## v0.6.1 (2026-05-03)
 
 ### CI

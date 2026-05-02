@@ -1,4 +1,4 @@
-"""Unit tests for ophyd_epicsrs.detector._factory.
+"""Unit tests for ophyd_epicsrs.ophyd_async._factory.
 
 Verifies factory functions return the right Signal type, dispatch on
 pv:// prefix, and propagate the wait option through to the backend.
@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 from ophyd_async.core import SignalR, SignalRW, SignalW, SignalX
 
-from ophyd_epicsrs.detector import (
+from ophyd_epicsrs.ophyd_async import (
     EpicsRsProtocol,
     epicsrs_signal_r,
     epicsrs_signal_rw,
@@ -18,7 +18,7 @@ from ophyd_epicsrs.detector import (
     epicsrs_signal_w,
     epicsrs_signal_x,
 )
-from ophyd_epicsrs.detector._signal_backend import EpicsRsSignalBackend
+from ophyd_epicsrs.ophyd_async._signal_backend import EpicsRsSignalBackend
 
 
 def _backend(sig) -> EpicsRsSignalBackend:

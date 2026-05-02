@@ -77,10 +77,21 @@ jobs:
       - name: Start mini-beamline IOC in the background
         working-directory: epics-rs
         env:
-          # Make sure the IOC's own CA server doesn't pick up stray
-          # broadcast addresses from the runner (we want loopback only).
+          # Server side: bind only on loopback so the IOC's CA/PVA
+          # services don't pick up stray broadcast addresses from the
+          # runner.
           EPICS_CAS_INTF_ADDR_LIST: 127.0.0.1
           EPICS_CAS_BEACON_ADDR_LIST: 127.0.0.1
+          # Client side: the readiness probe below runs a Python CA
+          # client in this same step, so it needs the same loopback
+          # search list as the integration-tests step. Without these
+          # the client default is AUTO_ADDR_LIST=YES → broadcasts on
+          # eth0 which the loopback-bound IOC never sees, and the
+          # probe times out after 30 s.
+          EPICS_CA_ADDR_LIST: 127.0.0.1
+          EPICS_CA_AUTO_ADDR_LIST: 'NO'
+          EPICS_PVA_ADDR_LIST: 127.0.0.1
+          EPICS_PVA_AUTO_ADDR_LIST: 'NO'
         run: |
           # Run detached, capture logs for forensic inspection.
           nohup ./target/release/mini_ioc examples/mini-beamline/ioc/st.cmd \

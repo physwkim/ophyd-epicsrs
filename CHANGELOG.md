@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.6.4 (2026-05-03)
+
+### Bug fixes
+
+- **CA: cache CTRL fields across reads** — the first DBR_CTRL read
+  (background prefetch or explicit `form="ctrl"`) ships
+  `units`, `precision`, the `*_disp_limit` family, the
+  `*_ctrl_limit` family, and `enum_strs`. Every subsequent
+  `get_with_metadata` falls back to DBR_TIME, which carries only
+  value + alarm + timestamp — so those fields silently disappeared
+  from the metadata dict on the second and later calls. For mbbi /
+  mbbo PVs the symptom was particularly visible: `char_value`
+  degraded from the labelled string to the raw int index. A
+  `cached_ctrl: Arc<Mutex<CachedCtrl>>` is now populated on every
+  CTRL read and merged into every TIME read (sync get, async get,
+  and monitor dispatch).
+
+- **PVA: NTEnum int put silently no-op** — `EpicsRsPvaPV.put` used
+  string-form `pvput(name, "1")` for every value. NTEnum has its
+  scalar in `value.index` (the top-level value is a `{index,
+  choices}` structure), and the server has no scalar slot for the
+  parsed int — so the write was silently rejected, no error
+  returned, no value change. The wrapper now caches NTEnum shape on
+  the first `get_with_metadata` and routes int / bool puts through
+  `pvput_field("value.index", ...)`. A put issued before any read
+  still uses the string-form path; in practice callers do at least
+  one read first (connect prefetch, status poll, etc.).
+
+### API additions
+
+- **`set_monitor_callback`** added on both `EpicsRsPV` and
+  `EpicsRsPvaPV` as the canonical name for the monitor-callback
+  registration. `add_monitor_callback` is preserved as a
+  back-compat alias. The "add" prefix was always misleading: the
+  implementation has set semantics (one callback, overwritten on
+  re-register). Multi-callback fan-out belongs at the shim layer,
+  which already wraps a single dispatcher around its Python-side
+  `_callbacks` dict.
+
+### Tests
+
+- Integration suite expanded from 15 → 56 tests across 7 new files
+  (bluesky plans, ophyd-async StandardReadable, multi-axis devices,
+  wire-level datatype coverage, performance, robustness, PVA
+  specifics). Wall time stays low (~25 s aggregate) thanks to a
+  session-wide motor `VELO=500` bump that replaces the `motor.template`
+  default of 1 unit/s.
+
 ## v0.6.3 (2026-05-03)
 
 ### Bug fixes

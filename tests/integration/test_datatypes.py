@@ -188,29 +188,38 @@ def test_ca_large_int16_waveform(ca_ctx):
 
     # `acquire.put(1, wait=True)` returns as soon as the bo record is
     # processed and the driver has scheduled the acquisition — NOT
-    # when the frame has actually arrived at the image1 plugin. A
-    # fixed sleep is racy on a busy CI runner: poll image1's frame
-    # counter for the increment that proves the plugin received and
-    # processed an NDArray, then do the heavy CA waveform read once.
+    # when the frame has actually arrived at the image1 plugin. Two
+    # AreaDetector races to ride out together:
+    #   1. ArrayCounter_RBV bumps when the plugin RECEIVES the NDArray
+    #   2. ArrayData populates only after processCallbacks finishes
+    #      copying the NDArray into the array param
+    # Polling counter alone leaves a window where ArrayData is still
+    # empty (CI runners are slow enough to land in it). Poll BOTH —
+    # break only when the counter advanced AND the array is settled.
     before = img_counter.get_with_metadata(timeout=2.0)["value"]
     acquire.put(1, wait=True, timeout=5.0)
 
     deadline = time.time() + 5.0
+    r = None
+    last_len: int | str = "(no read)"
+    after = before
     while time.time() < deadline:
         after = img_counter.get_with_metadata(timeout=2.0)["value"]
         if after > before:
-            break
+            snap = img.get_with_metadata(timeout=2.0)
+            if snap is not None:
+                last_len = len(snap["value"])
+                if last_len == 307200:
+                    r = snap
+                    break
         time.sleep(0.05)
-    else:
+    if r is None:
         pytest.fail(
-            f"image1 ArrayCounter_RBV stayed at {before} for >5 s — "
-            f"plugin never received a frame after acquire trigger"
+            f"image1 didn't deliver a full 307200-element frame within 5 s "
+            f"(counter {before}→{after}, last array length: {last_len})"
         )
 
-    t0 = time.perf_counter()
-    r = img.get_with_metadata(timeout=5.0)
-    dt = time.perf_counter() - t0
-    print(f"\n  image waveform get: {dt * 1000:.1f} ms, len={len(r['value'])}")
+    print(f"\n  image waveform: len={len(r['value'])}")
 
     assert len(r["value"]) == 307200
     # Pixel values are Int16 (poisson background ~1000 + Gaussian peak)

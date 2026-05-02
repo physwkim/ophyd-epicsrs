@@ -159,5 +159,10 @@ async def test_async_device_parallel_connect_three_detectors():
     dt = time.perf_counter() - t0
     print(f"\n  3x StandardReadable connect: {dt * 1000:.2f} ms")
     # Each detector has 3 PVs (1 read + 2 config) = 9 PV connects total.
-    # Localhost should comfortably finish under 1 s; loose ceiling.
-    assert dt < 2.0
+    # Localhost steady state: ~100–500 ms. Ceiling 5 s absorbs one
+    # mid-test reconnect from the upstream beacon-anomaly chain
+    # (epics-ca-rs first_sighting → EchoProbe → 5 s echo timeout →
+    # TcpClosed; see _contexts.py). Loose enough to ride out IOC
+    # turbulence, tight enough to catch a serial regression (9 PVs
+    # sequentially against a real IOC would take >> 5 s).
+    assert dt < 5.0

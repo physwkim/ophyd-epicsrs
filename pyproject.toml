@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "ophyd-epicsrs"
 version = "0.5.2"
 requires-python = ">=3.8"
-dependencies = ["ophyd>=1.9"]
+dependencies = ["ophyd>=1.9", "ophyd-async>=0.16", "bluesky>=1.13"]
 readme = "README.md"
 
 [tool.maturin]

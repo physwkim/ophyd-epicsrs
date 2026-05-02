@@ -1,5 +1,62 @@
 # Changelog
 
+## v0.6.5 (2026-05-03)
+
+### Bug fixes — async path completeness for the v0.6.4 changes
+
+v0.6.4 fixed two real bugs (PVA NTEnum int put, CA CTRL-fields
+cache) but only on the synchronous code path. Code review surfaced
+that the async surface was untouched, so any caller using
+`put_async` / `put_nowait_async` / `get_value_async` /
+`get_reading_async` (which is everything that goes through
+`ophyd_epicsrs.ophyd_async` and thus every ophyd-async signal) saw
+the original broken behaviour. v0.6.5 fixes that:
+
+- **PVA `put_async` / `put_nowait_async`**: now apply the same
+  NTEnum routing as sync `put`. Without this, every
+  `await sig.set(MyEnum.X)` against a PVA NTEnum signal silently
+  no-op'd at the wire, with no error returned.
+
+- **PVA `is_ntenum` cache**: now populated from `get_value_async`,
+  `get_reading_async`, and the monitor dispatch path — not just
+  sync `get_with_metadata`. Without this, async-only callers (the
+  normal ophyd-async pattern: connect → subscribe → set) would
+  never trigger NTEnum detection, so the put-routing fix above
+  would have nothing to consult.
+
+- **CA `cache_native_type_async`** consumed the prefetch and threw
+  away its CTRL fields. The downstream `get_reading_async("ctrl")`
+  in `EpicsRsSignalBackend.connect` then had to round-trip the IOC
+  again to recover units / precision / limits / enum_strs. Capture
+  those fields too — now the SignalBackend connect path is a
+  single CTRL fetch, not two.
+
+- **CA prefetch task** now eagerly populates `cached_ctrl` the
+  moment the background DBR_CTRL read completes. async-only callers
+  that never go through sync `get_with_metadata` previously got an
+  empty CTRL cache on their first `get_reading_async("time")`,
+  which silently dropped enum_strs / units / limits.
+
+### Tests
+
+- New `test_async_pva_ntenum_int_put_routes_via_field_path` in
+  `tests/integration/test_pva_specific.py` — drives the async-only
+  flow that the previous suite missed.
+- New `test_async_pva_ntenum_via_ophyd_async_strict_enum` — full
+  ophyd-async path with a `StrictEnum`-typed `SignalRW` against an
+  NTEnum PV (`mini:KohzuModeBO`), exercising the
+  `_EnumConverter.to_wire` → `put_async(int)` chain end-to-end.
+- `test_rapid_create_drop_no_thread_leak` now rotates across 8
+  distinct PV names instead of reusing a single name 200×, so each
+  iteration creates a fresh CaChannel + per-PV spawned tasks
+  (proves Drop semantics, not just channel-cache reuse).
+- `_speed_up_sim_motors` fixture now snapshots and restores each
+  motor's original VELO at teardown, so a long-running local IOC
+  isn't left in a non-default state after the suite.
+- All test + shim + signal-backend call sites switched from the
+  back-compat alias `add_monitor_callback` to the canonical
+  `set_monitor_callback`. The alias remains available.
+
 ## v0.6.4 (2026-05-03)
 
 ### Bug fixes

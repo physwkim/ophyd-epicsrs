@@ -169,23 +169,43 @@ def test_ca_large_int16_waveform(ca_ctx):
     carry the full frame.
 
     image1:EnableCallbacks defaults to Disable, so the plugin would
-    otherwise leave its array empty regardless of what cam1 publishes."""
+    otherwise leave its array empty regardless of what cam1 publishes.
+    """
     cb = ca_ctx.create_pv("mini:dot:cam1:ArrayCallbacks")
     en = ca_ctx.create_pv("mini:dot:image1:EnableCallbacks")
     mode = ca_ctx.create_pv("mini:dot:cam1:ImageMode")
     atime = ca_ctx.create_pv("mini:dot:cam1:AcquireTime")
     acquire = ca_ctx.create_pv("mini:dot:cam1:Acquire")
     img = ca_ctx.create_pv("mini:dot:image1:ArrayData")
-    for p in (cb, en, mode, atime, acquire, img):
+    img_counter = ca_ctx.create_pv("mini:dot:image1:ArrayCounter_RBV")
+    for p in (cb, en, mode, atime, acquire, img, img_counter):
         assert p.wait_for_connection(timeout=3.0)
 
-    en.put(1, wait=True, timeout=2.0)   # image1: Enable
     cb.put(1, wait=True, timeout=2.0)   # cam1: ArrayCallbacks on
+    en.put(1, wait=True, timeout=2.0)   # image1: Enable
     mode.put(0, wait=True, timeout=2.0)  # Single
     atime.put(0.05, wait=True, timeout=2.0)
-    time.sleep(0.2)
-    acquire.put(1, wait=True, timeout=5.0)  # blocks until acquisition done
-    time.sleep(0.5)  # let the frame propagate to image1:ArrayData
+
+    # `acquire.put(1, wait=True)` returns as soon as the bo record is
+    # processed and the driver has scheduled the acquisition — NOT
+    # when the frame has actually arrived at the image1 plugin. A
+    # fixed sleep is racy on a busy CI runner: poll image1's frame
+    # counter for the increment that proves the plugin received and
+    # processed an NDArray, then do the heavy CA waveform read once.
+    before = img_counter.get_with_metadata(timeout=2.0)["value"]
+    acquire.put(1, wait=True, timeout=5.0)
+
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        after = img_counter.get_with_metadata(timeout=2.0)["value"]
+        if after > before:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail(
+            f"image1 ArrayCounter_RBV stayed at {before} for >5 s — "
+            f"plugin never received a frame after acquire trigger"
+        )
 
     t0 = time.perf_counter()
     r = img.get_with_metadata(timeout=5.0)

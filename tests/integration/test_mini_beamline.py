@@ -20,29 +20,6 @@ import time
 
 import pytest
 
-from ophyd_epicsrs._native import EpicsRsContext, EpicsRsPvaContext
-
-
-# ---------- Fixtures ----------
-
-
-@pytest.fixture(scope="session")
-def ca_ctx() -> EpicsRsContext:
-    return EpicsRsContext()
-
-
-@pytest.fixture(scope="session")
-def pva_ctx() -> EpicsRsPvaContext:
-    return EpicsRsPvaContext()
-
-
-@pytest.fixture(scope="session", autouse=True)
-def _verify_ioc(ca_ctx):
-    """Skip the whole module if the IOC is not reachable."""
-    pv = ca_ctx.create_pv("mini:current")
-    if not pv.wait_for_connection(timeout=3.0):
-        pytest.skip("mini-beamline IOC not reachable on CA")
-
 
 # ---------- Native CA layer ----------
 
@@ -64,11 +41,16 @@ def test_ca_scalar_put_and_readback(ca_ctx):
     assert setpoint.wait_for_connection(timeout=3.0)
     assert rbv.wait_for_connection(timeout=3.0)
 
-    setpoint.put(0.123, timeout=2.0)
-    time.sleep(0.2)
-    r = rbv.get_with_metadata(timeout=2.0)
-    assert r is not None
-    assert abs(r["value"] - 0.123) < 1e-6
+    setpoint.put(0.123, wait=True, timeout=2.0)
+    deadline = time.time() + 2.0
+    last = None
+    while time.time() < deadline:
+        last = rbv.get_with_metadata(timeout=1.0)
+        if last and abs(last["value"] - 0.123) < 1e-6:
+            break
+        time.sleep(0.05)
+    assert last is not None
+    assert abs(last["value"] - 0.123) < 1e-6, f"rbv={last['value']}"
 
 
 def test_ca_monitor_callback(ca_ctx):
@@ -108,10 +90,16 @@ def test_pva_put_and_readback(pva_ctx):
     assert setpoint.wait_for_connection(timeout=3.0)
     assert rbv.wait_for_connection(timeout=3.0)
 
-    setpoint.put(0.456, timeout=2.0)
-    time.sleep(0.2)
-    r = rbv.get_with_metadata(timeout=2.0)
-    assert abs(r["value"] - 0.456) < 1e-6
+    setpoint.put(0.456, wait=True, timeout=2.0)
+    deadline = time.time() + 2.0
+    last = None
+    while time.time() < deadline:
+        last = rbv.get_with_metadata(timeout=1.0)
+        if last and abs(last["value"] - 0.456) < 1e-6:
+            break
+        time.sleep(0.05)
+    assert last is not None
+    assert abs(last["value"] - 0.456) < 1e-6, f"rbv={last['value']}"
 
 
 # ---------- bulk_caget ----------
@@ -154,17 +142,6 @@ def test_bulk_caget_many_pvs(ca_ctx):
 # ---------- ophyd (sync) frontend ----------
 
 
-@pytest.fixture(scope="session")
-def ophyd_setup():
-    """Install the epics-rs control layer once per session."""
-    from ophyd_epicsrs import use_epicsrs
-
-    use_epicsrs()
-    import ophyd
-
-    return ophyd
-
-
 def test_ophyd_signal_ca(ophyd_setup):
     sig = ophyd_setup.EpicsSignal("mini:current", name="current")
     sig.wait_for_connection(timeout=3.0)
@@ -189,12 +166,12 @@ def test_ophyd_motor_move_and_rbv(ophyd_setup):
     mtr.wait_for_connection(timeout=5.0)
     initial = mtr.position
     target = initial + 0.5  # short move so test stays fast
-    mtr.move(target, wait=True, timeout=30.0)
+    mtr.move(target, wait=True, timeout=10.0)
     assert abs(mtr.position - target) < 0.1, (
         f"motor at {mtr.position}, expected {target}"
     )
     # Move back so we don't leave state behind.
-    mtr.move(initial, wait=True, timeout=30.0)
+    mtr.move(initial, wait=True, timeout=10.0)
 
 
 def test_ophyd_point_detector_device(ophyd_setup):
@@ -230,11 +207,11 @@ def test_ophyd_motor_drives_detector(ophyd_setup):
     mtr.wait_for_connection(timeout=5.0)
     det_val.wait_for_connection(timeout=5.0)
 
-    mtr.move(0.0, wait=True, timeout=60.0)
+    mtr.move(0.0, wait=True, timeout=10.0)
     time.sleep(0.3)
     centre_val = det_val.get()
 
-    mtr.move(10.0, wait=True, timeout=60.0)
+    mtr.move(10.0, wait=True, timeout=10.0)
     time.sleep(0.3)
     off_val = det_val.get()
 
@@ -243,7 +220,7 @@ def test_ophyd_motor_drives_detector(ophyd_setup):
         f"expected centre {centre_val} to be > 3× off-axis {off_val}"
     )
 
-    mtr.move(0.0, wait=True, timeout=60.0)
+    mtr.move(0.0, wait=True, timeout=10.0)
 
 
 # ---------- ophyd-async (asyncio) frontend ----------

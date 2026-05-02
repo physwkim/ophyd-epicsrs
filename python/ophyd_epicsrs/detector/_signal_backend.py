@@ -282,10 +282,18 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            # No running loop: caller is using this backend outside an
-            # asyncio context. Fall back to direct invocation; if the
-            # callback later schedules onto a loop it must do so itself.
             loop = None
+
+        # First-detection guard: when the captured loop closes mid-session
+        # (typical: asyncio.run() exits while a monitor is still active),
+        # the dispatch thread keeps receiving events at the IOC's monitor
+        # rate. Calling the user callback would touch asyncio.Event /
+        # Queue inside ophyd-async's cache without a running loop — UB.
+        # Drop further events, warn ONCE, and proactively clear the
+        # underlying monitor so the IOC stops streaming to us at all.
+        loop_closed_handled = [False]
+        native_pv = self._read_pv_native
+        source = self.source("", read=True)
 
         def _wrapped(**kwargs):
             severity = kwargs.get("severity", 0)
@@ -304,21 +312,23 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
                     callback(reading)
                 except Exception:  # noqa: BLE001
                     _logger.exception(
-                        "monitor callback for %s raised", self.source("", read=True)
+                        "monitor callback for %s raised", source
                     )
-            else:
-                # Loop captured at registration time but has since
-                # closed (typical: asyncio.run() exited). Calling the
-                # callback directly from this Rust dispatch thread
-                # would touch asyncio.Event / asyncio.Queue inside the
-                # ophyd-async signal cache — those are not thread-safe
-                # without a running loop. Drop the event; warn once at
-                # the source level so the user can spot stale monitors.
-                _logger.warning(
+            elif not loop_closed_handled[0]:
+                loop_closed_handled[0] = True
+                _logger.debug(
                     "monitor event for %s arrived after the registered "
-                    "asyncio loop closed — dropping (call set_callback(None) "
-                    "before exiting the loop to silence this)",
-                    self.source("", read=True),
+                    "asyncio loop closed — clearing the subscription "
+                    "and dropping further events",
+                    source,
                 )
+                # Tear down the subscription on the Rust side so the
+                # IOC stops streaming events to a dead loop. Best-effort:
+                # clear_monitors itself can race with this very callback.
+                try:
+                    native_pv.clear_monitors()
+                except Exception:  # noqa: BLE001
+                    pass
+            # else: silently drop — handler already cleaned up.
 
         self._read_pv_native.add_monitor_callback(_wrapped)

@@ -5,6 +5,8 @@ pub mod pva;
 pub mod pva_convert;
 pub mod pva_put;
 pub mod runtime;
+#[macro_use]
+pub mod safe_log;
 
 use pyo3::prelude::*;
 

@@ -157,7 +157,11 @@ impl EpicsRsPV {
             return Ok(t);
         }
         let channel = self.channel.clone();
-        let dur = Duration::from_secs_f64(timeout_secs.min(5.0));
+        // Use the caller's full timeout budget. Earlier revisions had
+        // a hard 5 s cap here that was inconsistent with the async
+        // path (which uses a deadline) and silently truncated long
+        // user-supplied timeouts on the legacy sync path.
+        let dur = Duration::from_secs_f64(timeout_secs);
         let info = py.allow_threads(|| {
             self.spawn_wait(async move { tokio::time::timeout(dur, channel.info()).await })
         })?;
@@ -176,6 +180,10 @@ impl EpicsRsPV {
     /// asyncio event loop. Used inside `future_into_py` blocks so the
     /// caller's `await pv.put_async(...)` actually yields while we
     /// fetch channel info.
+    ///
+    /// Caller is responsible for the timeout budget — the helper does
+    /// not impose its own ceiling. (Earlier revisions had a redundant
+    /// `min(5.0)` cap here on top of caller-side caps.)
     async fn resolve_native_type(
         cache: Arc<Mutex<Option<DbFieldType>>>,
         channel: Arc<CaChannel>,
@@ -184,7 +192,7 @@ impl EpicsRsPV {
         if let Some(t) = *cache.lock() {
             return Ok(t);
         }
-        let dur = Duration::from_secs_f64(timeout_secs.min(5.0));
+        let dur = Duration::from_secs_f64(timeout_secs);
         match tokio::time::timeout(dur, channel.info()).await {
             Ok(Ok(i)) => {
                 *cache.lock() = Some(i.native_type);
@@ -440,11 +448,11 @@ impl EpicsRsPV {
                 let success = match tokio::time::timeout(dur, channel.put(&epics_val)).await {
                     Ok(Ok(())) => true,
                     Ok(Err(e)) => {
-                        tracing::warn!(target: "ophyd_epicsrs.ca", pv = %pvname, "put error: {e}");
+                        crate::safe_warn!(target: "ophyd_epicsrs.ca", pv = %pvname, "put error: {e}");
                         false
                     }
                     Err(_) => {
-                        tracing::warn!(target: "ophyd_epicsrs.ca", pv = %pvname, "put timed out");
+                        crate::safe_warn!(target: "ophyd_epicsrs.ca", pv = %pvname, "put timed out");
                         false
                     }
                 };
@@ -461,7 +469,7 @@ impl EpicsRsPV {
             let pvname = self.pvname.clone();
             self.runtime.spawn(async move {
                 if let Err(e) = channel.put_nowait(&epics_val).await {
-                    tracing::warn!(target: "ophyd_epicsrs.ca", pv = %pvname, "put_nowait error: {e}");
+                    crate::safe_warn!(target: "ophyd_epicsrs.ca", pv = %pvname, "put_nowait error: {e}");
                 }
             });
         }
@@ -592,7 +600,7 @@ impl EpicsRsPV {
                 let monitor = match channel.subscribe().await {
                     Ok(m) => m,
                     Err(e) => {
-                        tracing::debug!("{pvname}: subscribe failed ({e}), retrying...");
+                        crate::safe_debug!("{pvname}: subscribe failed ({e}), retrying...");
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         continue;
                     }
@@ -611,7 +619,7 @@ impl EpicsRsPV {
                     }
                 }
                 // Subscription ended (IOC restart, network blip) — resubscribe
-                tracing::debug!("{pvname}: monitor stream ended, resubscribing");
+                crate::safe_debug!("{pvname}: monitor stream ended, resubscribing");
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         });
@@ -689,10 +697,10 @@ impl EpicsRsPV {
                             // Echo timed out — TCP still up, no callback emitted
                         }
                     }
-                    tracing::debug!("{pvname}: connection event: {event:?}");
+                    crate::safe_debug!("{pvname}: connection event: {event:?}");
                 }
                 // Broadcast channel closed — resubscribe after brief pause
-                tracing::debug!("{pvname}: connection event stream ended, resubscribing");
+                crate::safe_debug!("{pvname}: connection event stream ended, resubscribing");
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         });
@@ -892,19 +900,33 @@ impl EpicsRsPV {
             let resolve_budget = (deadline - std::time::Instant::now())
                 .as_secs_f64()
                 .min(5.0);
-            let native = Self::resolve_native_type(cache, channel.clone(), resolve_budget).await?;
+            let native = Self::resolve_native_type(cache, channel.clone(), resolve_budget)
+                .await
+                .map_err(|_| {
+                    pyo3::exceptions::PyTimeoutError::new_err(format!(
+                        "put on {pvname}: native-type resolution exhausted the {timeout}s budget \
+                         before the put could be issued (consider warming the cache via \
+                         cache_native_type_async at connect, or pass a larger timeout)"
+                    ))
+                })?;
             let epics_val = Python::with_gil(|py| {
                 let v = value_owned.bind(py);
                 crate::convert::py_to_epics_value(v, native)
             })?;
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(pyo3::exceptions::PyTimeoutError::new_err(format!(
+                    "put on {pvname}: native-type resolution consumed the entire {timeout}s budget"
+                )));
+            }
             match tokio::time::timeout(remaining, channel.put(&epics_val)).await {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
                     "put on {pvname} failed: {e}"
                 ))),
                 Err(_) => Err(pyo3::exceptions::PyTimeoutError::new_err(format!(
-                    "put on {pvname} exceeded total budget {timeout}s"
+                    "put on {pvname} timed out at the wire after {remaining:?} \
+                     (total budget was {timeout}s)"
                 ))),
             }
         })

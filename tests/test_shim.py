@@ -98,16 +98,40 @@ def test_on_connection_change_dedupes_same_state():
 # ---------- Drop / leak proxy ----------
 
 
-def test_create_and_drop_loop_does_not_leak():
-    """Proxy for the Rust Drop fix — verifying the Python wrapper is GC'd
-    cleanly across many cycles. If Drop weren't aborting tasks, the runtime
-    would eventually fail to keep up; here we just check no exception."""
+def test_create_and_drop_loop_does_not_leak_threads():
+    """Quantitative leak check: 500 PV create+drop cycles should not
+    accumulate Python OS threads (each Rust EpicsRsPV starts at most
+    one dispatch_thread; Drop aborts all spawned tokio tasks AND lets
+    the dispatch thread exit cleanly when its rx Sender is dropped).
+
+    Threshold is conservative — typical leak would add ~one thread per
+    cycle (500+) so a >50 delta over 500 iterations would flag a
+    regression with high confidence.
+    """
+    import threading
+
     _ensure_setup()
-    for i in range(200):
-        pv = get_pv(f"DROP:{i}")
+
+    # Baseline: spawn one PV first to flush any one-time dispatcher /
+    # tracing initialisation thread creation.
+    _ = get_pv("WARMUP:THREADS")
+    gc.collect()
+    baseline = threading.active_count()
+
+    for i in range(500):
+        pv = get_pv(f"DROP:THREADS:{i}")
+        # Trigger callback paths that spawn tasks (the original leak risk).
+        pv._pv.set_connection_callback(lambda c: None)
+        pv._pv.set_access_callback(lambda r, w: None)
         del pv
     gc.collect()
-    # If this completes without OOM / runtime panic, Drop is doing its job.
+
+    after = threading.active_count()
+    delta = after - baseline
+    assert delta < 50, (
+        f"thread count grew by {delta} over 500 PV cycles "
+        f"(baseline={baseline}, after={after}) — possible leak in Drop"
+    )
 
 
 def test_release_pvs_clears_handlers():

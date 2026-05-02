@@ -106,6 +106,22 @@ CA and PVA are **both in scope** from day 1 via the shared epics-rs backend.
 
 ## Technical Considerations
 
+### Logging — pyo3-log + tracing "log" feature
+
+- All Rust-emitted `tracing::warn!` / `tracing::debug!` are bridged to
+  Python's `logging` module via pyo3-log (no global tracing-subscriber).
+- Configure as standard Python loggers:
+  `logging.getLogger("ophyd_epicsrs.ca").setLevel(logging.DEBUG)`,
+  `logging.getLogger("ophyd_epicsrs.pva").setLevel(logging.WARN)`.
+- pyo3-log caches level checks for ~30 s; runtime level changes are
+  not picked up immediately. Use `pyo3_log::ResetHandle::reset()` from
+  Python via a `_native` helper if real-time level switching is needed
+  (not currently exposed).
+- Tracing calls inside spawned tokio tasks use `safe_warn!` /
+  `safe_debug!` — they wrap `Python::with_gil` in `catch_unwind` so a
+  finalizing interpreter (typical pytest fixture teardown) does not
+  panic the runtime.
+
 ### Cancellation
 On Python `task.cancel()`, the corresponding Rust Future must `Drop` cleanly so any in-flight CA or PVA request aborts. Verify cancel-safety in epics-rs CA and PVA client paths (one known minor gap: CA G1 "TCP send timeout" SHOULD-FIX from the 2026-04-29 re-audit; tracked separately in epics-rs).
 
@@ -117,6 +133,24 @@ ophyd-async ships its own `AsyncStatus` implementation; this repo does not provi
 
 ### `EpicsOptions.wait` semantics
 `wait=False` (and callable variants — e.g. busy / acquire records that hang on Acquire=0) routes through `put_nowait_async`, which on CA fires `CA_PROTO_WRITE` (no notify) and on PVA spawns the put without awaiting the response.
+
+## Outstanding work
+
+### Integration tests against a real IOC
+
+Current unit tests (`tests/test_*.py`) are mock-based and validate the
+Python adapter layer. Several fixes — `monitor_generation` race guard,
+deadline-based timeout budget, pyo3-log bridge under interpreter
+finalize, Drop-on-disconnect leak prevention — can only be fully
+verified with an actual IOC. Plan:
+
+- CI fixture spinning up `softIoc` (epics-base) and `pvxs` softIoc with
+  a small db of NTScalar / NTEnum / NTTable PVs.
+- Tests covering: long-running monitor + IOC restart, set_callback
+  resubscribe race, Drop during active subscription, NTTable round-trip,
+  schema mismatch raises at connect.
+- Likely needs a separate `tests-integration/` directory and a
+  `pytest -m integration` marker.
 
 ## Success Criteria
 

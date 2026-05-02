@@ -93,6 +93,11 @@ pub struct EpicsRsPvaPV {
     monitor_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<PvaMonitorEvent>>>>,
     /// Single Python monitor callback (overwritten on re-register).
     py_monitor_callback: Arc<Mutex<Option<PyObject>>>,
+    /// Generation token incremented per `add_monitor_callback`. Each
+    /// dispatch thread captures its expected token at spawn time and
+    /// refuses to fire the callback once the canonical token has
+    /// advanced — same race-guard pattern as EpicsRsPV (see pv.rs).
+    monitor_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Connection callback set from Python side.
     connection_callback: Arc<Mutex<Option<PyObject>>>,
     /// Access-rights callback set from Python side. Stored in Arc so the
@@ -118,6 +123,7 @@ impl EpicsRsPvaPV {
             dispatch_thread: Mutex::new(None),
             monitor_tx: Arc::new(Mutex::new(None)),
             py_monitor_callback: Arc::new(Mutex::new(None)),
+            monitor_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             connection_callback: Arc::new(Mutex::new(None)),
             access_callback: Arc::new(Mutex::new(None)),
             connection_task: Mutex::new(None),
@@ -268,11 +274,11 @@ impl EpicsRsPvaPV {
                     match tokio::time::timeout(dur, client.pvput(&pvname, &value_str)).await {
                         Ok(Ok(())) => true,
                         Ok(Err(e)) => {
-                            tracing::warn!(target: "ophyd_epicsrs.pva", pv = %pvname, "pvput error: {e}");
+                            crate::safe_warn!(target: "ophyd_epicsrs.pva", pv = %pvname, "pvput error: {e}");
                             false
                         }
                         Err(_) => {
-                            tracing::warn!(target: "ophyd_epicsrs.pva", pv = %pvname, "pvput timed out");
+                            crate::safe_warn!(target: "ophyd_epicsrs.pva", pv = %pvname, "pvput timed out");
                             false
                         }
                     };
@@ -284,7 +290,7 @@ impl EpicsRsPvaPV {
             let pvname = self.pvname.clone();
             self.runtime.spawn(async move {
                 if let Err(e) = tokio::time::timeout(dur, client.pvput(&pvname, &value_str)).await {
-                    tracing::warn!(target: "ophyd_epicsrs.pva", pv = %pvname, "pvput error: {e}");
+                    crate::safe_warn!(target: "ophyd_epicsrs.pva", pv = %pvname, "pvput error: {e}");
                 }
             });
         }
@@ -310,13 +316,26 @@ impl EpicsRsPvaPV {
             return;
         }
 
+        // Bump generation BEFORE installing the new dispatch thread —
+        // an OLD thread still draining its rx will see its captured
+        // generation differ and bail before invoking the (potentially
+        // new) callback. Same race-guard pattern as EpicsRsPV.
+        let generation = self
+            .monitor_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+
         let (tx, rx) = std::sync::mpsc::channel::<PvaMonitorEvent>();
         *self.monitor_tx.lock() = Some(tx.clone());
 
         // Python dispatch thread
         let cb_ref = self.py_monitor_callback.clone();
+        let gen_ref = self.monitor_generation.clone();
         let dispatch = std::thread::spawn(move || {
             while let Ok(event) = rx.recv() {
+                if gen_ref.load(std::sync::atomic::Ordering::SeqCst) != generation {
+                    continue;
+                }
                 Python::with_gil(|py| {
                     let guard = cb_ref.lock();
                     let callback = match &*guard {
@@ -336,6 +355,15 @@ impl EpicsRsPvaPV {
                 });
             }
         });
+        // Reap any previous dispatch thread on a background join — the
+        // OLD thread will exit naturally when its rx Senders are gone.
+        if let Some(old) = self.dispatch_thread.lock().take() {
+            let _ = std::thread::Builder::new()
+                .name("ophyd-epicsrs-dispatch-join".into())
+                .spawn(move || {
+                    let _ = old.join();
+                });
+        }
         *self.dispatch_thread.lock() = Some(dispatch);
 
         // Tokio monitor task — fire callback by sending events through the queue.
@@ -381,7 +409,7 @@ impl EpicsRsPvaPV {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(target: "ophyd_epicsrs.pva", pv = %pvname_for_call, "pvmonitor_handle subscribe failed: {e}");
+                    crate::safe_warn!(target: "ophyd_epicsrs.pva", pv = %pvname_for_call, "pvmonitor_handle subscribe failed: {e}");
                 }
             }
         });

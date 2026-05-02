@@ -79,19 +79,32 @@ def test_legacy_ophyd_and_ophyd_async_share_circuit(ophyd_setup):
 
 
 def test_rapid_create_drop_no_thread_leak(ca_ctx):
-    """200 short-lived PVs against the live IOC. Thread count must
-    stay flat (proxy for the Rust task-leak fix that the unit test
-    checks against a fake server)."""
+    """200 short-lived PVs against the live IOC, rotating across a
+    pool of distinct names so each create gets its own CaChannel +
+    prefetch task + connection-event watcher rather than sharing a
+    cached channel. Thread count must still stay flat — proves Drop
+    aborts the per-PV spawned tasks, not just that channel caching
+    masks a leak."""
+    pool = [
+        "mini:ph:DetValue_RBV",
+        "mini:edge:DetValue_RBV",
+        "mini:slit:DetValue_RBV",
+        "mini:ph:mtr.RBV",
+        "mini:edge:mtr.RBV",
+        "mini:slit:mtr.RBV",
+        "mini:dot:cam1:ArrayCounter_RBV",
+        "mini:dot:cam1:Acquire_RBV",
+    ]
     baseline = threading.active_count()
     for i in range(200):
-        pv = ca_ctx.create_pv(f"mini:current")
+        pv = ca_ctx.create_pv(pool[i % len(pool)])
         pv.wait_for_connection(timeout=2.0)
         del pv
     gc.collect()
     time.sleep(0.5)  # let any pending Drop work finish
     after = threading.active_count()
     delta = after - baseline
-    print(f"\n  thread delta after 200 PV cycles: {delta}")
+    print(f"\n  thread delta after 200 PV cycles ({len(pool)} distinct names): {delta}")
     assert delta < 10, (
         f"thread count grew by {delta} (baseline={baseline}, after={after})"
     )

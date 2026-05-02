@@ -32,7 +32,8 @@ def _verify_ioc(ca_ctx):
 
 @pytest.fixture(scope="session", autouse=True)
 def _speed_up_sim_motors(_verify_ioc, ca_ctx):
-    """Bump every SimMotor's VELO to 500 unit/s for the test session.
+    """Bump every SimMotor's VELO to 500 unit/s for the test session,
+    snapshot + restore the original VELOs at teardown.
 
     Default ``motor.template`` ships VELO=1, which means a 10-unit move
     is a full 10-second wall clock. With dozens of motor moves across
@@ -44,8 +45,10 @@ def _speed_up_sim_motors(_verify_ioc, ca_ctx):
     Gaussian / erfc still tracks correctly because the IOC's CP links
     fire on every RBV step regardless of speed.
 
-    No teardown: the IOC restart in CI resets the motor record, and
-    locally a slower motor is what the user wanted to begin with.
+    Teardown restores each motor's original VELO so a long-running
+    local IOC isn't left in a non-default state after the suite —
+    otherwise other ophyd code in the same process / IOC session
+    would see surprisingly fast motors and wonder why.
     """
     motors = (
         "mini:ph:mtr",
@@ -55,10 +58,20 @@ def _speed_up_sim_motors(_verify_ioc, ca_ctx):
         "mini:dcm:y",
         "mini:dcm:z",
     )
+    saved: dict[str, float] = {}
     for m in motors:
         velo = ca_ctx.create_pv(f"{m}.VELO")
+        if not velo.wait_for_connection(timeout=2.0):
+            continue
+        snap = velo.get_with_metadata(timeout=1.0)
+        if snap is not None:
+            saved[m] = snap["value"]
+        velo.put(500.0, wait=True, timeout=2.0)
+    yield
+    for m, original in saved.items():
+        velo = ca_ctx.create_pv(f"{m}.VELO")
         if velo.wait_for_connection(timeout=2.0):
-            velo.put(500.0, wait=True, timeout=2.0)
+            velo.put(original, wait=True, timeout=2.0)
 
 
 @pytest.fixture(scope="session")

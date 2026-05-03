@@ -227,7 +227,3 @@ def main():
     demo_dcm_move()
 
     print("\n--- all plans complete ---")
-
-
-if __name__ == "__main__":
-    main()

@@ -258,7 +258,3 @@ def main():
     asyncio.run(demo_kohzu_mode_round_trip(devs))
 
     print("\n--- all plans complete ---")
-
-
-if __name__ == "__main__":
-    main()

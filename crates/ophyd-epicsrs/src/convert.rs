@@ -11,6 +11,7 @@ pub fn epics_value_to_py(py: Python<'_>, val: &EpicsValue) -> PyObject {
         EpicsValue::Double(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
         EpicsValue::Float(v) => (*v as f64).into_pyobject(py).unwrap().into_any().unbind(),
         EpicsValue::Long(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
+        EpicsValue::Int64(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
         EpicsValue::Short(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
         EpicsValue::Char(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
         EpicsValue::Enum(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
@@ -21,6 +22,7 @@ pub fn epics_value_to_py(py: Python<'_>, val: &EpicsValue) -> PyObject {
             .into_any()
             .unbind(),
         EpicsValue::LongArray(v) => PyList::new(py, v.iter()).unwrap().into_any().unbind(),
+        EpicsValue::Int64Array(v) => PyList::new(py, v.iter()).unwrap().into_any().unbind(),
         EpicsValue::ShortArray(v) => PyList::new(py, v.iter()).unwrap().into_any().unbind(),
         EpicsValue::CharArray(v) => PyList::new(py, v.iter()).unwrap().into_any().unbind(),
         EpicsValue::EnumArray(v) => PyList::new(py, v.iter()).unwrap().into_any().unbind(),
@@ -69,6 +71,10 @@ pub fn py_to_epics_value(
         DbFieldType::Long => {
             let v: i32 = obj.extract()?;
             Ok(EpicsValue::Long(v))
+        }
+        DbFieldType::Int64 => {
+            let v: i64 = obj.extract()?;
+            Ok(EpicsValue::Int64(v))
         }
         DbFieldType::Short => {
             let v: i16 = obj.extract()?;
@@ -129,6 +135,10 @@ fn py_sequence_to_epics_array(
         DbFieldType::Long => {
             let v: Vec<i32> = obj.extract()?;
             Ok(EpicsValue::LongArray(v))
+        }
+        DbFieldType::Int64 => {
+            let v: Vec<i64> = obj.extract()?;
+            Ok(EpicsValue::Int64Array(v))
         }
         DbFieldType::Short => {
             let v: Vec<i16> = obj.extract()?;

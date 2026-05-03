@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.6.8 (2026-05-03)
+
+### Dependency upgrade
+
+- **epics-rs 0.13.0 → 0.13.1**. Pulls in the new `EpicsValue::Int64` /
+  `EpicsValue::Int64Array` variants (DBR_INT64 native support, EPICS
+  V7+ field type) plus everything in
+  [epics-base-rs / epics-ca-rs / epics-pva-rs 0.13.1].
+
+- **DBR_INT64 conversion arms** added to `convert.rs` — Python
+  `int` ↔ `EpicsValue::Int64` (i64) for both scalar and array paths.
+  Long-typed (i32) and Int64-typed (i64) PVs are now both routed to
+  the right `EpicsValue` variant by the cached `native_type`.
+
 ## v0.6.7 (2026-05-03)
 
 ### Architecture — single CaClient / PvaClient per process

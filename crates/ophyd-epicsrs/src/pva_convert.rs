@@ -17,20 +17,33 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
 /// Convert a ScalarValue to a Python object.
+///
+/// Hot-path micro-optimization: the three most common NTScalar value types
+/// (Double, Long, Int) use direct CPython FFI to skip PyO3's trait dispatch
+/// chain (`into_pyobject → BoundObject → into_any → unbind`).
 pub fn scalar_to_py(py: Python<'_>, val: &ScalarValue) -> PyObject {
     match val {
-        // PyBool returns a Borrowed (singleton); convert to owned Bound first.
+        // Fast path: direct FFI for the most common types.
+        ScalarValue::Double(v) => unsafe {
+            PyObject::from_owned_ptr(py, pyo3::ffi::PyFloat_FromDouble(*v))
+        },
+        ScalarValue::Long(v) => unsafe {
+            PyObject::from_owned_ptr(py, pyo3::ffi::PyLong_FromLongLong(*v))
+        },
+        ScalarValue::Int(v) => unsafe {
+            PyObject::from_owned_ptr(py, pyo3::ffi::PyLong_FromLong(*v as std::ffi::c_long))
+        },
+        // Standard path for less common types.
         ScalarValue::Boolean(v) => v.into_pyobject(py).unwrap().to_owned().into_any().unbind(),
         ScalarValue::Byte(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
         ScalarValue::Short(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
-        ScalarValue::Int(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
-        ScalarValue::Long(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
         ScalarValue::UByte(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
         ScalarValue::UShort(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
         ScalarValue::UInt(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
         ScalarValue::ULong(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
-        ScalarValue::Float(v) => (*v as f64).into_pyobject(py).unwrap().into_any().unbind(),
-        ScalarValue::Double(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
+        ScalarValue::Float(v) => unsafe {
+            PyObject::from_owned_ptr(py, pyo3::ffi::PyFloat_FromDouble(*v as f64))
+        },
         ScalarValue::String(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
     }
 }
@@ -190,7 +203,7 @@ fn extract_ntenum(s: &PvStructure) -> Option<(i32, Vec<String>)> {
 /// Build an ophyd-compatible metadata dict from a top-level PvField.
 /// Handles NTScalar, NTScalarArray, NTEnum shapes; falls back to raw value
 /// for non-NT structures.
-pub fn pvfield_to_metadata(py: Python<'_>, field: &PvField) -> PyObject {
+pub fn pvfield_to_metadata(py: Python<'_>, field: &PvField, client_time: Option<(f64, i64, u32)>) -> PyObject {
     let dict = PyDict::new(py);
 
     match field {
@@ -254,7 +267,7 @@ pub fn pvfield_to_metadata(py: Python<'_>, field: &PvField) -> PyObject {
                 let _ = dict.set_item("posixseconds", secs);
                 let _ = dict.set_item("nanoseconds", nanos);
             } else {
-                set_client_timestamp(&dict);
+                set_client_timestamp(&dict, client_time);
             }
 
             // display
@@ -309,7 +322,7 @@ pub fn pvfield_to_metadata(py: Python<'_>, field: &PvField) -> PyObject {
             let _ = dict.set_item("char_value", format!("{other}"));
             let _ = dict.set_item("severity", 0i64);
             let _ = dict.set_item("status", 0i64);
-            set_client_timestamp(&dict);
+            set_client_timestamp(&dict, client_time);
         }
     }
 
@@ -320,13 +333,203 @@ pub fn pvfield_to_metadata(py: Python<'_>, field: &PvField) -> PyObject {
 /// such. `client_timestamp = True` so downstream code can distinguish
 /// IOC-sourced from synthesized timestamps (and choose to ignore the
 /// latter for time-critical metrics).
-fn set_client_timestamp(dict: &Bound<'_, PyDict>) {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let _ = dict.set_item("timestamp", now.as_secs_f64());
-    let _ = dict.set_item("posixseconds", now.as_secs() as i64);
-    let _ = dict.set_item("nanoseconds", now.subsec_nanos());
+fn set_client_timestamp(dict: &Bound<'_, PyDict>, client_time: Option<(f64, i64, u32)>) {
+    let (ts, secs, nanos) = client_time.unwrap_or_else(|| {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        (now.as_secs_f64(), now.as_secs() as i64, now.subsec_nanos())
+    });
+    let _ = dict.set_item("timestamp", ts);
+    let _ = dict.set_item("posixseconds", secs);
+    let _ = dict.set_item("nanoseconds", nanos);
     let _ = dict.set_item("client_timestamp", true);
+}
+
+#[pyclass(mapping, name = "EpicsRsPvaMetadata")]
+#[derive(Clone)]
+pub struct EpicsRsPvaMetadata {
+    pub field: PvField,
+    pub client_time: Option<(f64, i64, u32)>,
+    cached_dict: std::sync::Arc<std::sync::OnceLock<PyObject>>,
+}
+
+impl EpicsRsPvaMetadata {
+    pub fn new(field: PvField) -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let client_time = match &field {
+            PvField::Structure(s) => {
+                if s.get_timestamp().is_none() {
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+                    Some((now.as_secs_f64(), now.as_secs() as i64, now.subsec_nanos()))
+                } else {
+                    None
+                }
+            }
+            _ => {
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+                Some((now.as_secs_f64(), now.as_secs() as i64, now.subsec_nanos()))
+            }
+        };
+
+        Self {
+            field,
+            client_time,
+            cached_dict: std::sync::Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+}
+
+#[pymethods]
+impl EpicsRsPvaMetadata {
+    fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<PyObject> {
+        if let Some(dict) = self.cached_dict.get() {
+            let val = dict.bind(py).get_item(key)?;
+            return Ok(val.into_any().unbind());
+        }
+
+        match key {
+            "value" => {
+                match &self.field {
+                    PvField::Structure(s) => {
+                        if let Some((idx, _)) = extract_ntenum(s) {
+                            return Ok(idx.into_pyobject(py).unwrap().into_any().unbind());
+                        } else if let Some(value_field) = s.get_field("value") {
+                            return Ok(pvfield_to_py(py, value_field));
+                        } else {
+                            return Ok(structure_to_py(py, s));
+                        }
+                    }
+                    other => {
+                        return Ok(pvfield_to_py(py, other));
+                    }
+                }
+            }
+            "timestamp" => {
+                match &self.field {
+                    PvField::Structure(s) => {
+                        if let Some(ts) = s.get_timestamp() {
+                            let secs = struct_field_scalar(ts, "secondsPastEpoch")
+                                .and_then(scalar_as_i64)
+                                .unwrap_or(0);
+                            let nanos = struct_field_scalar(ts, "nanoseconds")
+                                .and_then(scalar_as_i64)
+                                .unwrap_or(0) as u32;
+                            let timestamp = secs as f64 + (nanos as f64) * 1e-9;
+                            return Ok(timestamp.into_pyobject(py).unwrap().into_any().unbind());
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some((ts, _, _)) = self.client_time {
+                    return Ok(ts.into_pyobject(py).unwrap().into_any().unbind());
+                }
+            }
+            "severity" => {
+                match &self.field {
+                    PvField::Structure(s) => {
+                        if let Some(alarm) = s.get_alarm() {
+                            let severity = struct_field_scalar(alarm, "severity")
+                                .and_then(scalar_as_i64)
+                                .unwrap_or(0);
+                            return Ok(severity.into_pyobject(py).unwrap().into_any().unbind());
+                        }
+                    }
+                    _ => {}
+                }
+                return Ok(0i64.into_pyobject(py).unwrap().into_any().unbind());
+            }
+            "status" => {
+                match &self.field {
+                    PvField::Structure(s) => {
+                        if let Some(alarm) = s.get_alarm() {
+                            let status = struct_field_scalar(alarm, "status")
+                                .and_then(scalar_as_i64)
+                                .unwrap_or(0);
+                            return Ok(status.into_pyobject(py).unwrap().into_any().unbind());
+                        }
+                    }
+                    _ => {}
+                }
+                return Ok(0i64.into_pyobject(py).unwrap().into_any().unbind());
+            }
+            _ => {}
+        }
+
+        let dict = pvfield_to_metadata(py, &self.field, self.client_time);
+        let val = dict.bind(py).get_item(key)?;
+        let _ = self.cached_dict.set(dict);
+        Ok(val.into_any().unbind())
+    }
+
+    fn keys(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let dict = self.get_or_build_dict(py);
+        dict.bind(py).call_method0("keys").map(|v| v.into_any().unbind())
+    }
+
+    fn values(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let dict = self.get_or_build_dict(py);
+        dict.bind(py).call_method0("values").map(|v| v.into_any().unbind())
+    }
+
+    fn items(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let dict = self.get_or_build_dict(py);
+        dict.bind(py).call_method0("items").map(|v| v.into_any().unbind())
+    }
+
+    fn __contains__(&self, py: Python<'_>, key: &str) -> PyResult<bool> {
+        let dict = self.get_or_build_dict(py);
+        dict.bind(py).contains(key)
+    }
+
+    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let dict = self.get_or_build_dict(py);
+        dict.bind(py).call_method0("__iter__").map(|v| v.into_any().unbind())
+    }
+
+    fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
+        let dict = self.get_or_build_dict(py);
+        dict.bind(py).len()
+    }
+
+    /// Mapping-style ``get(key, default=None)`` — non-mutating. Routes
+    /// through ``__getitem__`` so well-known keys (value, timestamp,
+    /// severity, status) stay on the lazy fast path; missing keys fall
+    /// through to the materialised dict and return ``default``.
+    #[pyo3(signature = (key, default=None))]
+    fn get(&self, py: Python<'_>, key: &str, default: Option<PyObject>) -> PyObject {
+        match self.__getitem__(py, key) {
+            Ok(v) => v,
+            Err(_) => default.unwrap_or_else(|| py.None()),
+        }
+    }
+
+    /// Mutating ``pop`` — ophyd's ``Signal.get`` calls
+    /// ``info.pop("value")`` and then iterates the rest as alarm /
+    /// timestamp metadata. Materialise the underlying dict so the pop
+    /// actually removes the entry; subsequent ``__getitem__`` /
+    /// ``keys`` see the modified view via the cache.
+    #[pyo3(signature = (key, default=None))]
+    fn pop(
+        &self,
+        py: Python<'_>,
+        key: &str,
+        default: Option<PyObject>,
+    ) -> PyResult<PyObject> {
+        let dict = self.get_or_build_dict(py).clone_ref(py);
+        let bound = dict.bind(py);
+        match bound.call_method1("pop", (key, default.unwrap_or_else(|| py.None()))) {
+            Ok(v) => Ok(v.into_any().unbind()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl EpicsRsPvaMetadata {
+    fn get_or_build_dict(&self, py: Python<'_>) -> &PyObject {
+        self.cached_dict.get_or_init(|| {
+            pvfield_to_metadata(py, &self.field, self.client_time)
+        })
+    }
 }

@@ -1,5 +1,75 @@
 # Changelog
 
+## v0.8.0 (2026-05-04)
+
+Major performance pass — every Rust↔Python hot path on the CA + PVA
+side has been optimised. Across 100-PV bulk reads on localhost,
+ophyd-epicsrs is now **5×** faster than aioca (CA) and **11×** faster
+than p4p (PVA); single warm get is at parity or better.
+
+### New public APIs
+
+- **`EpicsRsContext.bulk_get_pvs(pvs, timeout)`** — CA bulk read for
+  pre-cached PVs. Routes through epics-ca-rs's `get_many` (libca-style
+  per-server frame batching). 100 PVs in ~400 µs vs ~4.6 ms via
+  `bulk_caget`.
+- **`EpicsRsPvaContext.bulk_pvaget(pvnames, timeout)`** — PVA bulk
+  read by name (re-creates channels each call).
+- **`EpicsRsPvaContext.bulk_get_pvs_pva(pvs, timeout)`** — PVA bulk
+  read for pre-cached PVs. Routes through epics-pva-rs's
+  `pvget_many` with per-server combined-frame batching + warm-GET
+  intro cache. 100 PVs in ~210 µs (~2 µs/PV).
+
+### Performance wins
+
+- **PVA single warm get**: 166 µs → 97 µs (1.7× faster).
+- **PVA bulk(100)**: 2.4 ms → 210 µs (11× faster, beats CA bulk).
+- **CA single warm get**: 80 µs → 71 µs.
+- **CA bulk(100)**: 4.6 ms → 400 µs (11× faster).
+
+Driven by:
+- (A) `DirectServerWriter` sync send path for PVA writer
+- (B) `IoidSlot::TwoShot(VecDeque<oneshot>)` — per-op alloc removed
+- (C) `DashMap<u32, IoidSlot>` lock-free response router
+- (D) Warm-GET introspection cache (`Reusable` slot + `cached_get` +
+  `IoidGuard::defuse`) — skips INIT round-trip on subsequent gets
+- (E) Per-server frame batching in `pvget_many` (groups N GETs into
+  one TCP write, mirrors `CaClient::get_many`)
+- (F) `pyo3-async-runtimes::tokio::future_into_py_fast` (custom fork
+  patch — no cancellation propagation, no contextvars, no panic-
+  detection wrapper) for short-lived single-shot async futures
+- Direct CPython FFI fast path in `pvfield_to_py` for the common
+  NTScalar value types (Double, Long, Int)
+- Lock-free `is_ntenum` (`AtomicU8`) replaces `Arc<Mutex<Option<bool>>>`
+- Lazy `EpicsRsPvaMetadata` mapping wrapper — only materialises a
+  full Python dict when callers iterate / `.pop` / `.get` for a
+  missing key
+
+### New examples + docs
+
+- **`examples/bench_vs_others.py`** — comparative benchmark vs aioca
+  (CA) and p4p (PVA). Reports single warm get latency (p50/p95/p99),
+  bulk parallel scaling (10 / 20 / 50 / 100 PVs), connect time, and
+  monitor throughput. Adds the `bulk_get_pvs` / `bulk_pvaget` /
+  `bulk_get_pvs_pva` rows so the recommended API is the visible
+  winner.
+- **`docs/pva_single_get_async_perf.md`** — explains the PVA async
+  single-get bridge cost breakdown, why we shipped
+  `future_into_py_fast` (97 µs, true async), and why we rejected the
+  resolved-coroutine helper bypass (87 µs but breaks `gather()`).
+
+### Dependencies
+
+- **epics-rs 0.13.6 → 0.14.0** (transitive: `epics-base-rs`,
+  `epics-ca-rs`, `epics-pva-rs`, `epics-macros-rs` all to 0.14.0).
+  Brings the bulk `caget_many` / `get_many` (CA) and `pvget_many`
+  (PVA, now batched) APIs this release exposes.
+- **pyo3-async-runtimes** switched from crates.io 0.24 to a git
+  branch on `physwkim/pyo3-async-runtimes:perf-opt` (forked from
+  v0.24.0). Adds `future_into_py_fast` for the short-lived single-
+  shot use case. Will move back to crates.io once the patch lands
+  upstream.
+
 ## v0.7.0 (2026-05-03)
 
 Minor version bump — significant additions to the test surface and

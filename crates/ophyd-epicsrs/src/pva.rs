@@ -11,8 +11,12 @@
 //!   GIL contention from the tokio task.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
+
+const NTENUM_UNKNOWN: u8 = 0;
+const NTENUM_TRUE: u8 = 1;
+const NTENUM_FALSE: u8 = 2;
 
 use parking_lot::Mutex;
 use pyo3::exceptions::PyRuntimeError;
@@ -25,7 +29,7 @@ use epics_rs::pva::client_native::context::PvaClient;
 use epics_rs::pva::client_native::ops_v2::SubscriptionHandle;
 use epics_rs::pva::pvdata::{FieldDesc, PvField, ScalarType};
 
-use crate::pva_convert::{pvfield_to_metadata, pvfield_to_py};
+use crate::pva_convert::{pvfield_to_py, EpicsRsPvaMetadata};
 
 /// Monitor event queued from tokio task → Python thread.
 struct PvaMonitorEvent {
@@ -86,6 +90,132 @@ impl EpicsRsPvaContext {
         self.pv_count.load(Ordering::Acquire) == 0
     }
 
+    /// Bulk PVA read by PV names — the PVA counterpart of
+    /// ``EpicsRsContext.bulk_caget``.
+    ///
+    /// Issues N concurrent ``pvget`` operations via ``PvaClient::pvget_many``.
+    /// Channels are cached, so PVs on the same server share one TCP
+    /// connection. Returns ``{pvname: metadata | None}`` — successes
+    /// map to an ``EpicsRsPvaMetadata`` (lazy dict-like wrapper),
+    /// failures to ``None``.
+    ///
+    /// The GIL is released while the concurrent GETs run on tokio.
+    #[pyo3(signature = (pvnames, timeout=5.0))]
+    fn bulk_pvaget(
+        &self,
+        py: Python<'_>,
+        pvnames: Vec<String>,
+        timeout: f64,
+    ) -> PyResult<PyObject> {
+        let client = self.client.clone();
+        let dur = Duration::from_secs_f64(timeout);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.runtime.spawn(async move {
+            let names_for_call: Vec<&str> = pvnames.iter().map(String::as_str).collect();
+            let raw = tokio::time::timeout(dur, client.pvget_many(&names_for_call)).await;
+            let results: Vec<(String, Option<PvField>)> = match raw {
+                Ok(vec) => pvnames
+                    .into_iter()
+                    .zip(vec.into_iter())
+                    .map(|(name, res)| (name, res.ok()))
+                    .collect(),
+                Err(_) => pvnames
+                    .into_iter()
+                    .map(|name| (name, None))
+                    .collect(),
+            };
+            let _ = tx.send(results);
+        });
+
+        let results = py.allow_threads(move || {
+            rx.recv()
+                .map_err(|_| PyRuntimeError::new_err("bulk_pvaget failed"))
+        })?;
+
+        let dict = PyDict::new(py);
+        for (pvname, maybe_field) in results {
+            match maybe_field {
+                Some(field) => {
+                    let md = EpicsRsPvaMetadata::new(field);
+                    dict.set_item(&pvname, md.into_pyobject(py).unwrap())?;
+                }
+                None => dict.set_item(&pvname, py.None())?,
+            }
+        }
+        Ok(dict.into_any().unbind())
+    }
+
+    /// Bulk PVA read for already-created PVs — the PVA counterpart of
+    /// ``EpicsRsContext.bulk_get_pvs``.
+    ///
+    /// Skips channel creation overhead: pulls the cached ``PvaClient``
+    /// and PV name from each ``EpicsRsPvaPV`` and issues concurrent
+    /// ``pvget`` operations. Feeds each PV's ``is_ntenum`` cache as a
+    /// side-effect.
+    ///
+    /// Returns ``{pvname: metadata | None}`` — same shape as
+    /// ``bulk_pvaget``.
+    #[pyo3(signature = (pvs, timeout=5.0))]
+    fn bulk_get_pvs_pva(
+        &self,
+        py: Python<'_>,
+        pvs: Vec<Py<EpicsRsPvaPV>>,
+        timeout: f64,
+    ) -> PyResult<PyObject> {
+        let client = self.client.clone();
+        let dur = Duration::from_secs_f64(timeout);
+
+        // Snapshot pvname + is_ntenum ref under GIL
+        let snapshots: Vec<(String, Arc<AtomicU8>)> = pvs
+            .iter()
+            .map(|p| {
+                let r = p.borrow(py);
+                (r.pvname.clone(), r.is_ntenum.clone())
+            })
+            .collect();
+        drop(pvs);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.runtime.spawn(async move {
+            let names: Vec<&str> = snapshots.iter().map(|(n, _)| n.as_str()).collect();
+            let raw = tokio::time::timeout(dur, client.pvget_many(&names)).await;
+            let results: Vec<(String, Arc<AtomicU8>, Option<PvField>)> = match raw {
+                Ok(vec) => snapshots
+                    .into_iter()
+                    .zip(vec.into_iter())
+                    .map(|((name, is_ntenum), res)| (name, is_ntenum, res.ok()))
+                    .collect(),
+                Err(_) => snapshots
+                    .into_iter()
+                    .map(|(name, is_ntenum)| (name, is_ntenum, None))
+                    .collect(),
+            };
+            let _ = tx.send(results);
+        });
+
+        let results = py.allow_threads(move || {
+            rx.recv()
+                .map_err(|_| PyRuntimeError::new_err("bulk_get_pvs_pva failed"))
+        })?;
+
+        let dict = PyDict::new(py);
+        for (pvname, is_ntenum, maybe_field) in results {
+            match maybe_field {
+                Some(field) => {
+                    // Feed is_ntenum cache
+                    if is_ntenum.load(Ordering::Relaxed) == NTENUM_UNKNOWN {
+                        record_ntenum_into(&is_ntenum, &field);
+                    }
+                    let md = EpicsRsPvaMetadata::new(field);
+                    dict.set_item(&pvname, md.into_pyobject(py).unwrap())?;
+                }
+                None => dict.set_item(&pvname, py.None())?,
+            }
+        }
+        Ok(dict.into_any().unbind())
+    }
+
     fn __repr__(&self) -> String {
         "EpicsRsPvaContext(active)".to_string()
     }
@@ -143,7 +273,7 @@ pub struct EpicsRsPvaPV {
     /// ...)` instead of plain `pvput` — string-form pvput on NTEnum is
     /// silently rejected by the server (the field path tells the
     /// server precisely where to write).
-    is_ntenum: Arc<Mutex<Option<bool>>>,
+    is_ntenum: Arc<AtomicU8>,
     /// Shared with the parent ``EpicsRsPvaContext`` — decremented in
     /// Drop so ``EpicsRsPvaContext::is_unused()`` reflects live wrappers.
     pv_count: Arc<AtomicUsize>,
@@ -166,9 +296,9 @@ pub struct EpicsRsPvaPV {
 ///
 /// Extracted so both the `&self` sync path and `async move` async paths
 /// (which cannot borrow `self`) share a single call-site pattern.
-fn record_ntenum_into(slot: &Mutex<Option<bool>>, field: &PvField) {
+fn record_ntenum_into(slot: &AtomicU8, field: &PvField) {
     if let Some(detected) = detect_ntenum_shape(field) {
-        *slot.lock() = Some(detected);
+        slot.store(if detected { NTENUM_TRUE } else { NTENUM_FALSE }, Ordering::Relaxed);
     }
 }
 
@@ -224,11 +354,17 @@ impl EpicsRsPvaPV {
             access_callback: Arc::new(Mutex::new(None)),
             connection_task: Mutex::new(None),
             connected: Arc::new(Mutex::new(false)),
-            is_ntenum: Arc::new(Mutex::new(None)),
+            is_ntenum: Arc::new(AtomicU8::new(NTENUM_UNKNOWN)),
             pv_count,
         }
     }
 
+    /// Run a future on the tokio runtime and block until done.
+    ///
+    /// Uses spawn+mpsc rather than Handle::block_on because the future's
+    /// .await points (writer channel sends, reader channel recvs) are
+    /// faster when running on a tokio worker thread (intra-scheduler
+    /// wakeup ~1-3µs) vs an external thread (OS park/unpark ~5-10µs).
     fn spawn_wait<F, T>(&self, fut: F) -> PyResult<T>
     where
         F: std::future::Future<Output = T> + Send + 'static,
@@ -285,8 +421,10 @@ impl EpicsRsPvaPV {
         })?;
         match result {
             Ok(Ok(field)) => {
-                self.record_ntenum_shape(&field);
-                Ok(Some(pvfield_to_metadata(py, &field)))
+                if self.is_ntenum.load(Ordering::Relaxed) == NTENUM_UNKNOWN {
+                    self.record_ntenum_shape(&field);
+                }
+                Ok(Some(EpicsRsPvaMetadata::new(field).into_pyobject(py).unwrap().into_any().unbind()))
             }
             Ok(Err(e)) => {
                 tracing::warn!(target: "ophyd_epicsrs.pva", pv = %self.pvname, "pvget failed: {e}");
@@ -358,7 +496,7 @@ impl EpicsRsPvaPV {
         callback: Option<PyObject>,
     ) -> PyResult<()> {
         // NTEnum int-put: route through value.index field-path.
-        let route_ntenum_index = *self.is_ntenum.lock() == Some(true) && py_value_is_intlike(value);
+        let route_ntenum_index = self.is_ntenum.load(Ordering::Relaxed) == NTENUM_TRUE && py_value_is_intlike(value);
         let value_str = python_value_to_pvput_string(value)?;
 
         let client = self.client.clone();
@@ -470,7 +608,9 @@ impl EpicsRsPvaPV {
                 // and only then puts — so the first read may already
                 // be a monitor delivery rather than an explicit
                 // get_value_async.
-                record_ntenum_into(&is_ntenum_ref, &event.field);
+                if is_ntenum_ref.load(Ordering::Relaxed) == NTENUM_UNKNOWN {
+                    record_ntenum_into(&is_ntenum_ref, &event.field);
+                }
                 crate::safe_call!(Python::with_gil(|py| {
                     let guard = cb_ref.lock();
                     let callback = match &*guard {
@@ -479,7 +619,7 @@ impl EpicsRsPvaPV {
                     };
                     drop(guard);
                     let kwargs = PyDict::new(py);
-                    let md = pvfield_to_metadata(py, &event.field);
+                    let md = crate::pva_convert::pvfield_to_metadata(py, &event.field, None);
                     let md_ref = md.downcast_bound::<PyDict>(py).unwrap();
                     // Spread metadata keys into kwargs
                     let _ = kwargs.set_item("pvname", &event.pvname);
@@ -725,7 +865,7 @@ impl EpicsRsPvaPV {
             // get_reading_async) already populated the cache. This avoids
             // a redundant round-trip on reconnect and on non-NTEnum PVs
             // where the overhead buys nothing.
-            if is_ntenum.lock().is_some() {
+            if is_ntenum.load(Ordering::Relaxed) != NTENUM_UNKNOWN {
                 return Ok(true);
             }
             match tokio::time::timeout(dur, client.pvget(&name)).await {
@@ -816,39 +956,42 @@ impl EpicsRsPvaPV {
         let pvname = name.clone();
         let dur = Duration::from_secs_f64(timeout);
         let is_ntenum = self.is_ntenum.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        // `future_into_py_fast` skips add_done_callback / Cancellable /
+        // outer-spawn / scope (~15-25µs/call savings vs the standard
+        // `future_into_py`). Safe here because the future is short-
+        // lived, the caller does not cancel via asyncio, and we don't
+        // use contextvars across the await.
+        pyo3_async_runtimes::tokio::future_into_py_fast(py, async move {
             match tokio::time::timeout(dur, client.pvget(&name)).await {
                 Ok(Ok(field)) => {
-                    // Feed is_ntenum cache so a subsequent
-                    // put_async(int) routes through pvput_field. The
-                    // sync get's cache update isn't reached when the
-                    // user only ever uses the async surface.
-                    record_ntenum_into(&is_ntenum, &field);
+                    let cached = is_ntenum.load(Ordering::Relaxed);
+                    let is_nt = if cached != NTENUM_UNKNOWN {
+                        cached == NTENUM_TRUE
+                    } else {
+                        record_ntenum_into(&is_ntenum, &field);
+                        is_ntenum.load(Ordering::Relaxed) == NTENUM_TRUE
+                    };
                     crate::safe_call_or!(
                         Err(PyRuntimeError::new_err(format!(
                             "pvget on {pvname}: panic in Python::with_gil during value conversion"
                         ))),
                         Python::with_gil(|py| {
-                            // NTEnum handling: top-level Structure with a
-                            // `value` substructure containing {index, choices}.
-                            // Surface the int index (consistent with monitor).
-                            if let epics_rs::pva::pvdata::PvField::Structure(s) = &field {
-                                if let Some((idx, _choices)) =
-                                    crate::pva_convert::try_extract_ntenum(s)
-                                {
-                                    return Ok::<PyObject, PyErr>(
-                                        idx.into_pyobject(py).unwrap().into_any().unbind(),
-                                    );
+                            if is_nt {
+                                if let PvField::Structure(s) = &field {
+                                    if let Some((idx, _choices)) =
+                                        crate::pva_convert::try_extract_ntenum(s)
+                                    {
+                                        return Ok::<PyObject, PyErr>(
+                                            idx.into_pyobject(py).unwrap().into_any().unbind(),
+                                        );
+                                    }
                                 }
                             }
-                            let value_field = match &field {
-                                epics_rs::pva::pvdata::PvField::Structure(s) => s
-                                    .get_field("value")
-                                    .cloned()
-                                    .unwrap_or_else(|| field.clone()),
-                                _ => field.clone(),
+                            let value_field: &PvField = match &field {
+                                PvField::Structure(s) => s.get_field("value").unwrap_or(&field),
+                                _ => &field,
                             };
-                            Ok::<PyObject, PyErr>(pvfield_to_py(py, &value_field))
+                            Ok::<PyObject, PyErr>(pvfield_to_py(py, value_field))
                         })
                     )
                 }
@@ -881,13 +1024,15 @@ impl EpicsRsPvaPV {
             match tokio::time::timeout(dur, client.pvget(&name)).await {
                 Ok(Ok(field)) => {
                     // Feed is_ntenum cache (same reason as get_value_async).
-                    record_ntenum_into(&is_ntenum, &field);
+                    if is_ntenum.load(Ordering::Relaxed) == NTENUM_UNKNOWN {
+                        record_ntenum_into(&is_ntenum, &field);
+                    }
                     crate::safe_call_or!(
                         Err(PyRuntimeError::new_err(format!(
                             "pvget on {pvname}: panic in Python::with_gil during reading conversion"
                         ))),
                         Python::with_gil(|py| Ok::<PyObject, PyErr>(
-                            crate::pva_convert::pvfield_to_metadata(py, &field)
+                            EpicsRsPvaMetadata::new(field).into_pyobject(py).unwrap().into_any().unbind()
                         ))
                     )
                 }
@@ -916,7 +1061,7 @@ impl EpicsRsPvaPV {
         value: &Bound<'_, pyo3::PyAny>,
         timeout: f64,
     ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
-        let route_ntenum_index = *self.is_ntenum.lock() == Some(true) && py_value_is_intlike(value);
+        let route_ntenum_index = self.is_ntenum.load(Ordering::Relaxed) == NTENUM_TRUE && py_value_is_intlike(value);
         let value_str = python_value_to_pvput_string(value)?;
         let client = self.client.clone();
         let name = self.pvname.clone();
@@ -962,7 +1107,7 @@ impl EpicsRsPvaPV {
     ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
         // Same NTEnum routing as put / put_async — see put_async for
         // the rationale. ophyd-async's `set(wait=False)` lands here.
-        let route_ntenum_index = *self.is_ntenum.lock() == Some(true) && py_value_is_intlike(value);
+        let route_ntenum_index = self.is_ntenum.load(Ordering::Relaxed) == NTENUM_TRUE && py_value_is_intlike(value);
         let value_str = python_value_to_pvput_string(value)?;
         let client = self.client.clone();
         let name = self.pvname.clone();

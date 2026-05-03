@@ -7,6 +7,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use tokio::runtime::Runtime;
 
+use epics_rs::base::types::EpicsValue;
 use epics_rs::ca::client::CaClient;
 
 use crate::convert::epics_value_to_py;
@@ -91,8 +92,11 @@ impl EpicsRsContext {
 
     /// Read multiple PVs in parallel. Returns a dict of {pvname: value}.
     ///
-    /// All PVs are connected and read concurrently using tokio::join_all.
-    /// This is much faster than reading PVs one by one.
+    /// Routes through ``CaClient::caget_many_with_timeout`` which groups
+    /// the per-server READ_NOTIFY frames into a single TCP write per
+    /// server (libca-style bulk flush). N reads complete in roughly one
+    /// round-trip time instead of N round-trips serialized through the
+    /// coordinator.
     ///
     /// Parameters
     /// ----------
@@ -104,51 +108,22 @@ impl EpicsRsContext {
     /// Returns
     /// -------
     /// dict
-    ///     {pvname: value} for all successfully read PVs.
-    ///
-    /// Example
-    /// -------
-    ///     ctx = EpicsRsContext()
-    ///     data = ctx.bulk_caget(["PV:enc_wf", "PV:I0_wf", "PV:ROI1", ...])
-    ///     # All PVs read in parallel — ~1 round-trip time instead of N
+    ///     {pvname: value} — successfully-read PVs map to the value,
+    ///     failures (timeout / disconnect / type error) map to ``None``.
     #[pyo3(signature = (pvnames, timeout=5.0))]
     fn bulk_caget(&self, py: Python<'_>, pvnames: Vec<String>, timeout: f64) -> PyResult<PyObject> {
         let client = self.client.clone();
         let dur = Duration::from_secs_f64(timeout);
 
-        // Spawn all reads in parallel, collect results
         let (tx, rx) = std::sync::mpsc::channel();
         self.runtime.spawn(async move {
-            let mut handles = Vec::with_capacity(pvnames.len());
-            for name in &pvnames {
-                let ch = client.create_channel(name);
-                let pvname = name.clone();
-                handles.push(tokio::spawn(async move {
-                    if ch.wait_connected(dur).await.is_err() {
-                        return (pvname, None);
-                    }
-                    // Apply the user-supplied timeout to the actual read
-                    // too — `CaChannel::get()` has no built-in deadline,
-                    // so a single stuck channel (e.g. mid-reconnect from
-                    // the upstream beacon-anomaly chain — see
-                    // python/ophyd_epicsrs/_contexts.py) used to block
-                    // bulk_caget for ~30 s while the rest of the parallel
-                    // reads sat idle. Now each spawned read fails fast at
-                    // `dur` and the bulk call returns within the budget
-                    // the user actually asked for.
-                    match tokio::time::timeout(dur, ch.get()).await {
-                        Ok(Ok((_dbr, val))) => (pvname, Some(val)),
-                        _ => (pvname, None),
-                    }
-                }));
-            }
-
-            let mut results = Vec::with_capacity(handles.len());
-            for handle in handles {
-                if let Ok(result) = handle.await {
-                    results.push(result);
-                }
-            }
+            let names_for_call: Vec<&str> = pvnames.iter().map(String::as_str).collect();
+            let raw = client.caget_many_with_timeout(&names_for_call, dur).await;
+            let results: Vec<(String, Option<EpicsValue>)> = pvnames
+                .into_iter()
+                .zip(raw.into_iter())
+                .map(|(name, res)| (name, res.ok().map(|(_dbr, val)| val)))
+                .collect();
             let _ = tx.send(results);
         });
 
@@ -162,6 +137,68 @@ impl EpicsRsContext {
 
         // Convert to Python dict — failed PVs are included as None
         // so callers can distinguish "missing key" from "read failed".
+        let dict = PyDict::new(py);
+        for (pvname, maybe_val) in results {
+            match maybe_val {
+                Some(val) => dict.set_item(&pvname, epics_value_to_py(py, &val))?,
+                None => dict.set_item(&pvname, py.None())?,
+            }
+        }
+        Ok(dict.into_any().unbind())
+    }
+
+    /// Bulk read for already-created PVs — the fast path.
+    ///
+    /// ``bulk_caget(names)`` re-creates channels and waits for connect
+    /// every call, so its per-call cost is dominated by channel setup.
+    /// ``bulk_get_pvs(pvs)`` skips that: it pulls the cached
+    /// ``Arc<CaChannel>`` out of each ``EpicsRsPV`` and routes through
+    /// ``CaClient::get_many_with_timeout``, which packs the per-server
+    /// READ_NOTIFY frames into one TCP write (libca-style flush).
+    /// Mirrors the e2e ``get_many`` benchmark in epics-ca-rs (~2 µs/PV
+    /// for 100 PVs against the bench softIoc).
+    ///
+    /// Caller's responsibility to ensure each PV is connected before
+    /// calling — disconnected channels surface as ``None`` in the
+    /// returned dict.
+    #[pyo3(signature = (pvs, timeout=5.0))]
+    fn bulk_get_pvs(
+        &self,
+        py: Python<'_>,
+        pvs: Vec<Py<EpicsRsPV>>,
+        timeout: f64,
+    ) -> PyResult<PyObject> {
+        let client = self.client.clone();
+        let dur = Duration::from_secs_f64(timeout);
+
+        // Snapshot pvname + clone CaChannel under GIL, then release for
+        // the actual batch read.
+        let snapshots: Vec<(String, epics_rs::ca::client::CaChannel)> = pvs
+            .iter()
+            .map(|p| {
+                let r = p.borrow(py);
+                (r.pvname.clone(), (*r.channel).clone())
+            })
+            .collect();
+        drop(pvs);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.runtime.spawn(async move {
+            let (names, channels): (Vec<String>, Vec<_>) = snapshots.into_iter().unzip();
+            let raw = client.get_many_with_timeout(&channels, dur).await;
+            let results: Vec<(String, Option<EpicsValue>)> = names
+                .into_iter()
+                .zip(raw.into_iter())
+                .map(|(name, res)| (name, res.ok().map(|(_dbr, val)| val)))
+                .collect();
+            let _ = tx.send(results);
+        });
+
+        let results = py.allow_threads(move || {
+            rx.recv()
+                .map_err(|_| PyRuntimeError::new_err("bulk_get_pvs failed"))
+        })?;
+
         let dict = PyDict::new(py);
         for (pvname, maybe_val) in results {
             match maybe_val {

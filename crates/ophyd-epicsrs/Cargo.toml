@@ -1,6 +1,6 @@
 [package]
 name = "ophyd-epicsrs"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.85"
 license = "BSD-3-Clause"
@@ -10,9 +10,12 @@ name = "ophyd_epicsrs"
 crate-type = ["cdylib"]
 
 [dependencies]
-epics-rs = { version = "0.13.6", features = ["ca", "pva"] }
+epics-rs = { version = "0.14.0", features = ["ca", "pva"] }
 pyo3 = { version = "0.24", features = ["extension-module", "abi3-py38"] }
-pyo3-async-runtimes = { version = "0.24", features = ["tokio-runtime"] }
+# physwkim fork branched from v0.24.0 with the `future_into_py_fast`
+# patch — see docs/pva_single_get_async_perf.md for the rationale and
+# upstream PR target.
+pyo3-async-runtimes = { git = "https://github.com/physwkim/pyo3-async-runtimes.git", branch = "perf-opt", features = ["tokio-runtime"] }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
 parking_lot = "0.12"
 # tracing's "log" feature: when no Subscriber is registered, every

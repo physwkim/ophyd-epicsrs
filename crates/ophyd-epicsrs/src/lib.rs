@@ -39,6 +39,7 @@ fn ophyd_epicsrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<pv::EpicsRsPV>()?;
     m.add_class::<pva::EpicsRsPvaContext>()?;
     m.add_class::<pva::EpicsRsPvaPV>()?;
+    m.add_class::<pva_convert::EpicsRsPvaMetadata>()?;
     m.add_function(wrap_pyfunction!(reset_log_cache, m)?)?;
     m.add_function(wrap_pyfunction!(caught_panic_count, m)?)?;
     m.add_function(wrap_pyfunction!(_reset_panic_count_for_test, m)?)?;

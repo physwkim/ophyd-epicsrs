@@ -1,5 +1,93 @@
 # Changelog
 
+## v0.6.7 (2026-05-03)
+
+### Architecture — single CaClient / PvaClient per process
+
+Three independent contexts (pyepics-compat shim, ophyd-async backend,
+test fixture) each constructed their own `EpicsRsContext` /
+`EpicsRsPvaContext`. Every fresh `CaClient` saw each IOC's first
+beacon as a `first_sighting=true` anomaly
+(`epics-ca-rs/src/client/beacon_monitor.rs:327`), which fired an
+`EchoProbe` against every operational channel. Under load the IOC
+could miss the 5 s echo deadline → `TcpClosed` →
+`handle_disconnect` → "restored N subscriptions" reconnect storm
+and timed-out gets/puts. With three clients × N IOCs the spurious
+anomaly count multiplied accordingly.
+
+- **`python/ophyd_epicsrs/_contexts.py`**: new module owning the
+  process-wide singleton CA + PVA contexts. `_shim.py`,
+  `_signal_backend.py`, and the test `ca_ctx` / `pva_ctx` fixtures
+  all route through `get_ca_context()` / `get_pva_context()`.
+
+- **Public API surface** (`__init__.py`): `EpicsRsContext` /
+  `EpicsRsPvaContext` removed from `__all__` so user code can't
+  silently bypass the singleton. `get_ca_context`, `get_pva_context`,
+  and `shutdown_all` are the canonical entry points. `EpicsRsPV` /
+  `EpicsRsPvaPV` stay public for `isinstance` / type annotations on
+  `create_pv()` return values. Pyclass docstrings now warn against
+  direct instantiation.
+
+- **`shutdown_all()`** for long-running daemons that want to release
+  the runtime / sockets when finished. Refuses (`RuntimeError`)
+  while any `EpicsRsPV` / `EpicsRsPvaPV` wrapper is alive — without
+  this guard the singleton slot would empty but the old `CaClient`
+  would persist (PVs strongly reference it), and the next
+  `get_ca_context()` would construct a SECOND client, re-triggering
+  the multi-client anomaly chain. Backed by per-context
+  `pv_count: Arc<AtomicUsize>` (`is_unused()` on the pyclass) that
+  PVs increment in `create_pv` and decrement in `Drop`.
+
+- **`EpicsRsContext::new`** releases the GIL via `py.allow_threads`
+  while waiting for the spawned `CaClient::new` task — repeater
+  registration / UDP setup no longer blocks other Python threads.
+
+### Bug fixes — PVA NTEnum (11th-pass review)
+
+- **`cache_native_type_async` cache-hit guard**: skip the pvget when
+  `is_ntenum` is already cached (reconnect / non-NTEnum signals no
+  longer pay a redundant round-trip).
+
+- **`tracing::warn!` on pvget failure**: `cache_native_type_async`
+  was silently swallowing transient I/O failures, leaving the user
+  with a cold cache and `put_async(int)` quietly falling back to
+  plain `pvput` (rejected by the IOC). Now logs a warning so the
+  failure is at least visible.
+
+- **`detect_ntenum_shape` forward-compat**: changed
+  `struct_id == "epics:nt/NTEnum:1.0"` to
+  `starts_with("epics:nt/NTEnum:")` so a future minor bump (1.1, ...)
+  doesn't get misclassified as a different NT type.
+
+- **`record_ntenum_into` extraction**: replaced the four inlined
+  copies of the `is_ntenum` cache update with a single free function
+  that both `&self` and `async move` paths share.
+
+### Test hardening
+
+Four tests intermittently failed in CI under the upstream beacon-
+anomaly chain (all four passed in isolation). Hardened against
+transient reconnect storms while preserving real regression
+detection:
+
+- **`test_ca_large_int16_waveform`**: was polling AreaDetector's
+  `ArrayCounter_RBV` alone — bumps when the plugin RECEIVES the
+  NDArray but `ArrayData` populates only after `processCallbacks`
+  finishes the copy. Now polls BOTH counter AND array length.
+
+- **`test_concurrent_get_and_monitor`**: tolerates up to 2 transient
+  get timeouts; skips on full sustained outage; deadlock floor only
+  fires when one side made progress and the other did not (the
+  actual contract under test).
+
+- **`test_bulk_caget_many_pvs`**: retries once with a generous
+  timeout if any of the 15 PVs reads as `None` from a transient
+  reconnect.
+
+- **`test_async_device_parallel_connect_three_detectors`**: 2 s
+  ceiling bumped to 5 s, with a 1 s soft warning print to surface
+  persistent slowdowns without failing on a one-shot beacon storm.
+
 ## v0.6.6 (2026-05-02)
 
 ### Bug fixes — PVA NTEnum robustness (10th-pass review)

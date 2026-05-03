@@ -1,5 +1,59 @@
 # Changelog
 
+## v0.7.0 (2026-05-03)
+
+Minor version bump — significant additions to the test surface and
+example scripts. No public API breaks.
+
+### Tests — vendored upstream ophyd suite
+
+New ``tests/integration/upstream/`` directory with 13 ophyd test
+files adapted to run against the mini-beamline IOC instead of the
+caproto / XF:31IDA test IOCs the originals expect:
+
+- Pure-logic tests (no IOC needed): ``test_device``, ``test_hints``,
+  ``test_kind``, ``test_log``, ``test_main``, ``test_ophydobj``,
+  ``test_positioner``, ``test_status``, ``test_utils``,
+  ``test_versioning``, ``test_sim``.
+- Real-IOC tests with mini-beamline PV remap: ``test_epicsmotor``
+  (against ``mini:ph:mtr``), ``test_signalpositioner``,
+  ``test_signal`` (read_only / read_write / pair_set / pair_rbv /
+  bool_enum mapped to mini PVs).
+- ``conftest.py`` wires ``use_epicsrs_backend()`` (new alias),
+  ``TEST_CL=epicsrs``, and the mini-beamline-flavoured ``motor``
+  / ``signal_test_ioc`` / ``cleanup`` fixtures every upstream test
+  expects.
+
+Total integration test count rose from 118 → 353 across 3 stability
+runs, all clean (transient IOC reachability is the only skip
+trigger).
+
+### Examples
+
+- ``examples/mini_beamline.py`` — end-to-end CA / sync ophyd demo:
+  composite Devices (PointDetector, DCM, XYStage), RunEngine with
+  ``count`` / ``scan`` / ``rel_scan`` / ``grid_scan`` / DCM theta
+  move. Inline document_printer subscriber so the script runs
+  without a databroker.
+- ``examples/mini_beamline_async.py`` — ophyd-async + PVA
+  counterpart: ``StandardReadable`` composites, ``StrictEnum``
+  NTEnum round-trip exercising the ``pvput_field("value.index")``
+  routing added in v0.6.7, ``init_devices()`` parallel connect
+  (~40 ms for 8 PVA devices on localhost vs ~2 s for the 10 CA
+  devices in the sister script).
+
+### Public API
+
+- ``use_epicsrs_backend = use_epicsrs`` alias added so external
+  consumers (e.g. the ``physwkim/epicsrs-tests`` repo) can use
+  either name.
+
+### Dependencies
+
+- **epics-rs 0.13.4 → 0.13.6** (transitive: ``epics-base-rs``,
+  ``epics-ca-rs``, ``epics-pva-rs``, ``epics-macros-rs`` all to
+  0.13.6).
+
 ## v0.6.9 (2026-05-03)
 
 ### Bug fixes

@@ -6,3 +6,6 @@ __pycache__/
 *.pyc
 *.egg-info/
 .iocsh_history
+/.claude/
+/kodex-out/
+/ophyd.log

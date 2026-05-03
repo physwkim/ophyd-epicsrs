@@ -25,3 +25,11 @@ test = ["pytest>=8", "pytest-asyncio>=1"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    # Inherited from upstream ophyd test suite (epicsrs-tests/ophyd_tests).
+    # We keep them registered so vendored test files don't emit
+    # PytestUnknownMarkWarning. Tests still run regardless of marker —
+    # the mini-beamline IOC covers what would have needed motorsim/adsim.
+    "motorsim: upstream marker for tests requiring an EPICS motor record",
+    "adsim: upstream marker for tests requiring an AreaDetector simulator",
+]

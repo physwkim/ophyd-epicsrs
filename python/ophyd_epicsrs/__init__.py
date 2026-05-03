@@ -35,6 +35,7 @@ __all__ = [
     "reset_log_cache",
     "shutdown_all",
     "use_epicsrs",
+    "use_epicsrs_backend",
 ]
 
 
@@ -62,3 +63,7 @@ def use_epicsrs(*, logger=None):
         "get_dispatcher",
     )
     ophyd.cl = types.SimpleNamespace(**{k: getattr(_shim, k) for k in exports})
+
+
+# Alias for upstream-test conftests that import the older name.
+use_epicsrs_backend = use_epicsrs

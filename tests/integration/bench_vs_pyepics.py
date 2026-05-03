@@ -138,6 +138,9 @@ def bench_pyepics():
 def bench_epicsrs():
     print("\n=== ophyd-epicsrs (CA backend) ===")
 
+    # Benchmark intentionally constructs a fresh context (private API
+    # import) to measure cold-start cost in isolation; production code
+    # uses ophyd_epicsrs.get_ca_context() — see _contexts.py.
     ctx = EpicsRsContext()
     pv = ctx.create_pv(SINGLE_PV)
     pv.wait_for_connection(timeout=5.0)

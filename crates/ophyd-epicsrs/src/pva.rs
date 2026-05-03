@@ -11,6 +11,7 @@
 //!   GIL contention from the tokio task.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -41,6 +42,11 @@ struct PvaMonitorEvent {
 pub struct EpicsRsPvaContext {
     pub(crate) runtime: Arc<Runtime>,
     pub(crate) client: PvaClient,
+    /// Live ``EpicsRsPvaPV`` wrapper count — same role as
+    /// ``EpicsRsContext::pv_count``. Surfaces through ``is_unused()``
+    /// so ``shutdown_all`` can refuse to drop the singleton while
+    /// channels are still alive.
+    pv_count: Arc<AtomicUsize>,
 }
 
 #[pymethods]
@@ -56,16 +62,28 @@ impl EpicsRsPvaContext {
         let client = PvaClient::new()
             .map_err(|e| PyRuntimeError::new_err(format!("failed to create PVA client: {e}")))?;
 
-        Ok(Self { runtime, client })
+        Ok(Self {
+            runtime,
+            client,
+            pv_count: Arc::new(AtomicUsize::new(0)),
+        })
     }
 
     /// Create a PVA channel wrapper for the given name.
     fn create_pv(&self, pvname: &str) -> EpicsRsPvaPV {
+        self.pv_count.fetch_add(1, Ordering::AcqRel);
         EpicsRsPvaPV::new(
             self.runtime.clone(),
             self.client.clone(),
             pvname.to_string(),
+            self.pv_count.clone(),
         )
+    }
+
+    /// True iff no ``EpicsRsPvaPV`` wrappers created from this context
+    /// are currently alive.
+    fn is_unused(&self) -> bool {
+        self.pv_count.load(Ordering::Acquire) == 0
     }
 
     fn __repr__(&self) -> String {
@@ -126,6 +144,9 @@ pub struct EpicsRsPvaPV {
     /// silently rejected by the server (the field path tells the
     /// server precisely where to write).
     is_ntenum: Arc<Mutex<Option<bool>>>,
+    /// Shared with the parent ``EpicsRsPvaContext`` — decremented in
+    /// Drop so ``EpicsRsPvaContext::is_unused()`` reflects live wrappers.
+    pv_count: Arc<AtomicUsize>,
 }
 
 /// Classify a top-level PvField as NTEnum or not.
@@ -182,7 +203,12 @@ fn detect_ntenum_shape(field: &PvField) -> Option<bool> {
 }
 
 impl EpicsRsPvaPV {
-    fn new(runtime: Arc<Runtime>, client: PvaClient, pvname: String) -> Self {
+    fn new(
+        runtime: Arc<Runtime>,
+        client: PvaClient,
+        pvname: String,
+        pv_count: Arc<AtomicUsize>,
+    ) -> Self {
         Self {
             runtime,
             client,
@@ -199,6 +225,7 @@ impl EpicsRsPvaPV {
             connection_task: Mutex::new(None),
             connected: Arc::new(Mutex::new(false)),
             is_ntenum: Arc::new(Mutex::new(None)),
+            pv_count,
         }
     }
 
@@ -1072,6 +1099,10 @@ impl Drop for EpicsRsPvaPV {
         if let Some(h) = self.connection_task.lock().take() {
             h.abort();
         }
+
+        // Decrement the parent context's live-PV counter — see
+        // ``EpicsRsPvaContext::pv_count``.
+        self.pv_count.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

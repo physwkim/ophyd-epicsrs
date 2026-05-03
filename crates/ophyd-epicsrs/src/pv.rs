@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -128,10 +129,19 @@ pub struct EpicsRsPV {
     /// Tracked so Drop can abort in-flight `Python::with_gil` after
     /// interpreter finalize — same teardown race as monitor_setup_task.
     emit_tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// Shared with the parent ``EpicsRsContext`` — decremented in Drop
+    /// so ``EpicsRsContext::is_unused()`` knows when no PVs reference
+    /// the singleton client.
+    pv_count: Arc<AtomicUsize>,
 }
 
 impl EpicsRsPV {
-    pub fn new(runtime: Arc<Runtime>, channel: CaChannel, pvname: String) -> Self {
+    pub fn new(
+        runtime: Arc<Runtime>,
+        channel: CaChannel,
+        pvname: String,
+        pv_count: Arc<AtomicUsize>,
+    ) -> Self {
         let ch = Arc::new(channel);
         // Built up-front so the prefetch task can capture it eagerly —
         // see the comment inside the spawn for why "eagerly" matters
@@ -208,6 +218,7 @@ impl EpicsRsPV {
             prefetch_handle: Mutex::new(Some(prefetch_handle)),
             cached_ctrl,
             emit_tasks: Mutex::new(Vec::new()),
+            pv_count,
         }
     }
 
@@ -1190,5 +1201,10 @@ impl Drop for EpicsRsPV {
             h.abort();
         }
         // dispatch_thread will exit when monitor_tx Sender is dropped.
+
+        // Decrement the parent context's live-PV counter so
+        // ``EpicsRsContext::is_unused()`` can tell when no wrappers
+        // remain and ``shutdown_all`` is safe.
+        self.pv_count.fetch_sub(1, Ordering::AcqRel);
     }
 }

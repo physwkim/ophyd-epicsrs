@@ -8,6 +8,11 @@ and trips spurious ``first_sighting`` anomalies in epics-ca-rs that drop
 healthy TCP circuits. ``EpicsRsPV`` / ``EpicsRsPvaPV`` are exposed for
 ``isinstance`` checks and type annotations on the values returned by
 ``create_pv``; users should not construct them directly either.
+
+For long-running processes that want to release the runtime and sockets
+when finished with EPICS, call :func:`shutdown_all`. It refuses while
+any PV is still alive (so it cannot silently re-trigger the multi-client
+beacon-anomaly bug); release every PV first.
 """
 
 import logging

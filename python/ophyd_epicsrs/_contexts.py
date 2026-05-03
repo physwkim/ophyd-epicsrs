@@ -60,16 +60,38 @@ def shutdown_all() -> None:
     has been released frees the Rust runtime + beacon monitor + repeater
     socket. The Rust ``Drop`` impls handle background-task teardown.
 
-    **Caveat**: any subsequent ``get_ca_context()`` / ``get_pva_context()``
-    call will construct a *new* ``CaClient`` / ``PvaClient``. The new
-    client's empty beacon ``servers`` map will fire ``first_sighting``
-    anomalies on every IOC's next beacon — re-triggering the disconnect
-    storm we share singletons to avoid. Only call this when you mean
-    "I'm done with epics-rs entirely for now". Active PVs continue to
-    work because they hold their own ``Arc<Runtime>`` references; they
-    just keep the dropped client alive until they too are released.
+    **Refuses while active PVs exist**. Each context exposes
+    ``is_unused()``; if either still holds live ``EpicsRsPV`` /
+    ``EpicsRsPvaPV`` wrappers, ``RuntimeError`` is raised. This guards
+    against the silent multi-client regression that otherwise lurks:
+    after ``shutdown_all`` the singleton slot is empty, but Rust-side
+    the old ``CaClient`` stays alive (PVs strongly reference it). The
+    next ``get_ca_context()`` would construct a *new* ``CaClient``,
+    re-triggering the ``first_sighting`` beacon-anomaly chain that
+    sharing singletons (commit 001c605) was meant to prevent.
+
+    Drop order: clear the singleton slots inside the lock, then drop
+    the contexts *outside* it so a slow Rust ``Drop`` doesn't block
+    other threads' ``get_*_context()`` calls.
     """
     global _ca_context, _pva_context
     with _lock:
+        ca, pva = _ca_context, _pva_context
+        if ca is not None and not ca.is_unused():
+            raise RuntimeError(
+                "shutdown_all: CA context still has active EpicsRsPV "
+                "wrappers — release every PV first, otherwise the next "
+                "get_ca_context() would silently construct a second "
+                "CaClient and re-trigger the multi-client beacon-anomaly bug."
+            )
+        if pva is not None and not pva.is_unused():
+            raise RuntimeError(
+                "shutdown_all: PVA context still has active EpicsRsPvaPV "
+                "wrappers — release every PV first."
+            )
         _ca_context = None
         _pva_context = None
+    # Drop outside the lock so any lengthy Rust teardown (background
+    # task drain, socket close) doesn't block concurrent get_*_context().
+    del ca
+    del pva

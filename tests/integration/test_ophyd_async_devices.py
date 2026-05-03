@@ -162,7 +162,9 @@ async def test_async_device_parallel_connect_three_detectors():
     # Localhost steady state: ~100–500 ms. Ceiling 5 s absorbs one
     # mid-test reconnect from the upstream beacon-anomaly chain
     # (epics-ca-rs first_sighting → EchoProbe → 5 s echo timeout →
-    # TcpClosed; see _contexts.py). Loose enough to ride out IOC
-    # turbulence, tight enough to catch a serial regression (9 PVs
-    # sequentially against a real IOC would take >> 5 s).
+    # TcpClosed; see _contexts.py). The 1 s print warning surfaces
+    # the "in-between" zone — under 5 s so it doesn't fail, but
+    # slow enough to investigate if it shows up on every run.
+    if dt > 1.0:
+        print(f"  WARN: 9 PV connect took {dt:.2f}s — investigate if persistent")
     assert dt < 5.0

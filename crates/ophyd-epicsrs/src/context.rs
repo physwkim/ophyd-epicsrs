@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use pyo3::exceptions::PyRuntimeError;
@@ -26,6 +27,14 @@ use crate::pv::EpicsRsPV;
 pub struct EpicsRsContext {
     pub(crate) runtime: Arc<Runtime>,
     pub(crate) client: Arc<CaClient>,
+    /// Live ``EpicsRsPV`` wrapper count. Incremented in ``create_pv``
+    /// and decremented in ``EpicsRsPV::drop``. Surfaces through
+    /// ``is_unused()`` so ``ophyd_epicsrs.shutdown_all()`` can refuse
+    /// to drop the singleton while channels are still alive — without
+    /// it, the next ``get_ca_context()`` would silently spawn a second
+    /// ``CaClient`` and re-trigger the multi-client beacon-anomaly bug
+    /// (the singleton fix in 001c605 was meant to prevent).
+    pv_count: Arc<AtomicUsize>,
 }
 
 #[pymethods]
@@ -57,13 +66,27 @@ impl EpicsRsContext {
         Ok(Self {
             runtime,
             client: Arc::new(client),
+            pv_count: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    /// True iff no ``EpicsRsPV`` wrappers created from this context
+    /// are currently alive. Used by ``shutdown_all`` to refuse
+    /// dropping the singleton while channels are still in use.
+    fn is_unused(&self) -> bool {
+        self.pv_count.load(Ordering::Acquire) == 0
     }
 
     /// Create a PV channel for the given name.
     fn create_pv(&self, pvname: &str) -> EpicsRsPV {
         let channel = self.client.create_channel(pvname);
-        EpicsRsPV::new(self.runtime.clone(), channel, pvname.to_string())
+        self.pv_count.fetch_add(1, Ordering::AcqRel);
+        EpicsRsPV::new(
+            self.runtime.clone(),
+            channel,
+            pvname.to_string(),
+            self.pv_count.clone(),
+        )
     }
 
     /// Read multiple PVs in parallel. Returns a dict of {pvname: value}.

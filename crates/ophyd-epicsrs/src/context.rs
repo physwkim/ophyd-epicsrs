@@ -127,9 +127,18 @@ impl EpicsRsContext {
                     if ch.wait_connected(dur).await.is_err() {
                         return (pvname, None);
                     }
-                    match ch.get().await {
-                        Ok((_dbr, val)) => (pvname, Some(val)),
-                        Err(_) => (pvname, None),
+                    // Apply the user-supplied timeout to the actual read
+                    // too — `CaChannel::get()` has no built-in deadline,
+                    // so a single stuck channel (e.g. mid-reconnect from
+                    // the upstream beacon-anomaly chain — see
+                    // python/ophyd_epicsrs/_contexts.py) used to block
+                    // bulk_caget for ~30 s while the rest of the parallel
+                    // reads sat idle. Now each spawned read fails fast at
+                    // `dur` and the bulk call returns within the budget
+                    // the user actually asked for.
+                    match tokio::time::timeout(dur, ch.get()).await {
+                        Ok(Ok((_dbr, val))) => (pvname, Some(val)),
+                        _ => (pvname, None),
                     }
                 }));
             }

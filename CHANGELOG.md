@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.6.9 (2026-05-03)
+
+### Bug fixes
+
+- **`bulk_caget` per-read timeout**: `CaChannel::get()` had no built-in
+  deadline, so `bulk_caget(timeout=N)` only applied `N` to
+  `wait_connected` — a single channel stuck mid-reconnect (upstream
+  beacon-anomaly chain — see `python/ophyd_epicsrs/_contexts.py`)
+  would block the whole bulk call for ~30 s while the rest of the
+  parallel reads sat idle. Now wraps each `ch.get()` in
+  `tokio::time::timeout(dur, …)` so reads fail fast at the user-
+  supplied budget.
+
+### Dependencies
+
+- **epics-rs 0.13.1 → 0.13.4** (transitive: `epics-base-rs`,
+  `epics-ca-rs`, `epics-pva-rs`, `epics-macros-rs` all to 0.13.4).
+
+### Test suite hygiene
+
+- **README**: replaced direct `EpicsRsContext()` / `EpicsRsPvaContext()`
+  examples with `get_ca_context()` / `get_pva_context()` so users can't
+  silently bypass the singleton (4 sites). Key types section now
+  documents the singleton invariant.
+- **Performance tests**: hardened against beacon-anomaly storms — perf
+  budgets keep their soft warning print but skip the test on a 5×
+  ceiling miss, so a transient outage no longer surfaces as a perf
+  regression in CI.
+- **`test_bulk_caget_many_pvs`**: skips after the single retry if the
+  IOC is genuinely unreachable (was failing on persistent None).
+- **`test_dcm_device_composition`**: skips on connect timeout instead
+  of failing — the contract under test is Device composition, not
+  connect latency under network turbulence.
+- **`test_quad_bpm_device`**: removed (the IOC db never exposed those
+  PVs under any of the candidate prefixes, so the test only ever
+  skipped).
+
 ## v0.6.8 (2026-05-03)
 
 ### Dependency upgrade

@@ -230,9 +230,9 @@ checksum = "c34f04666d835ff5d62e058c3995147c06f42fe86ff053337632bca83e42702d"
 
 [[package]]
 name = "epics-base-rs"
-version = "0.13.1"
+version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3ffa943d749ae5c89a56c891de5865506d678f7f6395958412f4aac8417067d"
+checksum = "3ad29d3787a156bde71ff2f90da4e881d6cf9cbe14ef4cd311b19429af144891"
 dependencies = [
  "bytes",
  "chrono",
@@ -250,9 +250,9 @@ dependencies = [
 
 [[package]]
 name = "epics-ca-rs"
-version = "0.13.1"
+version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "734727d1334743e9ad22edfc143bbd4e5e6cbde58083edaf04e052d75d821850"
+checksum = "1e879499e7ab846749132fcbc0bb914eb3634493b8429f871b6f3f0485339ba7"
 dependencies = [
  "async-trait",
  "chrono",
@@ -268,9 +268,9 @@ dependencies = [
 
 [[package]]
 name = "epics-macros-rs"
-version = "0.13.1"
+version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e9d307333bdc57b2564f2f0bb1fe21db05510eb848767ff4a615e1a5174ad79"
+checksum = "71e89804e30113a3d8fb7d621752d37a085408aed00af6e7f2f65d3d2a2346ef"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -280,9 +280,9 @@ dependencies = [
 
 [[package]]
 name = "epics-pva-rs"
-version = "0.13.1"
+version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9af049af79e53af88f512a878d2b2fbc229e54c637d842062dd87479b9093f7"
+checksum = "0a09355e46d7ca1a46ac32c98fe1b5ba2569de676bcffefa3f0a1c3722b5c868"
 dependencies = [
  "bytes",
  "chrono",
@@ -307,9 +307,9 @@ dependencies = [
 
 [[package]]
 name = "epics-rs"
-version = "0.13.1"
+version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ae880924e917366ab2214380fdea7ef54a5f707cb07fdf07b25e0f7526255d3"
+checksum = "03d3d9c8d2beef0331f6c67c90a3dc0557c6c6b429197122ee209e4e57391ed4"
 dependencies = [
  "epics-base-rs",
  "epics-ca-rs",
@@ -692,7 +692,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "ophyd-epicsrs"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "epics-rs",
  "parking_lot",

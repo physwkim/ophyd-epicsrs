@@ -116,15 +116,12 @@ same tokio runtime as the sync path — no runtime fragmentation, same
 channel cache, mixed use against the same PV is safe.
 
 ```python
-from ophyd_epicsrs._native import EpicsRsContext, EpicsRsPvaContext
+from ophyd_epicsrs import get_ca_context, get_pva_context
 import asyncio
 
-ctx_ca = EpicsRsContext()
-ctx_pva = EpicsRsPvaContext()
-
 async def main():
-    pv_ca = ctx_ca.create_pv("IOC:motor.RBV")
-    pv_pva = ctx_pva.create_pv("IOC:nt:scalar")
+    pv_ca = get_ca_context().create_pv("IOC:motor.RBV")
+    pv_pva = get_pva_context().create_pv("IOC:nt:scalar")
 
     # Wait for connection in parallel
     ok_ca, ok_pva = await asyncio.gather(
@@ -161,9 +158,9 @@ remains unchanged — existing ophyd code works exactly as before.
 Read multiple PVs concurrently in a single call. All CA requests are sent simultaneously using tokio async, completing in one network round-trip instead of N sequential reads.
 
 ```python
-from ophyd_epicsrs import EpicsRsContext
+from ophyd_epicsrs import get_ca_context
 
-ctx = EpicsRsContext()
+ctx = get_ca_context()
 data = ctx.bulk_caget([
     "IOC:enc_wf",
     "IOC:I0_wf",
@@ -179,12 +176,12 @@ data = ctx.bulk_caget([
 Combine `bulk_caget` with [bluesky-dataforge](https://github.com/physwkim/bluesky-dataforge)'s `AsyncMongoWriter` for maximum fly scan throughput:
 
 ```python
-from ophyd_epicsrs import EpicsRsContext
+from ophyd_epicsrs import get_ca_context
 from bluesky_dataforge import AsyncMongoWriter
 import numpy as np
 import time
 
-ctx = EpicsRsContext()
+ctx = get_ca_context()
 writer = AsyncMongoWriter("mongodb://localhost:27017", "metadatastore")
 RE.subscribe(writer)  # replaces RE.subscribe(db.insert)
 
@@ -410,7 +407,7 @@ ophyd (sync)              ophyd-async (asyncio)
 
 ### Key types
 
-- **`EpicsRsContext`** / **`EpicsRsPvaContext`** — Shared tokio runtime + CA / PVA client. One of each per session.
+- **`EpicsRsContext`** / **`EpicsRsPvaContext`** — Shared tokio runtime + CA / PVA client. **Process-wide singleton** — obtain via `ophyd_epicsrs.get_ca_context()` / `get_pva_context()`, do not construct directly. Multiple clients in one process trip spurious `first_sighting` beacon anomalies in `epics-ca-rs` that drop healthy TCP circuits under load. `shutdown_all()` releases the singletons (refuses while any PV wrapper is alive).
 - **`EpicsRsPV`** / **`EpicsRsPvaPV`** — PV channel wrappers. Sync surface (`wait_for_connection`, `get_with_metadata`, `put`, `add_monitor_callback`) plus `*_async` siblings.
 - **`ophyd_epicsrs.ophyd_async.EpicsRsSignalBackend`** — `ophyd-async` `SignalBackend` implementation; routes `pva://` / `ca://` / bare names to the appropriate native client and applies the datatype-aware converter for the requested ophyd-async type. The factory functions (`epicsrs_signal_rw` etc.) wrap this and are the recommended entry point.
 

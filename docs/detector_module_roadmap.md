@@ -7,7 +7,7 @@ The next step for ophyd-epicsrs: introduce a new `ophyd_epicsrs.detector` module
 ### Current ophyd-epicsrs (v0.5.x)
 - Swaps ophyd's control layer to a Rust CA backend via `use_epicsrs()`
 - All existing ophyd Devices and plans run unchanged
-- Performance gains: GIL-free I/O, `bulk_caget` (~1500x), `bulk_connect_and_prefetch`
+- Performance gains: GIL-free I/O, `bulk_get` / `bulk_get_async` (~17× CA, ~38× PVA vs aioca/p4p at 100 PVs LAN), `bulk_connect_and_prefetch`
 - Limitation: still inherits ophyd's `ADBase` / `ADComponent` / Plugin tree, so adding a new detector carries heavy boilerplate and plugin-chain rewiring
 
 ### Backend readiness (epics-rs, post 2026-04-29 closeout)

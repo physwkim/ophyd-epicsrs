@@ -4,16 +4,23 @@ markdown-ready table to stdout.
 
 Both backends measure the exact same PV pool, on the exact same
 machine, with warm channels (each PV is connected and one read is
-issued before timing starts). This makes the comparison apples-to-
-apples: cold-vs-warm or first-vs-cached-monitor mismatches were the
-issue with previous benchmark numbers in the README.
+issued before timing starts). For the pyepics side, every timed
+``PV.get`` call passes ``use_monitor=False`` so we measure a fresh
+CA round-trip — pyepics's default ``PV.get()`` returns the locally
+cached monitor value (~2 µs Python attribute access), which is a
+different operation from ophyd-epicsrs's ``get_with_metadata`` and
+makes the two columns non-comparable. ``epics.caget()`` already
+defaults to ``use_monitor=False`` so the loop variant needs no
+flag.
 
 Usage:
-    python tests/integration/bench_vs_pyepics.py
+    python examples/bench_vs_pyepics.py
 """
 
 from __future__ import annotations
 
+import asyncio
+import os
 import statistics
 import time
 
@@ -88,29 +95,29 @@ def _percentiles(samples_us: list[float]) -> tuple[float, float, float]:
 def bench_pyepics():
     print("\n=== pyepics ===")
 
-    # ── Single PV warm get latency ───────────────────────────────────
+    # ── Single PV warm get latency (fresh CA read, not cached monitor)
     pv = epics.PV(SINGLE_PV)
     pv.wait_for_connection(timeout=5.0)
-    pv.get()  # warm
+    pv.get(use_monitor=False)  # warm
     samples = []
     for _ in range(N_GET_SAMPLES):
         t = time.perf_counter()
-        pv.get()
+        pv.get(use_monitor=False)
         samples.append((time.perf_counter() - t) * 1e6)
     p50, p95, p99 = _percentiles(samples)
-    print(f"single warm get:  p50={p50:.0f}µs  p95={p95:.0f}µs  p99={p99:.0f}µs")
+    print(f"single warm get:  p50={p50:.0f}µs  p95={p95:.0f}µs  p99={p99:.0f}µs  (fresh)")
 
-    # ── Sequential gets across PV_POOL[:N] ─────────────────────────────
+    # ── Sequential gets across PV_POOL[:N] (fresh reads) ──────────────
     # Pre-connect + warm
     pvs = [epics.PV(name) for name in PV_POOL]
     for p in pvs:
         p.wait_for_connection(timeout=5.0)
-        p.get()
+        p.get(use_monitor=False)
     for n in (10, 25, 48):
         subset = pvs[:n]
         t0 = time.perf_counter()
         for p in subset:
-            p.get()
+            p.get(use_monitor=False)
         dt_ms = (time.perf_counter() - t0) * 1000
         print(
             f"sequential get(N={n}):  {dt_ms:.2f} ms  ({dt_ms / n * 1000:.1f} µs/PV)"
@@ -146,14 +153,14 @@ def bench_epicsrs():
     pv.wait_for_connection(timeout=5.0)
     pv.get_with_metadata(timeout=2.0)  # warm
 
-    # ── Single PV warm get latency ──────────────────────────────────
+    # ── Single PV warm get latency (always fresh CA read) ────────────
     samples = []
     for _ in range(N_GET_SAMPLES):
         t = time.perf_counter()
         pv.get_with_metadata(timeout=2.0)
         samples.append((time.perf_counter() - t) * 1e6)
     p50, p95, p99 = _percentiles(samples)
-    print(f"single warm get:  p50={p50:.0f}µs  p95={p95:.0f}µs  p99={p99:.0f}µs")
+    print(f"single warm get:  p50={p50:.0f}µs  p95={p95:.0f}µs  p99={p99:.0f}µs  (fresh)")
 
     # ── Sequential get_with_metadata across PV_POOL[:N] ───────────────
     pvs = [ctx.create_pv(name) for name in PV_POOL]
@@ -170,19 +177,54 @@ def bench_epicsrs():
             f"sequential get(N={n}):  {dt_ms:.2f} ms  ({dt_ms / n * 1000:.1f} µs/PV)"
         )
 
-    # ── bulk_caget(N) ────────────────────────────────────────────────
+    # ── bulk_get(N) — warm + median-of-20, matching bench_vs_aioca_p4p.py
+    # so the two scripts report the same steady-state metric. The first
+    # call's result is asserted non-None so the timing rows can't be
+    # silently faking a fast path on empty dicts.
     for n in (10, 25, 48):
         names = PV_POOL[:n]
-        t0 = time.perf_counter()
-        ctx.bulk_caget(names, timeout=3.0)
-        dt_ms = (time.perf_counter() - t0) * 1000
+        warm_result = ctx.bulk_get(names, timeout=3.0)  # warm + sanity check
+        assert all(v is not None for v in warm_result.values()), (
+            f"bulk_get(N={n}) returned None for "
+            f"{[k for k, v in warm_result.items() if v is None]}"
+        )
+        per_call_us = []
+        for _ in range(20):
+            t = time.perf_counter()
+            ctx.bulk_get(names, timeout=3.0)
+            per_call_us.append((time.perf_counter() - t) * 1e6)
+        med_us = statistics.median(per_call_us)
         print(
-            f"bulk_caget(N={n}):  {dt_ms:.2f} ms  ({dt_ms / n * 1000:.1f} µs/PV)"
+            f"bulk_get(N={n}):  {med_us / 1000:.2f} ms  ({med_us / n:.1f} µs/PV, median of 20)"
+        )
+
+    # ── bulk_get_async(N) — awaitable variant; one asyncio.run covers
+    # all N so event-loop setup amortizes.
+    async def _time_all_bulk_async():
+        out = []
+        for nn in (10, 25, 48):
+            nms = PV_POOL[:nn]
+            await ctx.bulk_get_async(nms, timeout=3.0)  # warm
+            per_call_us_a = []
+            for _ in range(20):
+                t = time.perf_counter()
+                await ctx.bulk_get_async(nms, timeout=3.0)
+                per_call_us_a.append((time.perf_counter() - t) * 1e6)
+            out.append((nn, statistics.median(per_call_us_a)))
+        return out
+
+    for n, med_us in asyncio.run(_time_all_bulk_async()):
+        print(
+            f"bulk_get_async(N={n}):  {med_us / 1000:.2f} ms  ({med_us / n:.1f} µs/PV, median of 20)"
         )
 
 
 if __name__ == "__main__":
     print(f"PV pool size: {len(PV_POOL)}")
     print(f"Sample count for latency: {N_GET_SAMPLES}")
+    addr_list = os.environ.get("EPICS_CA_ADDR_LIST", "(unset — broadcast)")
+    auto_addr = os.environ.get("EPICS_CA_AUTO_ADDR_LIST", "(unset — default YES)")
+    print(f"EPICS_CA_ADDR_LIST: {addr_list}")
+    print(f"EPICS_CA_AUTO_ADDR_LIST: {auto_addr}")
     bench_pyepics()
     bench_epicsrs()

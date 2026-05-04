@@ -153,15 +153,20 @@ Available async methods on both CA and PVA wrappers:
 The sync surface (`wait_for_connection`, `get_with_metadata`, `put`, etc.)
 remains unchanged — existing ophyd code works exactly as before.
 
-## Parallel PV Read (bulk_caget)
+## Parallel PV Read (`bulk_get` / `bulk_get_async`)
 
-Read multiple PVs concurrently in a single call. All CA requests are sent simultaneously using tokio async, completing in one network round-trip instead of N sequential reads.
+Read multiple PVs concurrently in a single call. Per-server READ_NOTIFY frames are batched into one TCP write (libca-style flush) and the GIL is released for the entire round-trip — measured at **1.4 µs/PV (CA)** and **0.7 µs/PV (PVA)** at 100 PVs.
+
+Both protocols share the same API. CA → `EpicsRsContext`, PVA → `EpicsRsPvaContext`. Each context exposes:
+
+- `bulk_get(names, timeout=5.0) -> dict[str, value | None]` — sync (blocks the calling thread, GIL released; safe for ophyd / threading workflows)
+- `bulk_get_async(names, timeout=5.0) -> Awaitable[dict]` — returns a Python awaitable (asyncio / ophyd-async / RunEngine integration; does not block the event loop)
 
 ```python
 from ophyd_epicsrs import get_ca_context
 
 ctx = get_ca_context()
-data = ctx.bulk_caget([
+data = ctx.bulk_get([
     "IOC:enc_wf",
     "IOC:I0_wf",
     "IOC:ROI1:total_wf",
@@ -169,11 +174,18 @@ data = ctx.bulk_caget([
     # ... 수십~수백 개 PV
 ], timeout=5.0)
 # Returns dict: {"IOC:enc_wf": array, "IOC:I0_wf": array, ...}
+
+# asyncio / ophyd-async path
+async def collect():
+    data = await ctx.bulk_get_async(names, timeout=5.0)
+    ...
 ```
+
+Failed PVs (timeout / disconnect) appear in the dict as `None` — the caller can distinguish "missing key" from "read failed".
 
 ### Fly Scan Acceleration
 
-Combine `bulk_caget` with [bluesky-dataforge](https://github.com/physwkim/bluesky-dataforge)'s `AsyncMongoWriter` for maximum fly scan throughput:
+Combine `bulk_get` with [bluesky-dataforge](https://github.com/physwkim/bluesky-dataforge)'s `AsyncMongoWriter` for maximum fly scan throughput:
 
 ```python
 from ophyd_epicsrs import get_ca_context
@@ -190,7 +202,7 @@ def collect_pages(self):
     # 1. Parallel PV read — all waveforms in ~1ms
     pvnames = [self.enc_wf_pv, self.i0_wf_pv]
     pvnames += [f"ROI{r}:total_wf" for r in range(1, self.numROI + 1)]
-    raw = ctx.bulk_caget(pvnames)
+    raw = ctx.bulk_get(pvnames)
 
     # 2. Deadtime correction (numpy, fast)
     enc = np.array(raw[self.enc_wf_pv])[:self.numPoints]
@@ -217,95 +229,119 @@ def collect_pages(self):
 writer.flush()  # wait for all pending inserts after scan
 ```
 
-**Before (sequential):**
-```
-read PV1 (30ms) → read PV2 (30ms) → ... → read PV50 (30ms) = 1500ms
-yield row1 → db.insert (5ms) → yield row2 → db.insert (5ms) → ... = 500ms
-Total: ~2000ms
-```
-
-**After (parallel + EventPage):**
-```
-bulk_caget(50 PVs) = 1ms
-numpy deadtime = 1ms
-yield 1 EventPage → AsyncMongoWriter.enqueue → 0.1ms
-Total: ~2ms (Python free), MongoDB insert continues in background
-```
-
 ## Performance
 
-### Versus pyepics — honest like-for-like benchmark
+All numbers below are reproducible. Same machine (Apple Silicon),
+same mini-beamline IOC over LAN, same PV pool, warm channel state,
+median of 20 timed calls. Single-PV latency rows use 200/500 samples.
+Run `examples/bench_vs_aioca_p4p.py` and `examples/bench_vs_pyepics.py`
+to regenerate.
 
-Run on the same machine, same mini-beamline IOC, same PV pool, same
-connection state (warm). Reproducible from
-`tests/integration/bench_vs_pyepics.py`:
+### CA: ophyd-epicsrs vs aioca
 
-| Operation | pyepics | epicsrs | Comment |
-|-----------|---------|---------|---------|
-| Single PV cached get (`PV.get()` after monitor) | **p50 2 µs** | p50 61 µs | pyepics returns the cached monitor value with no network round-trip; `EpicsRsPV.get_with_metadata` always issues a fresh CA read. Different semantics. |
-| Single PV fresh CA read | ~100 µs avg (`epics.caget()`) | **p50 61 µs** | Same network round-trip; epicsrs releases the GIL during the read. |
-| Sequential fresh reads, 48 PVs (`caget` loop) | 4.71 ms | **2.28 ms** | 2.1× — fewer C↔Python crossings + per-call GIL releases. |
-| `bulk_caget(48)` | n/a (no bulk primitive) | **2.60 ms** | Same wall time as the sequential loop above because the IOC + LAN are fast enough that the per-PV GIL drops dominate; the *real* `bulk_caget` win is at higher latencies (see flyer scenario below). |
+100 PVs from the mini-beamline IOC. Both backends issue fresh CA
+READ_NOTIFY round-trips (no value cache).
 
-**Where the much larger speedups show up:**
+| Operation | aioca | ophyd-epicsrs | ratio |
+|-----------|-------|---------------|-------|
+| Single warm get (fresh CA read) | p50 **97 µs** | p50 **71 µs** | 1.4× |
+| Bulk read 100 PVs (sync) | 2434 µs (24.3 µs/PV) | **142 µs** (1.4 µs/PV) | **17×** |
+| Bulk read 100 PVs (async) | n/a (no bulk primitive) | **163 µs** (1.6 µs/PV) | — |
+| Connect 100 PVs | 40.4 ms (`connect+1get`) | **5.5 ms** | **7×** |
 
-- **Sluggish IOC / WAN link, 50 PVs.** Sequential pyepics adds N
-  round-trip latencies; `bulk_caget` adds one. At 30 ms RTT this is
-  the difference between ~1.5 s and ~30 ms — the original "1500×"
-  number in earlier README revisions came from this regime, but it
-  was not labelled honestly.
-- **Device connect with many PVs.** The legacy ophyd path issues
-  per-PV `wait_for_connection` calls serialised by the GIL.
-  `bulk_connect_and_prefetch` collects all unconnected PVs and
-  connects them concurrently in a single tokio call — see
-  *Device-level bulk connect* below.
-- **Mixed sync + async usage in the same process.** With pyepics +
-  aioca/p4p, you pay for two separate EPICS stacks (separate
-  channels, separate threads). With epicsrs both surfaces share one
-  backend.
+aioca has no `connect-without-get`, so its "connect" line includes
+one full read. Even bench_aioca's `caget(list)` issues N concurrent
+ops via `asyncio.gather` — the 17× gap on bulk read comes from
+batching frames into a single TCP write per server and avoiding
+per-PV libca callback dispatch.
 
-**Where pyepics wins:** the cached-monitor `PV.get()` path. If your
-hot loop is reading a value that already has an active monitor and
-you don't need fresh metadata, pyepics's in-process cache is hard to
-beat. `EpicsRsShimPV.get` (the legacy-ophyd surface) does cache
-monitor values too, so the gap mostly closes when you go through the
-ophyd Signal layer rather than calling `_native.get_with_metadata`
-directly.
+### PVA: ophyd-epicsrs vs p4p
 
-The put→get improvement (single-owner writer task + `TCP_NODELAY`)
-remains unchanged from earlier releases — it eliminates the ~45 ms
-head-of-line blocking that occurred when reads waited for writes to
-flush.
+| Operation | p4p | ophyd-epicsrs | ratio |
+|-----------|-----|---------------|-------|
+| Single warm get (fresh) | p50 **107 µs** | p50 **91 µs** | 1.2× |
+| Per-PV `await` × 100 (gather) | 2703 µs (27.0 µs/PV) | 2539 µs (25.4 µs/PV) | 1.1× |
+| Bulk read 100 PVs (sync) | n/a | **72 µs** (0.7 µs/PV) | **38×** vs `Context.get(list)` |
+| Bulk read 100 PVs (async) | n/a | **90 µs** (0.9 µs/PV) | — |
+| Connect 100 PVs | 15.6 ms (`connect+1get`) | **1.9 ms** | **8×** |
 
-### Reproducible mini-beamline measurements
+`Context.get([list])` in p4p does parallel issue under the hood but
+each PV is its own op object with its own callback — no protocol-
+level batched get exists in PVA, so the win is again in how
+ophyd-epicsrs collapses N ops into one Rust spawn + one `pvget_many`.
 
-The integration suite (`tests/integration/test_performance.py`)
-measures a fixed set of operations against the mini-beamline IOC from
-[epics-rs/examples/mini-beamline](https://github.com/epics-rs/epics-rs/tree/main/examples/mini-beamline).
-Anyone can reproduce these numbers — just run the integration suite
-locally with the IOC up, or trigger the nightly CI workflow. Numbers
-below are local Apple Silicon, IOC and tests on the same host:
+### CA: ophyd-epicsrs vs pyepics
 
-| Operation | Result |
-|-----------|--------|
-| Single `get_with_metadata` latency (200 samples) | p50 **54 µs** · p95 **81 µs** · p99 **135 µs** |
-| `bulk_caget(10)` | **0.63 ms** (63 µs/PV) |
-| `bulk_caget(25)` | **1.32 ms** (53 µs/PV) |
-| `bulk_caget(48)` | **2.63 ms** (55 µs/PV) |
-| ophyd-async parallel connect (30 PVs) | **4.1 ms** |
-| ophyd-async parallel connect (3 × StandardReadable, 9 PVs) | **3.4 ms** |
-| ophyd sync `Device` connect (4 components) | **55 ms** |
-| ophyd sync `Device` connect (DCM, 9 PVs incl. 3 motors) | **51 ms** |
-| ophyd sync `Device` connect (areaDetector cam, 11 PVs) | **52 ms** |
+48 PVs, fresh CA reads on both sides (pyepics calls use
+`use_monitor=False` so we are NOT comparing against the cached
+attribute path).
 
-Note the ~15× gap between ophyd-async parallel connect (4 ms for 30
-PVs) and ophyd sync `Device.wait_for_connection` (~50 ms for 9–11 PVs):
-both go through the same `_native` backend, but the sync path issues
-per-PV `wait_for_connection` calls serialised by the GIL, while the
-async path's `asyncio.gather(...)` overlaps every PV's connect inside
-the single tokio runtime. Mixed sync + async usage works (same
-backend, same circuit per IOC), so the recommended migration path is
-"new device classes in ophyd-async, legacy classes left as-is".
+| Operation | pyepics | ophyd-epicsrs | ratio |
+|-----------|---------|---------------|-------|
+| Single warm get (fresh CA read) | p50 **63 µs** | p50 **96 µs** | 0.66× |
+| Sequential 48 × `PV.get` | 2.95 ms (61 µs/PV) | 3.05 ms (64 µs/PV) | 0.97× |
+| Loop 48 × `epics.caget(name)` | 5.09 ms (106 µs/PV) | n/a — use `bulk_get` | — |
+| Bulk read 48 PVs (sync) | n/a (no bulk primitive) | **0.08 ms** (1.8 µs/PV) | **60×** vs `epics.caget` loop |
+| Bulk read 48 PVs (async) | n/a | **0.11 ms** (2.3 µs/PV) | — |
+
+pyepics is the closest competitor on single-PV fresh-read latency —
+libca via ctypes is a thin wrapper, so the network round-trip
+dominates and there is no Python overhead to remove. **The dramatic
+gains live in the bulk APIs and connect time, not single-PV
+latency.**
+
+### Where the gains come from
+
+- **Bulk reads (1.4 µs/PV CA, 0.7 µs/PV PVA at 100 PVs).** Per-server
+  READ_NOTIFY frames are batched into one TCP write (libca-style
+  flush). aioca/p4p issue per-PV ops via `asyncio.gather` — each
+  pays callback dispatch + GIL crossings.
+- **Connect time.** aioca/p4p have no `connect-without-get`, so
+  connect cost includes a full read round-trip. ophyd-epicsrs
+  separates them; raw connect on 100 PVs = 5.5 ms (CA) / 1.9 ms (PVA).
+- **Single tokio runtime for CA + PVA.** No double EPICS stack
+  overhead in mixed sync/async workflows. With pyepics + aioca/p4p
+  you carry separate channels and separate threads per backend.
+- **GIL-released bulk paths.** Both `bulk_get` (sync, blocks calling
+  thread but releases GIL) and `bulk_get_async` (asyncio-friendly)
+  issue all network I/O outside the GIL.
+
+### Where it does NOT help
+
+- **Single warm cached-monitor reads.** pyepics `PV.get()` with
+  `auto_monitor=True` returns a Python attribute (~2 µs). The
+  ophyd-epicsrs counterpart is `EpicsRsShimPV.get` going through the
+  ophyd Signal layer (which caches monitor values too); bare
+  `EpicsRsPV.get_with_metadata` always hits the wire by design.
+- **Single fresh CA read.** Within ±50% of pyepics (±25% of aioca).
+  Network round-trip dominates; per-call Python overhead is in the
+  noise.
+
+### `bulk_get` vs `bulk_get_async`
+
+The async variant adds ~15-25 µs over the sync variant per call
+(asyncio task scheduling + `future_into_py_fast` overhead). Use
+`bulk_get_async` when you need the calling event loop to keep
+servicing other coroutines during the round-trip — the canonical
+case is a RunEngine plan that interleaves bulk reads with monitor
+callbacks, motor-move waits, or other devices' I/O. For sync ophyd
+or threading workflows, `bulk_get` is strictly cheaper.
+
+### Reproducibility & honest framing
+
+- Single-PV `single warm get` rows are intentionally **fresh** reads
+  on both sides. pyepics `PV.get()` defaults to
+  `use_monitor=True` (returns the cached monitor attribute, ~2 µs);
+  the bench script overrides this with `use_monitor=False`, and
+  ophyd-epicsrs's `get_with_metadata` always issues a wire round-trip
+  by design.
+- Bulk paths are warmed once before the timed loop populates the
+  internal channel cache — the median-of-20 number is the
+  steady-state per-call cost, NOT including the first call's connect
+  and channel-cache fill (~1 ms for 100 PVs).
+- The benchmark scripts assert `all(v is not None for v in result.values())`
+  before timing, so a regressed empty-dict fast path cannot silently
+  inflate the numbers.
 
 ## Advantages over pyepics backend
 
@@ -351,7 +387,7 @@ The speedup scales with PV count — a 200-PV areaDetector Device initializes in
 
 ### GIL-released bulk read
 
-`bulk_caget` reads multiple PVs concurrently using tokio `join_all`, completing in a single network round-trip with the GIL released. See the [Parallel PV Read](#parallel-pv-read-bulk_caget) section above.
+`bulk_get` (sync) and `bulk_get_async` (asyncio) read multiple PVs concurrently using tokio `join_all`, completing in a single network round-trip with the GIL released. See the [Parallel PV Read](#parallel-pv-read-bulk_get--bulk_get_async) section above.
 
 ## Reliability
 
@@ -402,7 +438,7 @@ ophyd (sync)              ophyd-async (asyncio)
 | Monitor receive | **released** — tokio background task |
 | Monitor callback → Python | **held** — dispatch thread |
 | Connection wait | **released** — tokio async |
-| bulk_caget | **released** — tokio join_all |
+| bulk_get / bulk_get_async | **released** — tokio join_all |
 | `*_async` methods | **released** — `pyo3-async-runtimes` future |
 
 ### Key types

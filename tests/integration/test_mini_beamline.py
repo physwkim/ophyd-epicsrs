@@ -102,10 +102,10 @@ def test_pva_put_and_readback(pva_ctx):
     assert abs(last["value"] - 0.456) < 1e-6, f"rbv={last['value']}"
 
 
-# ---------- bulk_caget ----------
+# ---------- bulk_get ----------
 
 
-def test_bulk_caget_many_pvs(ca_ctx):
+def test_bulk_get_many_pvs(ca_ctx):
     """Single call should hand back a dict of {name: value} faster than
     a sequential read loop."""
     pvs = [
@@ -125,13 +125,13 @@ def test_bulk_caget_many_pvs(ca_ctx):
         "mini:BraggThetaRdbkAO",
         "mini:BraggLambdaRdbkAO",
     ]
-    # Warm: ensure connected first (bulk_caget itself can connect, but timing
+    # Warm: ensure connected first (bulk_get itself can connect, but timing
     # the read alone is what we care about).
     for name in pvs:
         ca_ctx.create_pv(name).wait_for_connection(timeout=3.0)
 
     t0 = time.perf_counter()
-    data = ca_ctx.bulk_caget(pvs, timeout=3.0)
+    data = ca_ctx.bulk_get(pvs, timeout=3.0)
     bulk_dt = time.perf_counter() - t0
 
     assert set(data.keys()) == set(pvs)
@@ -141,20 +141,20 @@ def test_bulk_caget_many_pvs(ca_ctx):
     # first_sighting chain — see _contexts.py). Retry once with a
     # generous per-read timeout. If any are STILL missing after the
     # retry, the IOC is genuinely unreachable for those channels —
-    # skip rather than report as a bulk_caget API failure (the contract
+    # skip rather than report as a bulk_get API failure (the contract
     # under test is "returns dict of {name: value}", verified by the
     # set-equality above; missing values are an upstream symptom).
     if any(v is None for v in data.values()):
         missed = [k for k, v in data.items() if v is None]
-        print(f"  bulk_caget: transient None for {missed} — retrying")
-        data = ca_ctx.bulk_caget(pvs, timeout=10.0)
+        print(f"  bulk_get: transient None for {missed} — retrying")
+        data = ca_ctx.bulk_get(pvs, timeout=10.0)
     if any(v is None for v in data.values()):
         still_missed = [k for k, v in data.items() if v is None]
         pytest.skip(
             f"persistent None reads after retry: {still_missed} — "
-            "transient IOC outage on those channels, not a bulk_caget bug"
+            "transient IOC outage on those channels, not a bulk_get bug"
         )
-    print(f"\n  bulk_caget({len(pvs)}) = {bulk_dt * 1000:.2f} ms")
+    print(f"\n  bulk_get({len(pvs)}) = {bulk_dt * 1000:.2f} ms")
 
 
 # ---------- ophyd (sync) frontend ----------

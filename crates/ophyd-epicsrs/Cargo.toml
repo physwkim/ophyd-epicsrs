@@ -10,8 +10,13 @@ name = "ophyd_epicsrs"
 crate-type = ["cdylib"]
 
 [dependencies]
-epics-rs = { version = "0.14.0", features = ["ca", "pva"] }
+epics-rs = { path = "../../../epics-rs/crates/epics-rs", features = ["ca", "pva"] }
 pyo3 = { version = "0.24", features = ["extension-module", "abi3-py38"] }
+# numpy 0.24 matches pyo3 0.24 — used to return waveform reads as
+# zero-copy ndarrays (PyArray1::from_slice copies once into a numpy
+# buffer; the alternative — PyList of N PyFloats — costs ~100×
+# more on 10k-element arrays). See convert.rs / pva_convert.rs.
+numpy = "0.24"
 # physwkim fork branched from v0.24.0 with the `future_into_py_fast`
 # patch — see docs/pva_single_get_async_perf.md for the rationale and
 # upstream PR target.

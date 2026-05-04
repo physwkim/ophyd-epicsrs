@@ -81,14 +81,18 @@ future that scales to thousands of concurrent gets.
 ## Bulk path is still the answer
 
 For workloads that read more than a handful of PVs, the
-`bulk_get_pvs_pva` API beats both single-call paths by an order of
-magnitude (211µs total for 100 PVs vs 9700µs via gather of 100
-single calls). Document the recommended pattern:
+`bulk_get` / `bulk_get_async` API on `EpicsRsPvaContext` beats both
+single-call paths by an order of magnitude (~72 µs total for 100
+PVs vs ~2.5 ms via gather of 100 single calls). Document the
+recommended pattern:
 
 ```python
-# slow — N async calls
+# slow — N async calls (per-PV await)
 values = await asyncio.gather(*[pv.get_value_async() for pv in pvs])
 
-# fast — single batched call
-values = ctx.bulk_get_pvs_pva(pvs)  # ~2.1 µs/PV
+# fast — single batched call (sync)
+values = ctx.bulk_get([pv.pvname for pv in pvs])      # ~0.7 µs/PV at 100 PVs
+
+# fast — single batched call (asyncio / ophyd-async)
+values = await ctx.bulk_get_async([pv.pvname for pv in pvs])
 ```

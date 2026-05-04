@@ -37,6 +37,49 @@ struct PvaMonitorEvent {
     field: PvField,
 }
 
+/// Shared core for the sync and async ``bulk_get`` paths.
+///
+/// Uses concurrent per-PV ``pvget`` (spawned as N tokio tasks) instead
+/// of ``PvaClient::pvget_many``: the latter takes a batched warm-path
+/// shortcut that, against an ``epics-bridge-rs`` qsrv-fronted IOC,
+/// fails systematically because the server does not honour reused
+/// ``ioid`` GET frames after the first INIT+GET. ``op_get`` (called
+/// by ``pvget``) carries an internal cold-path fallback when the warm
+/// GET returns an error status, so per-PV ``pvget`` works correctly.
+/// Failures (timeout / per-PV error) surface as ``None``.
+///
+/// Performance trade-off: we lose the single-TCP-write batching that
+/// ``pvget_many`` offered on the happy path. For 10 PVs against a
+/// qsrv bridge this means roughly N concurrent op_get calls instead
+/// of one batched call — still issued in parallel via tokio task
+/// scheduling, just with N writer-task hops instead of one. The
+/// correct-but-slightly-slower path is acceptable until ``pvget_many``
+/// gains its own warm-failure cold fallback upstream.
+async fn run_bulk_get_pva(
+    client: PvaClient,
+    pvnames: Vec<String>,
+    dur: Duration,
+) -> Vec<(String, Option<PvField>)> {
+    let mut handles = Vec::with_capacity(pvnames.len());
+    for name in &pvnames {
+        let client = client.clone();
+        let name_owned = name.clone();
+        handles.push(tokio::spawn(async move {
+            tokio::time::timeout(dur, client.pvget(&name_owned))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+        }));
+    }
+
+    let mut results = Vec::with_capacity(pvnames.len());
+    for (name, h) in pvnames.into_iter().zip(handles) {
+        let result = h.await.ok().flatten();
+        results.push((name, result));
+    }
+    results
+}
+
 /// Shared PVA context — Runtime + PvaClient.
 ///
 /// Do NOT construct this directly. Use ``ophyd_epicsrs.get_pva_context()``
@@ -90,18 +133,21 @@ impl EpicsRsPvaContext {
         self.pv_count.load(Ordering::Acquire) == 0
     }
 
-    /// Bulk PVA read by PV names — the PVA counterpart of
-    /// ``EpicsRsContext.bulk_caget``.
+    /// Bulk PVA read — concurrent ``pvget`` on N PV names.
     ///
-    /// Issues N concurrent ``pvget`` operations via ``PvaClient::pvget_many``.
-    /// Channels are cached, so PVs on the same server share one TCP
-    /// connection. Returns ``{pvname: metadata | None}`` — successes
-    /// map to an ``EpicsRsPvaMetadata`` (lazy dict-like wrapper),
-    /// failures to ``None``.
+    /// Spawns N tokio tasks that each call ``PvaClient::pvget``;
+    /// channels are cached inside ``PvaClient`` so PVs on the same
+    /// server share one TCP connection. Bypasses
+    /// ``PvaClient::pvget_many`` — see ``run_bulk_get_pva`` for the
+    /// rationale (qsrv bridge rejects pvget_many's reused-ioid warm
+    /// path on every call after the first). Returns
+    /// ``{pvname: metadata | None}`` — successes map to an
+    /// ``EpicsRsPvaMetadata`` (lazy dict-like wrapper), failures
+    /// (timeout / per-PV error) to ``None``.
     ///
     /// The GIL is released while the concurrent GETs run on tokio.
     #[pyo3(signature = (pvnames, timeout=5.0))]
-    fn bulk_pvaget(
+    fn bulk_get(
         &self,
         py: Python<'_>,
         pvnames: Vec<String>,
@@ -112,25 +158,13 @@ impl EpicsRsPvaContext {
 
         let (tx, rx) = std::sync::mpsc::channel();
         self.runtime.spawn(async move {
-            let names_for_call: Vec<&str> = pvnames.iter().map(String::as_str).collect();
-            let raw = tokio::time::timeout(dur, client.pvget_many(&names_for_call)).await;
-            let results: Vec<(String, Option<PvField>)> = match raw {
-                Ok(vec) => pvnames
-                    .into_iter()
-                    .zip(vec.into_iter())
-                    .map(|(name, res)| (name, res.ok()))
-                    .collect(),
-                Err(_) => pvnames
-                    .into_iter()
-                    .map(|name| (name, None))
-                    .collect(),
-            };
+            let results = run_bulk_get_pva(client, pvnames, dur).await;
             let _ = tx.send(results);
         });
 
         let results = py.allow_threads(move || {
             rx.recv()
-                .map_err(|_| PyRuntimeError::new_err("bulk_pvaget failed"))
+                .map_err(|_| PyRuntimeError::new_err("bulk_get failed"))
         })?;
 
         let dict = PyDict::new(py);
@@ -146,74 +180,40 @@ impl EpicsRsPvaContext {
         Ok(dict.into_any().unbind())
     }
 
-    /// Bulk PVA read for already-created PVs — the PVA counterpart of
-    /// ``EpicsRsContext.bulk_get_pvs``.
+    /// Async variant of ``bulk_get`` — returns a Python awaitable.
     ///
-    /// Skips channel creation overhead: pulls the cached ``PvaClient``
-    /// and PV name from each ``EpicsRsPvaPV`` and issues concurrent
-    /// ``pvget`` operations. Feeds each PV's ``is_ntenum`` cache as a
-    /// side-effect.
-    ///
-    /// Returns ``{pvname: metadata | None}`` — same shape as
-    /// ``bulk_pvaget``.
-    #[pyo3(signature = (pvs, timeout=5.0))]
-    fn bulk_get_pvs_pva(
+    /// Drop-in for asyncio / ophyd-async callers. Same semantics as
+    /// the sync ``bulk_get`` but does not block the calling thread,
+    /// so a single asyncio loop can interleave bulk reads with other
+    /// device work.
+    #[pyo3(signature = (pvnames, timeout=5.0))]
+    fn bulk_get_async<'py>(
         &self,
-        py: Python<'_>,
-        pvs: Vec<Py<EpicsRsPvaPV>>,
+        py: Python<'py>,
+        pvnames: Vec<String>,
         timeout: f64,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
         let client = self.client.clone();
         let dur = Duration::from_secs_f64(timeout);
 
-        // Snapshot pvname + is_ntenum ref under GIL
-        let snapshots: Vec<(String, Arc<AtomicU8>)> = pvs
-            .iter()
-            .map(|p| {
-                let r = p.borrow(py);
-                (r.pvname.clone(), r.is_ntenum.clone())
-            })
-            .collect();
-        drop(pvs);
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.runtime.spawn(async move {
-            let names: Vec<&str> = snapshots.iter().map(|(n, _)| n.as_str()).collect();
-            let raw = tokio::time::timeout(dur, client.pvget_many(&names)).await;
-            let results: Vec<(String, Arc<AtomicU8>, Option<PvField>)> = match raw {
-                Ok(vec) => snapshots
-                    .into_iter()
-                    .zip(vec.into_iter())
-                    .map(|((name, is_ntenum), res)| (name, is_ntenum, res.ok()))
-                    .collect(),
-                Err(_) => snapshots
-                    .into_iter()
-                    .map(|(name, is_ntenum)| (name, is_ntenum, None))
-                    .collect(),
-            };
-            let _ = tx.send(results);
-        });
-
-        let results = py.allow_threads(move || {
-            rx.recv()
-                .map_err(|_| PyRuntimeError::new_err("bulk_get_pvs_pva failed"))
-        })?;
-
-        let dict = PyDict::new(py);
-        for (pvname, is_ntenum, maybe_field) in results {
-            match maybe_field {
-                Some(field) => {
-                    // Feed is_ntenum cache
-                    if is_ntenum.load(Ordering::Relaxed) == NTENUM_UNKNOWN {
-                        record_ntenum_into(&is_ntenum, &field);
+        // Same fast-path async wrapper used by per-PV
+        // ``get_value_async`` — see that method for the trade-offs.
+        pyo3_async_runtimes::tokio::future_into_py_fast(py, async move {
+            let results = run_bulk_get_pva(client, pvnames, dur).await;
+            Python::with_gil(|py| {
+                let dict = PyDict::new(py);
+                for (pvname, maybe_field) in results {
+                    match maybe_field {
+                        Some(field) => {
+                            let md = EpicsRsPvaMetadata::new(field);
+                            dict.set_item(&pvname, md.into_pyobject(py).unwrap())?;
+                        }
+                        None => dict.set_item(&pvname, py.None())?,
                     }
-                    let md = EpicsRsPvaMetadata::new(field);
-                    dict.set_item(&pvname, md.into_pyobject(py).unwrap())?;
                 }
-                None => dict.set_item(&pvname, py.None())?,
-            }
-        }
-        Ok(dict.into_any().unbind())
+                Ok::<PyObject, PyErr>(dict.into_any().unbind())
+            })
+        })
     }
 
     fn __repr__(&self) -> String {

@@ -23,7 +23,7 @@ apples-to-apples on the wire. Install benchmark deps:
 
 Run:
 
-    python examples/bench_vs_others.py
+    python examples/bench_vs_aioca_p4p.py
 """
 
 from __future__ import annotations
@@ -113,7 +113,7 @@ def section(title: str):
 # ---------------------------------------------------------------------------
 # CA: ophyd-epicsrs
 # ---------------------------------------------------------------------------
-def bench_epicsrs_ca():
+async def bench_epicsrs_ca():
     from ophyd_epicsrs import get_ca_context
 
     ctx = get_ca_context()
@@ -131,36 +131,35 @@ def bench_epicsrs_ca():
         samples.append((time.perf_counter() - t) * 1e6)
     print(f"  single warm get:    {fmt_us(*percentiles(samples))}")
 
-    # Bulk parallel via bulk_caget — re-creates channels every call,
-    # so each invocation pays connect overhead. Reflects the worst-case
-    # one-shot caget(list) workload with no channel reuse.
+    # Bulk parallel via bulk_get — internal channel cache means the
+    # first call pays connect overhead, subsequent calls hit the libca-
+    # style frame batching fast path (~1.4 µs/PV at 100 PVs).
     pre = [ctx.create_pv(name) for name in PV_POOL]
     for p in pre:
         p.wait_for_connection(timeout=5.0)
     for n in BULK_N:
         names = PV_POOL[:n]
-        ctx.bulk_caget(names, timeout=3.0)  # warm
+        ctx.bulk_get(names, timeout=3.0)  # warm
         per_call_us = []
         for _ in range(20):
             t = time.perf_counter()
-            ctx.bulk_caget(names, timeout=3.0)
+            ctx.bulk_get(names, timeout=3.0)
             per_call_us.append((time.perf_counter() - t) * 1e6)
         med = statistics.median(per_call_us)
-        print(f"  bulk_caget({n:3d}):    {med:7.0f}µs (median, {med / n:6.1f}µs/PV)")
+        print(f"  bulk_get({n:3d}):      {med:7.0f}µs (median, {med / n:6.1f}µs/PV)")
 
-    # Bulk via bulk_get_pvs — uses the cached channels, libca-style
-    # frame batching. The path you'd take in a fly-scan flyer that
-    # already holds the PV objects.
+    # bulk_get_async — same path as bulk_get but returns a Python
+    # awaitable (asyncio / ophyd-async friendly).
     for n in BULK_N:
-        subset = pre[:n]
-        ctx.bulk_get_pvs(subset, timeout=3.0)  # warm
+        names = PV_POOL[:n]
+        await ctx.bulk_get_async(names, timeout=3.0)  # warm
         per_call_us = []
         for _ in range(20):
             t = time.perf_counter()
-            ctx.bulk_get_pvs(subset, timeout=3.0)
+            await ctx.bulk_get_async(names, timeout=3.0)
             per_call_us.append((time.perf_counter() - t) * 1e6)
         med = statistics.median(per_call_us)
-        print(f"  bulk_get_pvs({n:3d}):  {med:7.0f}µs (median, {med / n:6.1f}µs/PV)")
+        print(f"  bulk_get_async({n:3d}):{med:7.0f}µs (median, {med / n:6.1f}µs/PV)")
 
     # Connect time for N FRESH channels (no read yet). aioca / p4p
     # don't expose connect-without-get, so they bench `connect+1get`
@@ -280,29 +279,30 @@ async def bench_epicsrs_pva():
         med = statistics.median(per_call_us)
         print(f"  gather({n:3d} PVs):    {med:7.0f}µs (median, {med / n:6.1f}µs/PV)")
 
-    # bulk_pvaget — by-name path (re-creates channels each call)
+    # bulk_get — concurrent pvget_many, single Rust spawn
     for n in BULK_N:
         names = PV_POOL[:n]
-        ctx.bulk_pvaget(names, timeout=3.0)  # warm
+        ctx.bulk_get(names, timeout=3.0)  # warm
         per_call_us = []
         for _ in range(20):
             t = time.perf_counter()
-            ctx.bulk_pvaget(names, timeout=3.0)
+            ctx.bulk_get(names, timeout=3.0)
             per_call_us.append((time.perf_counter() - t) * 1e6)
         med = statistics.median(per_call_us)
-        print(f"  bulk_pvaget({n:3d}):   {med:7.0f}µs (median, {med / n:6.1f}µs/PV)")
+        print(f"  bulk_get({n:3d}):      {med:7.0f}µs (median, {med / n:6.1f}µs/PV)")
 
-    # bulk_get_pvs_pva — pre-cached PV objects, single Rust spawn
+    # bulk_get_async — awaitable variant for ophyd-async / asyncio
+    # consumers; same I/O path as bulk_get.
     for n in BULK_N:
-        subset = pvs[:n]
-        ctx.bulk_get_pvs_pva(subset, timeout=3.0)  # warm
+        names = PV_POOL[:n]
+        await ctx.bulk_get_async(names, timeout=3.0)  # warm
         per_call_us = []
         for _ in range(20):
             t = time.perf_counter()
-            ctx.bulk_get_pvs_pva(subset, timeout=3.0)
+            await ctx.bulk_get_async(names, timeout=3.0)
             per_call_us.append((time.perf_counter() - t) * 1e6)
         med = statistics.median(per_call_us)
-        print(f"  bulk_get_pvs_pva({n:3d}): {med:7.0f}µs (median, {med / n:6.1f}µs/PV)")
+        print(f"  bulk_get_async({n:3d}):{med:7.0f}µs (median, {med / n:6.1f}µs/PV)")
 
     # Connect time
     for n in BULK_N:
@@ -399,7 +399,7 @@ async def main():
     )
 
     with section("CA: ophyd-epicsrs"):
-        bench_epicsrs_ca()
+        await bench_epicsrs_ca()
     with section("CA: aioca"):
         await bench_aioca()
     with section("PVA: ophyd-epicsrs"):

@@ -16,15 +16,15 @@ use epics_rs::ca::client::{CaChannel, CaClient};
 use crate::convert::epics_value_to_py;
 use crate::pv::EpicsRsPV;
 
-const BULK_CAGET_CACHE_LIMIT: usize = 4096;
+const BULK_GET_CACHE_LIMIT: usize = 4096;
 
 #[derive(Default)]
-struct BulkCagetCache {
+struct BulkGetCache {
     channels: HashMap<String, CaChannel>,
     order: VecDeque<String>,
 }
 
-impl BulkCagetCache {
+impl BulkGetCache {
     fn get_or_create(&mut self, client: &CaClient, pvname: &str) -> CaChannel {
         if let Some(channel) = self.channels.get(pvname) {
             return channel.clone();
@@ -34,7 +34,7 @@ impl BulkCagetCache {
         self.channels.insert(pvname.to_string(), channel.clone());
         self.order.push_back(pvname.to_string());
 
-        while self.channels.len() > BULK_CAGET_CACHE_LIMIT {
+        while self.channels.len() > BULK_GET_CACHE_LIMIT {
             let Some(oldest) = self.order.pop_front() else {
                 break;
             };
@@ -43,6 +43,65 @@ impl BulkCagetCache {
 
         channel
     }
+}
+
+/// Run a batched CA read with a one-shot retry for channels that came
+/// back disconnected/missing on the first pass. Shared between the
+/// sync and async ``bulk_get`` paths so they have identical semantics.
+async fn run_bulk_get(
+    client: Arc<CaClient>,
+    snapshots: Vec<(String, CaChannel)>,
+    dur: Duration,
+) -> Vec<(String, Option<EpicsValue>)> {
+    let (names, channels): (Vec<String>, Vec<_>) = snapshots.into_iter().unzip();
+    let mut raw = client.get_many_with_timeout(&channels, dur).await;
+
+    let retry_indices: Vec<usize> = raw
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, result)| {
+            if matches!(
+                result,
+                Err(CaError::Disconnected) | Err(CaError::ChannelNotFound(_))
+            ) {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if !retry_indices.is_empty() {
+        let mut wait_handles = Vec::with_capacity(retry_indices.len());
+        for idx in retry_indices {
+            let channel = channels[idx].clone();
+            wait_handles.push(tokio::spawn(async move {
+                (idx, channel.wait_connected(dur).await.is_ok())
+            }));
+        }
+
+        let mut ready_indices = Vec::new();
+        let mut ready_channels = Vec::new();
+        for handle in wait_handles {
+            if let Ok((idx, true)) = handle.await {
+                ready_indices.push(idx);
+                ready_channels.push(channels[idx].clone());
+            }
+        }
+
+        if !ready_channels.is_empty() {
+            let retried = client.get_many_with_timeout(&ready_channels, dur).await;
+            for (idx, result) in ready_indices.into_iter().zip(retried) {
+                raw[idx] = result;
+            }
+        }
+    }
+
+    names
+        .into_iter()
+        .zip(raw.into_iter())
+        .map(|(name, res)| (name, res.ok().map(|(_dbr, val)| val)))
+        .collect()
 }
 
 /// Shared EPICS CA context — holds a tokio Runtime and CaClient.
@@ -60,14 +119,14 @@ impl BulkCagetCache {
 pub struct EpicsRsContext {
     pub(crate) runtime: Arc<Runtime>,
     pub(crate) client: Arc<CaClient>,
-    /// Hidden channel cache for by-name ``bulk_caget``.
+    /// Hidden channel cache for by-name ``bulk_get``.
     ///
     /// This is intentionally not a Python PV-object cache: ophyd still
     /// gets a fresh ``EpicsRsPV`` wrapper from ``create_pv``. The cache
     /// only lets repeated one-shot by-name reads skip CA create/search
-    /// and use the same hot ``get_many_with_timeout`` path as
-    /// ``bulk_get_pvs``.
-    bulk_caget_cache: Mutex<BulkCagetCache>,
+    /// and reuse the same hot ``get_many_with_timeout`` path on every
+    /// call.
+    bulk_get_cache: Mutex<BulkGetCache>,
     /// Live ``EpicsRsPV`` wrapper count. Incremented in ``create_pv``
     /// and decremented in ``EpicsRsPV::drop``. Surfaces through
     /// ``is_unused()`` so ``ophyd_epicsrs.shutdown_all()`` can refuse
@@ -107,7 +166,7 @@ impl EpicsRsContext {
         Ok(Self {
             runtime,
             client: Arc::new(client),
-            bulk_caget_cache: Mutex::new(BulkCagetCache::default()),
+            bulk_get_cache: Mutex::new(BulkGetCache::default()),
             pv_count: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -152,12 +211,12 @@ impl EpicsRsContext {
     ///     {pvname: value} — successfully-read PVs map to the value,
     ///     failures (timeout / disconnect / type error) map to ``None``.
     #[pyo3(signature = (pvnames, timeout=5.0))]
-    fn bulk_caget(&self, py: Python<'_>, pvnames: Vec<String>, timeout: f64) -> PyResult<PyObject> {
+    fn bulk_get(&self, py: Python<'_>, pvnames: Vec<String>, timeout: f64) -> PyResult<PyObject> {
         let client = self.client.clone();
         let dur = Duration::from_secs_f64(timeout);
 
         let snapshots: Vec<(String, CaChannel)> = {
-            let mut cache = self.bulk_caget_cache.lock();
+            let mut cache = self.bulk_get_cache.lock();
             pvnames
                 .into_iter()
                 .map(|pvname| {
@@ -169,55 +228,7 @@ impl EpicsRsContext {
 
         let (tx, rx) = std::sync::mpsc::channel();
         self.runtime.spawn(async move {
-            let (names, channels): (Vec<String>, Vec<_>) = snapshots.into_iter().unzip();
-            let mut raw = client.get_many_with_timeout(&channels, dur).await;
-
-            let retry_indices: Vec<usize> = raw
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, result)| {
-                    if matches!(
-                        result,
-                        Err(CaError::Disconnected) | Err(CaError::ChannelNotFound(_))
-                    ) {
-                        Some(idx)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            if !retry_indices.is_empty() {
-                let mut wait_handles = Vec::with_capacity(retry_indices.len());
-                for idx in retry_indices {
-                    let channel = channels[idx].clone();
-                    wait_handles.push(tokio::spawn(async move {
-                        (idx, channel.wait_connected(dur).await.is_ok())
-                    }));
-                }
-
-                let mut ready_indices = Vec::new();
-                let mut ready_channels = Vec::new();
-                for handle in wait_handles {
-                    if let Ok((idx, true)) = handle.await {
-                        ready_indices.push(idx);
-                        ready_channels.push(channels[idx].clone());
-                    }
-                }
-
-                if !ready_channels.is_empty() {
-                    let retried = client.get_many_with_timeout(&ready_channels, dur).await;
-                    for (idx, result) in ready_indices.into_iter().zip(retried) {
-                        raw[idx] = result;
-                    }
-                }
-            }
-
-            let results: Vec<(String, Option<EpicsValue>)> = names
-                .into_iter()
-                .zip(raw.into_iter())
-                .map(|(name, res)| (name, res.ok().map(|(_dbr, val)| val)))
-                .collect();
+            let results = run_bulk_get(client, snapshots, dur).await;
             let _ = tx.send(results);
         });
 
@@ -226,7 +237,7 @@ impl EpicsRsContext {
         // so the closure owns it — no Mutex needed.
         let results = py.allow_threads(move || {
             rx.recv()
-                .map_err(|_| PyRuntimeError::new_err("bulk_caget failed"))
+                .map_err(|_| PyRuntimeError::new_err("bulk_get failed"))
         })?;
 
         // Convert to Python dict — failed PVs are included as None
@@ -241,66 +252,52 @@ impl EpicsRsContext {
         Ok(dict.into_any().unbind())
     }
 
-    /// Bulk read for already-created PVs — the fast path.
+    /// Async variant of ``bulk_get`` — returns a Python awaitable.
     ///
-    /// ``bulk_caget(names)`` re-creates channels and waits for connect
-    /// every call, so its per-call cost is dominated by channel setup.
-    /// ``bulk_get_pvs(pvs)`` skips that: it pulls the cached
-    /// ``Arc<CaChannel>`` out of each ``EpicsRsPV`` and routes through
-    /// ``CaClient::get_many_with_timeout``, which packs the per-server
-    /// READ_NOTIFY frames into one TCP write (libca-style flush).
-    /// Mirrors the e2e ``get_many`` benchmark in epics-ca-rs (~2 µs/PV
-    /// for 100 PVs against the bench softIoc).
-    ///
-    /// Caller's responsibility to ensure each PV is connected before
-    /// calling — disconnected channels surface as ``None`` in the
-    /// returned dict.
-    #[pyo3(signature = (pvs, timeout=5.0))]
-    fn bulk_get_pvs(
+    /// Drop-in for asyncio / ophyd-async callers: keeps the RunEngine
+    /// loop free to schedule other work while the batched READ_NOTIFY
+    /// round-trip is in flight. The channel-cache snapshot happens
+    /// synchronously under the GIL before the awaitable is returned,
+    /// so the awaiter never blocks on cache contention.
+    #[pyo3(signature = (pvnames, timeout=5.0))]
+    fn bulk_get_async<'py>(
         &self,
-        py: Python<'_>,
-        pvs: Vec<Py<EpicsRsPV>>,
+        py: Python<'py>,
+        pvnames: Vec<String>,
         timeout: f64,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
         let client = self.client.clone();
         let dur = Duration::from_secs_f64(timeout);
 
-        // Snapshot pvname + clone CaChannel under GIL, then release for
-        // the actual batch read.
-        let snapshots: Vec<(String, epics_rs::ca::client::CaChannel)> = pvs
-            .iter()
-            .map(|p| {
-                let r = p.borrow(py);
-                (r.pvname.clone(), (*r.channel).clone())
-            })
-            .collect();
-        drop(pvs);
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.runtime.spawn(async move {
-            let (names, channels): (Vec<String>, Vec<_>) = snapshots.into_iter().unzip();
-            let raw = client.get_many_with_timeout(&channels, dur).await;
-            let results: Vec<(String, Option<EpicsValue>)> = names
+        let snapshots: Vec<(String, CaChannel)> = {
+            let mut cache = self.bulk_get_cache.lock();
+            pvnames
                 .into_iter()
-                .zip(raw.into_iter())
-                .map(|(name, res)| (name, res.ok().map(|(_dbr, val)| val)))
-                .collect();
-            let _ = tx.send(results);
-        });
+                .map(|pvname| {
+                    let channel = cache.get_or_create(&client, &pvname);
+                    (pvname, channel)
+                })
+                .collect()
+        };
 
-        let results = py.allow_threads(move || {
-            rx.recv()
-                .map_err(|_| PyRuntimeError::new_err("bulk_get_pvs failed"))
-        })?;
-
-        let dict = PyDict::new(py);
-        for (pvname, maybe_val) in results {
-            match maybe_val {
-                Some(val) => dict.set_item(&pvname, epics_value_to_py(py, &val))?,
-                None => dict.set_item(&pvname, py.None())?,
-            }
-        }
-        Ok(dict.into_any().unbind())
+        // `future_into_py_fast` skips add_done_callback / Cancellable /
+        // outer-spawn / scope (~15-25µs/call savings vs the standard
+        // `future_into_py`). Same trade-offs as the per-PV
+        // ``get_value_async`` path: short-lived future, no asyncio
+        // cancellation, no contextvar propagation across the await.
+        pyo3_async_runtimes::tokio::future_into_py_fast(py, async move {
+            let results = run_bulk_get(client, snapshots, dur).await;
+            Python::with_gil(|py| {
+                let dict = PyDict::new(py);
+                for (pvname, maybe_val) in results {
+                    match maybe_val {
+                        Some(val) => dict.set_item(&pvname, epics_value_to_py(py, &val))?,
+                        None => dict.set_item(&pvname, py.None())?,
+                    }
+                }
+                Ok::<PyObject, PyErr>(dict.into_any().unbind())
+            })
+        })
     }
 
     /// Connect multiple PVs in parallel and collect available metadata.
@@ -386,7 +383,7 @@ impl EpicsRsContext {
         });
 
         // Wait for all results (GIL released) — same `move` pattern as
-        // bulk_caget; closure owns rx, no Mutex needed.
+        // bulk_get; closure owns rx, no Mutex needed.
         let results = py.allow_threads(move || {
             rx.recv()
                 .map_err(|_| PyRuntimeError::new_err("bulk_connect_and_prefetch failed"))

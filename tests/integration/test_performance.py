@@ -77,18 +77,18 @@ def warm_pool(ca_ctx):
     return PV_POOL
 
 
-# ---------- bulk_caget scaling ----------
+# ---------- bulk_get scaling ----------
 
 
 @pytest.mark.parametrize("n", [10, 25, 48])
-def test_bulk_caget_scaling(ca_ctx, warm_pool, n):
-    """bulk_caget(N) wall-time should be sub-linear in N because the
+def test_bulk_get_scaling(ca_ctx, warm_pool, n):
+    """bulk_get(N) wall-time should be sub-linear in N because the
     reads are issued concurrently inside one tokio runtime."""
     pvs = warm_pool[:n]
     t0 = time.perf_counter()
-    data = ca_ctx.bulk_caget(pvs, timeout=3.0)
+    data = ca_ctx.bulk_get(pvs, timeout=3.0)
     dt = (time.perf_counter() - t0) * 1000
-    print(f"\n  bulk_caget({n}): {dt:.2f} ms ({dt / n:.3f} ms/PV)")
+    print(f"\n  bulk_get({n}): {dt:.2f} ms ({dt / n:.3f} ms/PV)")
     assert len(data) == n
     # Steady state: ~50 ms for 48 PVs on localhost. A 5×-ceiling miss
     # here usually means a mid-test reconnect blocked one of the
@@ -100,11 +100,11 @@ def test_bulk_caget_scaling(ca_ctx, warm_pool, n):
     # runner". Soft warning above 500 ms surfaces gradual drift.
     if dt > 5000:
         pytest.skip(
-            f"bulk_caget({n}) took {dt:.0f} ms — transient IOC outage, "
+            f"bulk_get({n}) took {dt:.0f} ms — transient IOC outage, "
             "can't measure perf"
         )
     if dt > 500:
-        print(f"  WARN: bulk_caget({n}) took {dt:.0f} ms — investigate if persistent")
+        print(f"  WARN: bulk_get({n}) took {dt:.0f} ms — investigate if persistent")
 
 
 # ---------- single PV get latency ----------

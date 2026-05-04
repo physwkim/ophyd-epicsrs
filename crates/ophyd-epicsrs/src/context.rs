@@ -1,17 +1,49 @@
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use tokio::runtime::Runtime;
 
 use epics_rs::base::types::EpicsValue;
-use epics_rs::ca::client::CaClient;
+use epics_rs::ca::CaError;
+use epics_rs::ca::client::{CaChannel, CaClient};
 
 use crate::convert::epics_value_to_py;
 use crate::pv::EpicsRsPV;
+
+const BULK_CAGET_CACHE_LIMIT: usize = 4096;
+
+#[derive(Default)]
+struct BulkCagetCache {
+    channels: HashMap<String, CaChannel>,
+    order: VecDeque<String>,
+}
+
+impl BulkCagetCache {
+    fn get_or_create(&mut self, client: &CaClient, pvname: &str) -> CaChannel {
+        if let Some(channel) = self.channels.get(pvname) {
+            return channel.clone();
+        }
+
+        let channel = client.create_channel(pvname);
+        self.channels.insert(pvname.to_string(), channel.clone());
+        self.order.push_back(pvname.to_string());
+
+        while self.channels.len() > BULK_CAGET_CACHE_LIMIT {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.channels.remove(&oldest);
+        }
+
+        channel
+    }
+}
 
 /// Shared EPICS CA context — holds a tokio Runtime and CaClient.
 ///
@@ -28,6 +60,14 @@ use crate::pv::EpicsRsPV;
 pub struct EpicsRsContext {
     pub(crate) runtime: Arc<Runtime>,
     pub(crate) client: Arc<CaClient>,
+    /// Hidden channel cache for by-name ``bulk_caget``.
+    ///
+    /// This is intentionally not a Python PV-object cache: ophyd still
+    /// gets a fresh ``EpicsRsPV`` wrapper from ``create_pv``. The cache
+    /// only lets repeated one-shot by-name reads skip CA create/search
+    /// and use the same hot ``get_many_with_timeout`` path as
+    /// ``bulk_get_pvs``.
+    bulk_caget_cache: Mutex<BulkCagetCache>,
     /// Live ``EpicsRsPV`` wrapper count. Incremented in ``create_pv``
     /// and decremented in ``EpicsRsPV::drop``. Surfaces through
     /// ``is_unused()`` so ``ophyd_epicsrs.shutdown_all()`` can refuse
@@ -67,6 +107,7 @@ impl EpicsRsContext {
         Ok(Self {
             runtime,
             client: Arc::new(client),
+            bulk_caget_cache: Mutex::new(BulkCagetCache::default()),
             pv_count: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -92,11 +133,11 @@ impl EpicsRsContext {
 
     /// Read multiple PVs in parallel. Returns a dict of {pvname: value}.
     ///
-    /// Routes through ``CaClient::caget_many_with_timeout`` which groups
-    /// the per-server READ_NOTIFY frames into a single TCP write per
-    /// server (libca-style bulk flush). N reads complete in roughly one
-    /// round-trip time instead of N round-trips serialized through the
-    /// coordinator.
+    /// Reuses a bounded by-name channel cache, then routes hot channels
+    /// through ``CaClient::get_many_with_timeout``. That groups the
+    /// per-server READ_NOTIFY frames into a single TCP write per server
+    /// (libca-style bulk flush). New or disconnected cached channels
+    /// are connected and retried once.
     ///
     /// Parameters
     /// ----------
@@ -115,11 +156,64 @@ impl EpicsRsContext {
         let client = self.client.clone();
         let dur = Duration::from_secs_f64(timeout);
 
+        let snapshots: Vec<(String, CaChannel)> = {
+            let mut cache = self.bulk_caget_cache.lock();
+            pvnames
+                .into_iter()
+                .map(|pvname| {
+                    let channel = cache.get_or_create(&client, &pvname);
+                    (pvname, channel)
+                })
+                .collect()
+        };
+
         let (tx, rx) = std::sync::mpsc::channel();
         self.runtime.spawn(async move {
-            let names_for_call: Vec<&str> = pvnames.iter().map(String::as_str).collect();
-            let raw = client.caget_many_with_timeout(&names_for_call, dur).await;
-            let results: Vec<(String, Option<EpicsValue>)> = pvnames
+            let (names, channels): (Vec<String>, Vec<_>) = snapshots.into_iter().unzip();
+            let mut raw = client.get_many_with_timeout(&channels, dur).await;
+
+            let retry_indices: Vec<usize> = raw
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, result)| {
+                    if matches!(
+                        result,
+                        Err(CaError::Disconnected) | Err(CaError::ChannelNotFound(_))
+                    ) {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if !retry_indices.is_empty() {
+                let mut wait_handles = Vec::with_capacity(retry_indices.len());
+                for idx in retry_indices {
+                    let channel = channels[idx].clone();
+                    wait_handles.push(tokio::spawn(async move {
+                        (idx, channel.wait_connected(dur).await.is_ok())
+                    }));
+                }
+
+                let mut ready_indices = Vec::new();
+                let mut ready_channels = Vec::new();
+                for handle in wait_handles {
+                    if let Ok((idx, true)) = handle.await {
+                        ready_indices.push(idx);
+                        ready_channels.push(channels[idx].clone());
+                    }
+                }
+
+                if !ready_channels.is_empty() {
+                    let retried = client.get_many_with_timeout(&ready_channels, dur).await;
+                    for (idx, result) in ready_indices.into_iter().zip(retried) {
+                        raw[idx] = result;
+                    }
+                }
+            }
+
+            let results: Vec<(String, Option<EpicsValue>)> = names
                 .into_iter()
                 .zip(raw.into_iter())
                 .map(|(name, res)| (name, res.ok().map(|(_dbr, val)| val)))

@@ -410,3 +410,8 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    # Multiple CA/PVA client libraries (aioca, p4p, epics-rs) loaded in
+    # the same process race during atexit cleanup → segfault.  All bench
+    # data is already printed, so skip destructors entirely.
+    import os
+    os._exit(0)

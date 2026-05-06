@@ -1,5 +1,78 @@
 # Changelog
 
+## v0.9.0 (2026-05-06)
+
+CA bulk-read hot-path tuning + bulk API consolidation. The four
+distinct bulk methods from v0.8.0 (`bulk_caget`, `bulk_get_pvs`,
+`bulk_pvaget`, `bulk_get_pvs_pva`) collapse into a single uniform
+shape on each context, plus an async variant for asyncio /
+ophyd-async callers.
+
+### Public API — breaking
+
+- **`EpicsRsContext.bulk_caget` → `bulk_get`** (CA, sync). Same
+  semantics; the CA-specific suffix dropped now that PVA mirrors the
+  same name. Internally now uses a bounded by-name `CaChannel` cache
+  (LRU, 4096 entries) so repeated calls skip CA create/search and
+  route hot channels through `CaClient::get_many_with_timeout`.
+- **`EpicsRsContext.bulk_get_pvs` removed.** The pre-cached-PV variant
+  is no longer needed because `bulk_get`'s channel cache already
+  delivers the same hot-path performance from PV names.
+- **`EpicsRsPvaContext.bulk_pvaget` → `bulk_get`** (PVA, sync).
+- **`EpicsRsPvaContext.bulk_get_pvs_pva` removed**, same reason.
+- **New: `bulk_get_async(names, timeout=5.0)`** on both CA and PVA
+  contexts. Returns a Python awaitable — drop-in for asyncio /
+  ophyd-async / RunEngine integration; does not block the event
+  loop.
+
+Migration: rename `bulk_caget` → `bulk_get`, `bulk_pvaget` →
+`bulk_get`, and replace `bulk_get_pvs*` calls with the by-name
+`bulk_get` (the channel cache makes the explicit pre-cached-PV path
+redundant).
+
+### CA backend — bulk_get hot-path
+
+- Bounded by-name `CaChannel` cache (`BulkGetCache`, LRU 4096) shared
+  by sync + async paths so repeat-name reads skip CA create/search.
+- One-shot retry on `Disconnected` / `ChannelNotFound`: PVs that miss
+  the first `get_many` pass `wait_connected` once and the batch
+  re-issues `get_many` for just the recovered channels — a stale cache
+  entry no longer poisons the whole batch.
+- Shared `run_bulk_get` core for both `bulk_get` and `bulk_get_async`,
+  so they have identical batching + retry semantics.
+
+### PVA backend — bulk_get correctness
+
+- `bulk_get` now spawns N concurrent `pvget` tokio tasks instead of
+  routing through `PvaClient::pvget_many`. The batched warm-path in
+  `pvget_many` reuses the same `ioid` for every GET after the first
+  INIT+GET; against an `epics-bridge-rs` qsrv-fronted IOC the server
+  rejects every reused-ioid GET, so `pvget_many` returned `None` on
+  every PV after the first. `op_get` (called by per-PV `pvget`) has
+  an internal cold-path fallback when the warm GET fails, so the
+  per-PV path is correct.
+- Trade-off: we lose the single-TCP-write batching `pvget_many`
+  offered on the happy path. Concurrent op_get hops still parallelise
+  cleanly via tokio scheduling. Acceptable until `pvget_many` gains
+  its own warm-failure cold fallback upstream.
+
+### Benchmarks
+
+- `examples/bench_flyscan_waveform.py` — fly-scan waveform throughput
+  benchmark (300 lines).
+- `tests/integration/bench_vs_pyepics.py` → `examples/bench_vs_pyepics.py`
+  (moved out of the test tree; honest like-for-like vs pyepics).
+- `tests/integration/bench_vs_others.py` → `examples/bench_vs_aioca_p4p.py`
+  (renamed; comparative bench vs aioca / p4p, atexit `os._exit(0)`
+  guard so racing CA/PVA libraries no longer segfault on shutdown
+  and clobber the output).
+
+### README
+
+- "Parallel PV Read" section rewritten around the unified `bulk_get`
+  / `bulk_get_async` API. Documents both protocols, sync + async,
+  with the failure-as-`None` semantics called out.
+
 ## v0.8.0 (2026-05-04)
 
 Major performance pass — every Rust↔Python hot path on the CA + PVA

@@ -1,6 +1,6 @@
 [package]
 name = "ophyd-epicsrs"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.85"
 license = "BSD-3-Clause"
@@ -10,7 +10,7 @@ name = "ophyd_epicsrs"
 crate-type = ["cdylib"]
 
 [dependencies]
-epics-rs = { path = "../../../epics-rs/crates/epics-rs", features = ["ca", "pva"] }
+epics-rs = { version = "0.14.2", features = ["ca", "pva"] }
 pyo3 = { version = "0.24", features = ["extension-module", "abi3-py38"] }
 # numpy 0.24 matches pyo3 0.24 — used to return waveform reads as
 # zero-copy ndarrays (PyArray1::from_slice copies once into a numpy

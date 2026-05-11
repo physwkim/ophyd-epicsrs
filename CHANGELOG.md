@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.11.0 (2026-05-11)
+
+Dependency bump — picks up the epics-rs 0.16.0 line (CA + PVA backend
+fixes from the bridge-rs Round 2 review and earlier hot-path tuning).
+No API changes.
+
+### Dependencies
+
+- `epics-rs` 0.15.0 → 0.16.0 (transitive: `epics-base-rs`,
+  `epics-ca-rs`, `epics-pva-rs`, `epics-macros-rs` all bumped to
+  0.16.0).
+
+### Internal
+
+- `pva_convert.rs`: `match &self.field { PvField::Structure(s) =>
+  ... }` arms for `timestamp` / `severity` / `status` collapsed to
+  let-chains (`if let PvField::Structure(s) = &self.field && let
+  Some(...) = ...`) — `clippy::single_match` cleanup, no behaviour
+  change.
+- `pva.rs`: rustfmt + markdown-bullet continuation indent fixed in
+  `detect_ntenum_shape` doc block (`clippy::doc_overindented_list_items`).
+
 ## v0.9.0 (2026-05-06)
 
 CA bulk-read hot-path tuning + bulk API consolidation. The four

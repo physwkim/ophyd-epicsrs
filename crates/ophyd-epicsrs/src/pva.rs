@@ -29,7 +29,7 @@ use epics_rs::pva::client_native::context::PvaClient;
 use epics_rs::pva::client_native::ops_v2::SubscriptionHandle;
 use epics_rs::pva::pvdata::{FieldDesc, PvField, ScalarType};
 
-use crate::pva_convert::{pvfield_to_py, EpicsRsPvaMetadata};
+use crate::pva_convert::{EpicsRsPvaMetadata, pvfield_to_py};
 
 /// Monitor event queued from tokio task → Python thread.
 struct PvaMonitorEvent {
@@ -147,12 +147,7 @@ impl EpicsRsPvaContext {
     ///
     /// The GIL is released while the concurrent GETs run on tokio.
     #[pyo3(signature = (pvnames, timeout=5.0))]
-    fn bulk_get(
-        &self,
-        py: Python<'_>,
-        pvnames: Vec<String>,
-        timeout: f64,
-    ) -> PyResult<PyObject> {
+    fn bulk_get(&self, py: Python<'_>, pvnames: Vec<String>, timeout: f64) -> PyResult<PyObject> {
         let client = self.client.clone();
         let dur = Duration::from_secs_f64(timeout);
 
@@ -282,11 +277,11 @@ pub struct EpicsRsPvaPV {
 /// Classify a top-level PvField as NTEnum or not.
 ///
 /// * `Some(true)`  — `struct_id == "epics:nt/NTEnum:1.0"`, or field-shape
-///                   confirms NTEnum (index + choices sub-fields present).
+///   confirms NTEnum (index + choices sub-fields present).
 /// * `Some(false)` — `struct_id` positively identifies a different NT type
-///                   (starts with `"epics:nt/"` but is not NTEnum).
+///   (starts with `"epics:nt/"` but is not NTEnum).
 /// * `None`        — non-structure, or structure with empty/unknown struct_id
-///                   whose NTEnum shape could not be confirmed.
+///   whose NTEnum shape could not be confirmed.
 ///
 /// Callers must treat `None` as "no new information" and must NOT flip
 /// a cached `Some(true)` to `Some(false)` — monitor deltas can arrive
@@ -298,7 +293,10 @@ pub struct EpicsRsPvaPV {
 /// (which cannot borrow `self`) share a single call-site pattern.
 fn record_ntenum_into(slot: &AtomicU8, field: &PvField) {
     if let Some(detected) = detect_ntenum_shape(field) {
-        slot.store(if detected { NTENUM_TRUE } else { NTENUM_FALSE }, Ordering::Relaxed);
+        slot.store(
+            if detected { NTENUM_TRUE } else { NTENUM_FALSE },
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -424,7 +422,13 @@ impl EpicsRsPvaPV {
                 if self.is_ntenum.load(Ordering::Relaxed) == NTENUM_UNKNOWN {
                     self.record_ntenum_shape(&field);
                 }
-                Ok(Some(EpicsRsPvaMetadata::new(field).into_pyobject(py).unwrap().into_any().unbind()))
+                Ok(Some(
+                    EpicsRsPvaMetadata::new(field)
+                        .into_pyobject(py)
+                        .unwrap()
+                        .into_any()
+                        .unbind(),
+                ))
             }
             Ok(Err(e)) => {
                 tracing::warn!(target: "ophyd_epicsrs.pva", pv = %self.pvname, "pvget failed: {e}");
@@ -496,7 +500,8 @@ impl EpicsRsPvaPV {
         callback: Option<PyObject>,
     ) -> PyResult<()> {
         // NTEnum int-put: route through value.index field-path.
-        let route_ntenum_index = self.is_ntenum.load(Ordering::Relaxed) == NTENUM_TRUE && py_value_is_intlike(value);
+        let route_ntenum_index =
+            self.is_ntenum.load(Ordering::Relaxed) == NTENUM_TRUE && py_value_is_intlike(value);
         let value_str = python_value_to_pvput_string(value)?;
 
         let client = self.client.clone();
@@ -1032,7 +1037,11 @@ impl EpicsRsPvaPV {
                             "pvget on {pvname}: panic in Python::with_gil during reading conversion"
                         ))),
                         Python::with_gil(|py| Ok::<PyObject, PyErr>(
-                            EpicsRsPvaMetadata::new(field).into_pyobject(py).unwrap().into_any().unbind()
+                            EpicsRsPvaMetadata::new(field)
+                                .into_pyobject(py)
+                                .unwrap()
+                                .into_any()
+                                .unbind()
                         ))
                     )
                 }
@@ -1061,7 +1070,8 @@ impl EpicsRsPvaPV {
         value: &Bound<'_, pyo3::PyAny>,
         timeout: f64,
     ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
-        let route_ntenum_index = self.is_ntenum.load(Ordering::Relaxed) == NTENUM_TRUE && py_value_is_intlike(value);
+        let route_ntenum_index =
+            self.is_ntenum.load(Ordering::Relaxed) == NTENUM_TRUE && py_value_is_intlike(value);
         let value_str = python_value_to_pvput_string(value)?;
         let client = self.client.clone();
         let name = self.pvname.clone();
@@ -1107,7 +1117,8 @@ impl EpicsRsPvaPV {
     ) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
         // Same NTEnum routing as put / put_async — see put_async for
         // the rationale. ophyd-async's `set(wait=False)` lands here.
-        let route_ntenum_index = self.is_ntenum.load(Ordering::Relaxed) == NTENUM_TRUE && py_value_is_intlike(value);
+        let route_ntenum_index =
+            self.is_ntenum.load(Ordering::Relaxed) == NTENUM_TRUE && py_value_is_intlike(value);
         let value_str = python_value_to_pvput_string(value)?;
         let client = self.client.clone();
         let name = self.pvname.clone();

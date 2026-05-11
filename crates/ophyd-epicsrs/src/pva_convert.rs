@@ -206,7 +206,11 @@ fn extract_ntenum(s: &PvStructure) -> Option<(i32, Vec<String>)> {
 /// Build an ophyd-compatible metadata dict from a top-level PvField.
 /// Handles NTScalar, NTScalarArray, NTEnum shapes; falls back to raw value
 /// for non-NT structures.
-pub fn pvfield_to_metadata(py: Python<'_>, field: &PvField, client_time: Option<(f64, i64, u32)>) -> PyObject {
+pub fn pvfield_to_metadata(
+    py: Python<'_>,
+    field: &PvField,
+    client_time: Option<(f64, i64, u32)>,
+) -> PyObject {
     let dict = PyDict::new(py);
 
     match field {
@@ -364,14 +368,18 @@ impl EpicsRsPvaMetadata {
         let client_time = match &field {
             PvField::Structure(s) => {
                 if s.get_timestamp().is_none() {
-                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default();
                     Some((now.as_secs_f64(), now.as_secs() as i64, now.subsec_nanos()))
                 } else {
                     None
                 }
             }
             _ => {
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default();
                 Some((now.as_secs_f64(), now.as_secs() as i64, now.subsec_nanos()))
             }
         };
@@ -393,67 +401,56 @@ impl EpicsRsPvaMetadata {
         }
 
         match key {
-            "value" => {
-                match &self.field {
-                    PvField::Structure(s) => {
-                        if let Some((idx, _)) = extract_ntenum(s) {
-                            return Ok(idx.into_pyobject(py).unwrap().into_any().unbind());
-                        } else if let Some(value_field) = s.get_field("value") {
-                            return Ok(pvfield_to_py(py, value_field));
-                        } else {
-                            return Ok(structure_to_py(py, s));
-                        }
-                    }
-                    other => {
-                        return Ok(pvfield_to_py(py, other));
+            "value" => match &self.field {
+                PvField::Structure(s) => {
+                    if let Some((idx, _)) = extract_ntenum(s) {
+                        return Ok(idx.into_pyobject(py).unwrap().into_any().unbind());
+                    } else if let Some(value_field) = s.get_field("value") {
+                        return Ok(pvfield_to_py(py, value_field));
+                    } else {
+                        return Ok(structure_to_py(py, s));
                     }
                 }
-            }
+                other => {
+                    return Ok(pvfield_to_py(py, other));
+                }
+            },
             "timestamp" => {
-                match &self.field {
-                    PvField::Structure(s) => {
-                        if let Some(ts) = s.get_timestamp() {
-                            let secs = struct_field_scalar(ts, "secondsPastEpoch")
-                                .and_then(scalar_as_i64)
-                                .unwrap_or(0);
-                            let nanos = struct_field_scalar(ts, "nanoseconds")
-                                .and_then(scalar_as_i64)
-                                .unwrap_or(0) as u32;
-                            let timestamp = secs as f64 + (nanos as f64) * 1e-9;
-                            return Ok(timestamp.into_pyobject(py).unwrap().into_any().unbind());
-                        }
-                    }
-                    _ => {}
+                if let PvField::Structure(s) = &self.field
+                    && let Some(ts) = s.get_timestamp()
+                {
+                    let secs = struct_field_scalar(ts, "secondsPastEpoch")
+                        .and_then(scalar_as_i64)
+                        .unwrap_or(0);
+                    let nanos = struct_field_scalar(ts, "nanoseconds")
+                        .and_then(scalar_as_i64)
+                        .unwrap_or(0) as u32;
+                    let timestamp = secs as f64 + (nanos as f64) * 1e-9;
+                    return Ok(timestamp.into_pyobject(py).unwrap().into_any().unbind());
                 }
                 if let Some((ts, _, _)) = self.client_time {
                     return Ok(ts.into_pyobject(py).unwrap().into_any().unbind());
                 }
             }
             "severity" => {
-                match &self.field {
-                    PvField::Structure(s) => {
-                        if let Some(alarm) = s.get_alarm() {
-                            let severity = struct_field_scalar(alarm, "severity")
-                                .and_then(scalar_as_i64)
-                                .unwrap_or(0);
-                            return Ok(severity.into_pyobject(py).unwrap().into_any().unbind());
-                        }
-                    }
-                    _ => {}
+                if let PvField::Structure(s) = &self.field
+                    && let Some(alarm) = s.get_alarm()
+                {
+                    let severity = struct_field_scalar(alarm, "severity")
+                        .and_then(scalar_as_i64)
+                        .unwrap_or(0);
+                    return Ok(severity.into_pyobject(py).unwrap().into_any().unbind());
                 }
                 return Ok(0i64.into_pyobject(py).unwrap().into_any().unbind());
             }
             "status" => {
-                match &self.field {
-                    PvField::Structure(s) => {
-                        if let Some(alarm) = s.get_alarm() {
-                            let status = struct_field_scalar(alarm, "status")
-                                .and_then(scalar_as_i64)
-                                .unwrap_or(0);
-                            return Ok(status.into_pyobject(py).unwrap().into_any().unbind());
-                        }
-                    }
-                    _ => {}
+                if let PvField::Structure(s) = &self.field
+                    && let Some(alarm) = s.get_alarm()
+                {
+                    let status = struct_field_scalar(alarm, "status")
+                        .and_then(scalar_as_i64)
+                        .unwrap_or(0);
+                    return Ok(status.into_pyobject(py).unwrap().into_any().unbind());
                 }
                 return Ok(0i64.into_pyobject(py).unwrap().into_any().unbind());
             }
@@ -468,17 +465,23 @@ impl EpicsRsPvaMetadata {
 
     fn keys(&self, py: Python<'_>) -> PyResult<PyObject> {
         let dict = self.get_or_build_dict(py);
-        dict.bind(py).call_method0("keys").map(|v| v.into_any().unbind())
+        dict.bind(py)
+            .call_method0("keys")
+            .map(|v| v.into_any().unbind())
     }
 
     fn values(&self, py: Python<'_>) -> PyResult<PyObject> {
         let dict = self.get_or_build_dict(py);
-        dict.bind(py).call_method0("values").map(|v| v.into_any().unbind())
+        dict.bind(py)
+            .call_method0("values")
+            .map(|v| v.into_any().unbind())
     }
 
     fn items(&self, py: Python<'_>) -> PyResult<PyObject> {
         let dict = self.get_or_build_dict(py);
-        dict.bind(py).call_method0("items").map(|v| v.into_any().unbind())
+        dict.bind(py)
+            .call_method0("items")
+            .map(|v| v.into_any().unbind())
     }
 
     fn __contains__(&self, py: Python<'_>, key: &str) -> PyResult<bool> {
@@ -488,7 +491,9 @@ impl EpicsRsPvaMetadata {
 
     fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
         let dict = self.get_or_build_dict(py);
-        dict.bind(py).call_method0("__iter__").map(|v| v.into_any().unbind())
+        dict.bind(py)
+            .call_method0("__iter__")
+            .map(|v| v.into_any().unbind())
     }
 
     fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
@@ -514,12 +519,7 @@ impl EpicsRsPvaMetadata {
     /// actually removes the entry; subsequent ``__getitem__`` /
     /// ``keys`` see the modified view via the cache.
     #[pyo3(signature = (key, default=None))]
-    fn pop(
-        &self,
-        py: Python<'_>,
-        key: &str,
-        default: Option<PyObject>,
-    ) -> PyResult<PyObject> {
+    fn pop(&self, py: Python<'_>, key: &str, default: Option<PyObject>) -> PyResult<PyObject> {
         let dict = self.get_or_build_dict(py).clone_ref(py);
         let bound = dict.bind(py);
         match bound.call_method1("pop", (key, default.unwrap_or_else(|| py.None()))) {
@@ -531,8 +531,7 @@ impl EpicsRsPvaMetadata {
 
 impl EpicsRsPvaMetadata {
     fn get_or_build_dict(&self, py: Python<'_>) -> &PyObject {
-        self.cached_dict.get_or_init(|| {
-            pvfield_to_metadata(py, &self.field, self.client_time)
-        })
+        self.cached_dict
+            .get_or_init(|| pvfield_to_metadata(py, &self.field, self.client_time))
     }
 }

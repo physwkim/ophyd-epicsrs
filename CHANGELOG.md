@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.12.1 (2026-05-15)
+
+Dependency-only patch: bumps `epics-rs` to 0.17.2, which fixes the
+upstream CA path that caused `MaxSize*_RBV` (longin) reads to return
+0 on the first read after channel connect. Confirmed against the
+mini-beamline IOC — `tests/integration/test_multi_axis_devices.py`
+now passes 4/4 (was 3/4 on 0.17.1).
+
+### Dependencies
+
+- `epics-rs` 0.17.1 → 0.17.2 (transitive: `epics-base-rs`,
+  `epics-ca-rs`, `epics-pva-rs`, `epics-macros-rs` all bumped to
+  0.17.2).
+
 ## v0.12.0 (2026-05-15)
 
 Multi-axis review pass (vs upstream `ophyd` + `ophyd-async`). Each

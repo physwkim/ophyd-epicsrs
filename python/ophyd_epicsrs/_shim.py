@@ -168,17 +168,50 @@ class EpicsRsShimPV:
             cb(read_access=read_access, write_access=write_access, pv=self)
 
     def wait_for_connection(self, timeout=None):
-        result = self._pv.wait_for_connection(timeout=timeout or 5.0)
+        connect_timeout = 5.0 if timeout is None else timeout
+        result = self._pv.wait_for_connection(timeout=connect_timeout)
         if result and not self.connected:
             self._on_connection_change(True)
         if result:
             if self._args.get("value") is None:
-                md = self._pv.get_with_metadata(timeout=timeout or 2.0, form=self.form)
+                read_timeout = 2.0 if timeout is None else timeout
+                md = self._pv.get_with_metadata(
+                    timeout=read_timeout, form=self.form
+                )
                 if md:
                     self._args.update(md)
             if _dispatcher is not None:
                 _process_pending(_dispatcher)
         return result
+
+    def _resolve_string_value(self, value):
+        # Map enum index → enum label so ophyd Signals with string=True
+        # receive a real label, not str(int). DBR_TIME_ENUM monitors don't
+        # carry enum_strs, so we fall back to ctrlvars to populate the cache.
+        if isinstance(value, str) or value is None:
+            return value
+        enum_strs = self._args.get("enum_strs")
+        if enum_strs is None:
+            try:
+                self.get_ctrlvars(timeout=1)
+            except Exception:
+                pass
+            enum_strs = self._args.get("enum_strs")
+        if enum_strs and isinstance(value, int) and not isinstance(value, bool) \
+                and 0 <= value < len(enum_strs):
+            return enum_strs[value]
+        return value
+
+    def _ensure_char_value(self, kwargs):
+        # DBR_TIME_ENUM snapshots omit char_value because enum_strs aren't
+        # in the wire payload. Resolve via cached enum_strs so consumers
+        # (ophyd's _read_changed, run_now in add_callback) see the label.
+        if "char_value" in kwargs:
+            return
+        value = kwargs.get("value")
+        label = self._resolve_string_value(value)
+        if isinstance(label, str) and label is not value:
+            kwargs["char_value"] = label
 
     def get(
         self,
@@ -189,12 +222,17 @@ class EpicsRsShimPV:
         use_monitor=True,
     ):
         if use_monitor and self._args.get("value") is not None:
-            return self._args["value"]
-        md = self._pv.get_with_metadata(timeout=timeout or 2.0, form=self.form)
-        if md is not None:
+            value = self._args["value"]
+        else:
+            read_timeout = 2.0 if timeout is None else timeout
+            md = self._pv.get_with_metadata(timeout=read_timeout, form=self.form)
+            if md is None:
+                return None
             self._args.update(md)
-            return md["value"]
-        return None
+            value = md.get("value")
+        if as_string:
+            return self._resolve_string_value(value)
+        return value
 
     def get_with_metadata(
         self,
@@ -205,11 +243,16 @@ class EpicsRsShimPV:
         use_monitor=False,
     ):
         if use_monitor and self._args.get("value") is not None:
-            return self._args.copy()
-        form = form or self.form
-        md = self._pv.get_with_metadata(timeout=timeout or 2.0, form=form)
-        if md is not None:
-            self._args.update(md)
+            md = self._args.copy()
+        else:
+            form = form or self.form
+            read_timeout = 2.0 if timeout is None else timeout
+            md = self._pv.get_with_metadata(timeout=read_timeout, form=form)
+            if md is not None:
+                self._args.update(md)
+        if md is not None and as_string:
+            md = dict(md)
+            md["value"] = self._resolve_string_value(md.get("value"))
         return md
 
     def put(
@@ -220,6 +263,7 @@ class EpicsRsShimPV:
         use_complete=False,
         callback=None,
         callback_data=None,
+        **kwargs,
     ):
         if callback:
             use_complete = True
@@ -227,6 +271,20 @@ class EpicsRsShimPV:
         if timeout is None:
             timeout = 315569520
         effective_wait = wait or use_complete
+        # Resolve enum label → index. The Rust DBR_ENUM converter expects
+        # an integer; named labels (e.g. "Fixed") come in from ophyd when
+        # string=True. Look up via cached enum_strs, fetching ctrlvars
+        # lazily if needed.
+        if isinstance(value, str):
+            enum_strs = self._args.get("enum_strs")
+            if enum_strs is None:
+                try:
+                    self.get_ctrlvars(timeout=1)
+                except Exception:
+                    pass
+                enum_strs = self._args.get("enum_strs")
+            if enum_strs and value in enum_strs:
+                value = enum_strs.index(value)
         self._pv.put(value, wait=effective_wait, timeout=timeout)
         if callback:
             if callback_data is not None:
@@ -250,15 +308,20 @@ class EpicsRsShimPV:
         self._callbacks[index] = callback
         self._pv.set_monitor_callback(self._on_monitor_update)
         if run_now and self.connected and self._args:
-            callback(pvname=self.pvname, **self._args)
+            initial = dict(self._args)
+            self._ensure_char_value(initial)
+            callback(pvname=self.pvname, **initial)
         return index
 
     def remove_callback(self, index):
         self._callbacks.pop(index, None)
 
     def _on_monitor_update(self, **kwargs):
+        self._ensure_char_value(kwargs)
         self._args.update({k: v for k, v in kwargs.items() if k != "pvname"})
-        for cb in self._callbacks.values():
+        # Snapshot callbacks before iterating to avoid RuntimeError if
+        # another thread mutates _callbacks during dispatch.
+        for cb in list(self._callbacks.values()):
             try:
                 cb(**kwargs)
             except Exception:
@@ -267,13 +330,15 @@ class EpicsRsShimPV:
                 )
 
     def get_timevars(self, timeout=None, warn=True):
-        md = self._pv.get_timevars(timeout=timeout or 1.0)
+        t = 1.0 if timeout is None else timeout
+        md = self._pv.get_timevars(timeout=t)
         if md:
             self._args.update(md)
         return md
 
     def get_ctrlvars(self, timeout=None, warn=True):
-        md = self._pv.get_ctrlvars(timeout=timeout or 1.0)
+        t = 1.0 if timeout is None else timeout
+        md = self._pv.get_ctrlvars(timeout=t)
         if md:
             self._args.update(md)
         return md
@@ -304,6 +369,12 @@ class EpicsRsShimPV:
         self._pv.clear_monitors()
 
     def disconnect(self):
+        # Reset cached connection state so a subsequent wait_for_connection
+        # actually fires _on_connection_change. Without this the dedup in
+        # _on_connection_change silently swallows the next connect event
+        # after IOC reboot / network blip → PV stuck at connected=False
+        # from ophyd's perspective.
+        self.connected = False
         self._pv.disconnect()
 
     def _getarg(self, arg):

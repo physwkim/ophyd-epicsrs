@@ -22,6 +22,9 @@ maturin develop
 Call `use_epicsrs()` once at startup, before constructing any ophyd Signals or Devices:
 
 ```python
+import os
+os.environ.setdefault("OPHYD_CONTROL_LAYER", "dummy")  # see "Avoiding the pyepics dispatcher leak" below
+
 from ophyd_epicsrs import use_epicsrs
 use_epicsrs()
 
@@ -35,6 +38,30 @@ print(motor.read())
 `use_epicsrs()` assigns `ophyd.cl` directly. It must be called before any
 `Signal` or `Device` is constructed, since they capture `ophyd.cl.get_pv`
 at construction time.
+
+### Avoiding the pyepics dispatcher leak
+
+`use_epicsrs()` does `import ophyd` internally. ophyd's `__init__.py` runs
+`set_cl()` at module-import time, which spawns an 8-thread pyepics
+`EventDispatcher` (`metadata`, `monitor`, `get_put`, `util0..3`,
+`debug_monitor`) before `use_epicsrs()` can replace `ophyd.cl`. The
+pyepics dispatcher is then orphaned but its threads keep running idle
+forever.
+
+Set `OPHYD_CONTROL_LAYER=dummy` **before any ophyd import** to make
+ophyd install the no-op dummy shim instead. `use_epicsrs()` then swaps
+`ophyd.cl` from dummy → epics-rs, and only the epics-rs dispatcher
+remains. The dummy shim has no `caget`/`caput` implementation, but the
+swap happens inside `use_epicsrs()` so no user code ever hits the dummy
+control layer.
+
+### Known interactions
+
+- **`bluesky.magics`** (`%mov`, `%movr`, `%wa`, …) — importing the
+  module defines `BlueskyMagics.RE = RunEngine({}, loop=asyncio.new_event_loop())`
+  as a class attribute, which silently spawns a second `RunEngine`
+  instance + asyncio loop + dispatcher just from the import. If you
+  don't use those magics, skip `from bluesky.magics import BlueskyMagics`.
 
 ## PVA support
 

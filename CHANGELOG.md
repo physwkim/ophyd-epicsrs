@@ -1,5 +1,107 @@
 # Changelog
 
+## v0.12.0 (2026-05-15)
+
+Multi-axis review pass (vs upstream `ophyd` + `ophyd-async`). Each
+change closes a finding from the 2026-05-15 review; see the comments
+at the cited file:line for the per-site rationale.
+
+Minor bump because `EpicsRsSignalBackend.set_callback` now raises
+`RuntimeError` when invoked without a running asyncio loop (see
+breaking section below).
+
+### Public API — breaking
+
+- **`EpicsRsSignalBackend.set_callback(cb)`** now raises
+  `RuntimeError` when invoked without a running asyncio loop. The
+  earlier behaviour silently routed monitor events through the Rust
+  dispatch thread, which is unsafe — ophyd-async's Signal cache
+  mutates `asyncio.Event` from the callback, and touching it off the
+  loop thread is undefined behaviour. Migration: call `set_callback`
+  from inside an async context (the normal ophyd-async plan flow on
+  a RunEngine already satisfies this).
+
+### ophyd-async backend (`EpicsRsSignalBackend`)
+
+- `put(None)` now restores the **value the write PV held at connect
+  time** (cached in `_initial_write_value`), matching ophyd-async
+  `_aioca` / `_p4p` semantics. Previously issued a fresh
+  `get_value_async` at put time, so a value change between connect
+  and `put(None)` would write the wrong "initial" value
+  (`_signal_backend.py:134-167`).
+- `get_datakey` now skips schema fields that ophyd-async upstream
+  also skips: `units` for `str`/`bool` datatypes, `precision` for
+  `int`, `limits` for `bool` (`_signal_backend.py:218-251`).
+
+### PVA backend
+
+- `EpicsRsPvaPV.set_connection_callback` now installs a continuous
+  watcher via `PvaClient::connect().on_connect().on_disconnect()
+  .exec()` and fires on every Active transition (initial connect AND
+  every reconnect). Previously a single one-shot probe meant
+  disconnects + reconnects after the first event were invisible —
+  ophyd Devices watching `connected` on a PVA RO signal could stay
+  stuck at `True` after an IOC restart (`pva.rs:706-783`).
+- `EpicsRsPvaContext.bulk_get` / `bulk_get_async` now run a one-shot
+  retry pass for PVs that missed the first attempt (mirrors the CA
+  `bulk_get` retry pattern): `pvconnect` resolves the channel and
+  the get is re-issued (`pva.rs:60-118`).
+- `bulk_get_async` (CA + PVA) switched from `future_into_py_fast` to
+  the standard `future_into_py` so `asyncio.wait_for` cancellation
+  propagates to the underlying Rust work instead of leaving it
+  pinned until `timeout` expires. Per-PV `get_value_async` stays on
+  the fast path (short-lived) (`context.rs:283-292`,
+  `pva.rs:196-205`).
+
+### CA backend
+
+- `EpicsRsPV` connection-event loop now clears `cached_ctrl` AND
+  `native_type` on `ConnectionEvent::NativeTypeChanged`. The record
+  was redefined on the IOC (e.g. `mbbi` replaced with `ai`) or the
+  channel reconnected to a different IOC; keeping the old CTRL
+  metadata would silently re-inject stale `enum_strs` / `units` /
+  limits into subsequent reads (most visibly: enum `char_value`
+  resolves to the wrong label) (`pv.rs:825-841`).
+- `BulkGetCache::get_or_create` now promotes hits to the back of
+  the eviction queue — without LRU promotion the VecDeque tracked
+  insertion order only, and a frequently-read PV registered early
+  could be evicted in favour of one-shot reads once the
+  `BULK_GET_CACHE_LIMIT` ceiling was hit (`context.rs:27-46`).
+- `emit_current_connection_state` / `emit_current_access_state` now
+  reap finished probe handles before pushing so the `emit_tasks`
+  Vec stays bounded by in-flight probes (`pv.rs:316-322,339-341`).
+
+### Wire-conversion correctness
+
+- `pva_put::py_to_scalar` now guards the bool branch with
+  `is_instance_of::<PyBool>()` BEFORE `extract::<bool>()` — under
+  pyo3 0.24 the latter succeeds for any Python int, so a scalar put
+  of `42` was silently converted to `Boolean(true)` on the fallback
+  path (`pva_put.rs:220-239`).
+- `EpicsRsPvaMetadata::__getitem__` now exposes `client_timestamp`
+  on the lazy fast path so callers branching on it see the same
+  marker as the materialised-dict path (`pva_convert.rs:435-447`).
+- `snapshot_to_pydict` now clamps the `f64 → u64` cast for
+  `posixseconds` when the timestamp is negative (clock-skew / pre-
+  epoch edge case) (`convert.rs:192-202`).
+
+### Shim (`_shim.py`)
+
+- Extracted `_ensure_enum_strs()` helper so `_resolve_string_value`
+  and `put` share the lazy ctrlvars fallback (was duplicated).
+- Replaced the bare `315569520` "no timeout" magic number with a
+  named `_PUT_TIMEOUT_INFINITE` constant.
+- Documented why `chid` / `context` remain `None` (pyepics-CA-only
+  attrs that vanilla ophyd never reads on our shim PV).
+
+### Internal — review notes
+
+The review also withdrew two earlier findings on second pass:
+`_NumpyArrayConverter.datakey_dtype(None)` already honours the
+declared `self.dtype` (the `|f8` fallback is genuinely a "no info"
+case), and `_StrConverter` `|S40` matches ophyd-async upstream
+(`core/_signal_backend.py:158`) — not a drift.
+
 ## v0.11.0 (2026-05-11)
 
 Dependency bump — picks up the epics-rs 0.16.0 line (CA + PVA backend

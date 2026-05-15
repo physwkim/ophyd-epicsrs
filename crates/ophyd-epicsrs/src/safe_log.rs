@@ -41,9 +41,57 @@ compile_error!(
     See the workspace Cargo.toml comment for details."
 );
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static PANIC_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
+
+/// Install a chained `panic::set_hook` that bumps `PANIC_COUNT` for
+/// **every** panic in the process (including async-task bodies that
+/// `catch_unwind` does not wrap — those land here via tokio's task
+/// panic propagation and would otherwise be invisible because we
+/// `abort()` JoinHandles instead of `.await`-ing them).
+///
+/// Idempotent: only the first call installs. Chains to the previous
+/// hook so existing stderr / `RUST_BACKTRACE` behaviour is preserved.
+///
+/// Called from `runtime::shared_runtime()` so the hook is in place
+/// before any task is spawned. Process-wide by nature (panic hooks
+/// are global), so panics from non-ophyd code also bump our counter —
+/// acceptable trade-off: the counter is "panics observed in this
+/// process" rather than "panics ophyd-epicsrs caused", and the user
+/// can still inspect the chained default hook's stderr trace to
+/// determine the source.
+pub fn install_panic_hook() {
+    HOOK_INSTALLED.get_or_init(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let prev = PANIC_COUNT.fetch_add(1, Ordering::Relaxed);
+            if prev == 0 {
+                use std::io::Write;
+                let payload_str = info
+                    .payload()
+                    .downcast_ref::<&'static str>()
+                    .copied()
+                    .map(|s| s.to_string())
+                    .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<unknown panic payload>".to_string());
+                let loc = info
+                    .location()
+                    .map(|l| format!("{}:{}", l.file(), l.line()))
+                    .unwrap_or_else(|| "<unknown location>".to_string());
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[ophyd-epicsrs] panic hook fired: {payload_str} at {loc} \
+                     (track via ophyd_epicsrs.caught_panic_count(); subsequent \
+                     panics will only increment the counter)"
+                );
+            }
+            previous(info);
+        }));
+    });
+}
 
 /// Number of caught panics since process start. Useful for tests and
 /// for an introspection function exposed to Python.

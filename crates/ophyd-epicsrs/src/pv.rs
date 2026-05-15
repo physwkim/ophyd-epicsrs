@@ -315,7 +315,13 @@ impl EpicsRsPV {
                 }));
             }
         });
-        self.emit_tasks.lock().push(handle);
+        // Reap finished probe handles before pushing so the Vec doesn't
+        // grow without bound across re-registrations. Probe tasks finish
+        // in milliseconds; this keeps the live-handle count bounded by
+        // in-flight probes only.
+        let mut tasks = self.emit_tasks.lock();
+        tasks.retain(|h| !h.is_finished());
+        tasks.push(handle);
     }
 
     /// Best-effort injection of the current access-rights state for a newly
@@ -338,7 +344,9 @@ impl EpicsRsPV {
                 }));
             }
         });
-        self.emit_tasks.lock().push(handle);
+        let mut tasks = self.emit_tasks.lock();
+        tasks.retain(|h| !h.is_finished());
+        tasks.push(handle);
     }
 }
 
@@ -776,6 +784,8 @@ impl EpicsRsPV {
         let channel = self.channel.clone();
         let conn_cb_ref = self.connection_callback.clone();
         let access_cb_ref = self.access_callback.clone();
+        let cached_ctrl_ref = self.cached_ctrl.clone();
+        let native_type_ref = self.native_type.clone();
         let pvname = self.pvname.clone();
         let handle = self.runtime.spawn(async move {
             loop {
@@ -815,6 +825,22 @@ impl EpicsRsPV {
                         }
                         ConnectionEvent::Unresponsive => {
                             // Echo timed out — TCP still up, no callback emitted
+                        }
+                        ConnectionEvent::NativeTypeChanged { .. } => {
+                            // Record was redefined on the IOC (e.g. `mbbi`
+                            // replaced with `ai`) OR the channel
+                            // reconnected to a different IOC. The cached
+                            // CTRL metadata (units, enum_strs, limits)
+                            // now describes the OLD type — keeping it
+                            // would silently re-inject stale fields into
+                            // subsequent DBR_TIME reads and monitor
+                            // events (most visibly: enum char_value
+                            // resolves to the WRONG label). Drop both
+                            // the cached_ctrl and the cached
+                            // native_type so the next read repopulates
+                            // them from the new record.
+                            *cached_ctrl_ref.lock() = CachedCtrl::default();
+                            *native_type_ref.lock() = None;
                         }
                     }
                     crate::safe_debug!("{pvname}: connection event: {event:?}");

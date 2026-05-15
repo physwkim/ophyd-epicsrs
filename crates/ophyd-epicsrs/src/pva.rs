@@ -25,7 +25,7 @@ use pyo3::types::PyDict;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
-use epics_rs::pva::client_native::context::PvaClient;
+use epics_rs::pva::client_native::context::{ConnectHandle, PvaClient};
 use epics_rs::pva::client_native::ops_v2::SubscriptionHandle;
 use epics_rs::pva::pvdata::{FieldDesc, PvField, ScalarType};
 
@@ -72,10 +72,57 @@ async fn run_bulk_get_pva(
         }));
     }
 
-    let mut results = Vec::with_capacity(pvnames.len());
+    let mut results: Vec<(String, Option<PvField>)> = Vec::with_capacity(pvnames.len());
     for (name, h) in pvnames.into_iter().zip(handles) {
         let result = h.await.ok().flatten();
         results.push((name, result));
+    }
+
+    // One-shot retry pass for first-attempt misses — matches the CA
+    // `run_bulk_get` pattern (context.rs). pvconnect resolves the
+    // channel (search + connect) before re-issuing the get, so PVs
+    // that failed because the search hadn't completed get a second
+    // chance instead of being reported as None.
+    let retry_indices: Vec<usize> = results
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (_, v))| v.is_none().then_some(i))
+        .collect();
+    if !retry_indices.is_empty() {
+        let mut connect_handles = Vec::with_capacity(retry_indices.len());
+        for idx in &retry_indices {
+            let client = client.clone();
+            let name = results[*idx].0.clone();
+            connect_handles.push(tokio::spawn(async move {
+                tokio::time::timeout(dur, client.pvconnect(&name))
+                    .await
+                    .is_ok()
+            }));
+        }
+        let mut ready_indices = Vec::new();
+        for (idx, h) in retry_indices.iter().zip(connect_handles) {
+            if h.await.unwrap_or(false) {
+                ready_indices.push(*idx);
+            }
+        }
+        if !ready_indices.is_empty() {
+            let mut retry_handles = Vec::with_capacity(ready_indices.len());
+            for idx in &ready_indices {
+                let client = client.clone();
+                let name = results[*idx].0.clone();
+                retry_handles.push(tokio::spawn(async move {
+                    tokio::time::timeout(dur, client.pvget(&name))
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                }));
+            }
+            for (idx, h) in ready_indices.into_iter().zip(retry_handles) {
+                if let Some(field) = h.await.ok().flatten() {
+                    results[idx].1 = Some(field);
+                }
+            }
+        }
     }
     results
 }
@@ -191,9 +238,14 @@ impl EpicsRsPvaContext {
         let client = self.client.clone();
         let dur = Duration::from_secs_f64(timeout);
 
-        // Same fast-path async wrapper used by per-PV
-        // ``get_value_async`` — see that method for the trade-offs.
-        pyo3_async_runtimes::tokio::future_into_py_fast(py, async move {
+        // Standard `future_into_py` (not `_fast`): bulk reads can be
+        // wrapped by `asyncio.wait_for` at the bluesky plan layer; the
+        // fast variant skips Cancellable wiring and would let the Rust
+        // futures keep running after the asyncio task is cancelled,
+        // pinning the runtime until `dur` expires. Per-PV
+        // `get_value_async` stays on the fast path because individual
+        // gets are short-lived.
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let results = run_bulk_get_pva(client, pvnames, dur).await;
             Python::with_gil(|py| {
                 let dict = PyDict::new(py);
@@ -238,6 +290,13 @@ pub struct EpicsRsPvaPV {
     /// JoinHandle for set_access_callback's spawned probe task. Same
     /// teardown race as monitor_setup_task — aborted by disconnect.
     access_setup_task: Mutex<Option<JoinHandle<()>>>,
+    /// JoinHandle for the spawned `ConnectBuilder::exec()` setup task.
+    /// Held separately from `connection_task` because the latter is
+    /// only populated AFTER `exec()` resolves — using it as the in-
+    /// flight guard would race a quick re-registration into spawning
+    /// a duplicate setup. Aborted by disconnect/Drop so an unfinished
+    /// builder can't later try to install into a torn-down wrapper.
+    connection_setup_task: Mutex<Option<JoinHandle<()>>>,
     /// Python dispatch thread for monitor callbacks.
     dispatch_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Sender to dispatch thread; None = no monitor active.
@@ -256,8 +315,13 @@ pub struct EpicsRsPvaPV {
     /// slot and the post-await callback fire becomes a no-op even if
     /// the spawned task survived past the abort signal.
     access_callback: Arc<Mutex<Option<PyObject>>>,
-    /// Background task watching the connect handle for state changes.
-    connection_task: Mutex<Option<JoinHandle<()>>>,
+    /// Watcher handle from `PvaClient::connect().exec()`. Dropping the
+    /// `ConnectHandle` cancels the underlying tokio task. Wrapped in
+    /// `Arc<Mutex<...>>` so the async setup task (which calls `exec()`
+    /// off the Python thread) can install the handle from inside the
+    /// runtime; reading/dropping it (from `disconnect()` / `Drop`)
+    /// cancels the watcher.
+    connection_task: Arc<Mutex<Option<ConnectHandle>>>,
     /// Cached connection state — exposed to Python as a fast read.
     connected: Arc<Mutex<bool>>,
     /// NTEnum-shape detection result, populated from the first pvget
@@ -344,13 +408,14 @@ impl EpicsRsPvaPV {
             monitor_handle: Arc::new(Mutex::new(None)),
             monitor_setup_task: Mutex::new(None),
             access_setup_task: Mutex::new(None),
+            connection_setup_task: Mutex::new(None),
             dispatch_thread: Mutex::new(None),
             monitor_tx: Arc::new(Mutex::new(None)),
             py_monitor_callback: Arc::new(Mutex::new(None)),
             monitor_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             connection_callback: Arc::new(Mutex::new(None)),
             access_callback: Arc::new(Mutex::new(None)),
-            connection_task: Mutex::new(None),
+            connection_task: Arc::new(Mutex::new(None)),
             connected: Arc::new(Mutex::new(false)),
             is_ntenum: Arc::new(AtomicU8::new(NTENUM_UNKNOWN)),
             pv_count,
@@ -699,16 +764,35 @@ impl EpicsRsPvaPV {
         *self.monitor_setup_task.lock() = Some(setup);
     }
 
-    /// Set a connection callback. Best-effort: PVA's connect builder
-    /// fires on_connect/on_disconnect, but we attach a lightweight
-    /// background task that polls pvconnect once and emits Connected.
-    /// Disconnect events surface via the monitor task ending.
+    /// Set a connection callback.
+    ///
+    /// Subscribes via `PvaClient::connect(pv).on_connect(...).on_disconnect(...)
+    /// .exec()` so every transition through Active (initial connect AND
+    /// every reconnect) fires the user's callback — previously a single
+    /// one-shot probe meant disconnect/reconnect events were invisible
+    /// to ophyd Devices that watched `connected` on a PVA RO signal.
+    /// Dropping the stored `ConnectHandle` (via clear/disconnect/Drop)
+    /// cancels the watcher task.
     fn set_connection_callback(&self, py: Python<'_>, callback: PyObject) {
         *self.connection_callback.lock() = Some(callback.clone_ref(py));
 
-        // If a connection task already exists, just leave the new cb registered.
-        if self.connection_task.lock().is_some() {
-            // Emit current state immediately so callers see it.
+        // If a watcher is already installed (connection_task populated)
+        // OR currently being set up (connection_setup_task in flight),
+        // the new callback automatically takes effect through the shared
+        // Arc<Mutex<Option<PyObject>>> slot. Emit the current cached
+        // state immediately so callers observing right after registration
+        // see a non-stale view.
+        //
+        // The dual guard closes a race: ConnectBuilder::exec() resolves
+        // asynchronously, so `connection_task` is only populated AFTER
+        // the spawned setup task completes. A second registration that
+        // arrives in the window between spawn() and install would
+        // otherwise spawn another setup task and end up with two
+        // builders racing to write the same slot — the loser's
+        // ConnectHandle is dropped (its watcher cancelled), which is
+        // wasteful but not unsafe. The separate flag turns that into
+        // a no-op as intended.
+        if self.connection_task.lock().is_some() || self.connection_setup_task.lock().is_some() {
             let connected = *self.connected.lock();
             let _ = callback.call1(py, (connected,));
             return;
@@ -716,29 +800,81 @@ impl EpicsRsPvaPV {
 
         let client = self.client.clone();
         let pvname = self.pvname.clone();
-        let cb_ref = self.connection_callback.clone();
-        let connected_ref = self.connected.clone();
+        let cb_ref_connect = self.connection_callback.clone();
+        let cb_ref_disconnect = self.connection_callback.clone();
+        let connected_ref_connect = self.connected.clone();
+        let connected_ref_disconnect = self.connected.clone();
+        let handle_slot = self.connection_task.clone();
+        let kick_client = client.clone();
+        let kick_pvname = pvname.clone();
 
-        let handle = self.runtime.spawn(async move {
-            // One-shot connect probe with bounded timeout. After this,
-            // disconnects are surfaced through the monitor task (if active).
-            let connected =
-                tokio::time::timeout(Duration::from_secs(30), client.pvconnect(&pvname))
-                    .await
-                    .ok()
-                    .and_then(|r| r.ok())
-                    .is_some();
-            *connected_ref.lock() = connected;
-            crate::safe_call!(Python::with_gil(|py| {
-                let guard = cb_ref.lock();
-                if let Some(cb) = &*guard {
-                    let cb_clone = cb.clone_ref(py);
-                    drop(guard);
-                    let _ = cb_clone.call1(py, (connected,));
+        // `ConnectBuilder::exec()` is async — spawn a setup task that
+        // installs the watcher and stashes the resulting handle into
+        // the wrapper's `connection_task` Arc. We do not block the
+        // Python thread on the builder resolving (a slow search would
+        // hang the caller indefinitely). disconnect()/Drop reads the
+        // same Arc to cancel via `ConnectHandle::Drop`.
+        //
+        // The watcher only OBSERVES state transitions — it does not
+        // INITIATE a search. Without an explicit `pvconnect()` kick
+        // the channel sits in Inactive forever (until some other op
+        // happens to trigger the search), and `on_connect` never
+        // fires. Spawn a separate fire-and-forget `pvconnect` so the
+        // first registration actually triggers the search/connect
+        // path; subsequent state changes (disconnect → search →
+        // connect) are then driven by the channel's normal lifecycle.
+        let setup = self.runtime.spawn(async move {
+            // Kick the search/connect off so the watcher has a
+            // transition to observe. Best-effort: failures are
+            // surfaced via the watcher loop, not here.
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    kick_client.pvconnect(&kick_pvname),
+                )
+                .await;
+            });
+            let exec_result = client
+                .connect(&pvname)
+                .on_connect(move || {
+                    *connected_ref_connect.lock() = true;
+                    crate::safe_call!(Python::with_gil(|py| {
+                        let guard = cb_ref_connect.lock();
+                        if let Some(cb) = &*guard {
+                            let cb_clone = cb.clone_ref(py);
+                            drop(guard);
+                            let _ = cb_clone.call1(py, (true,));
+                        }
+                    }));
+                })
+                .on_disconnect(move || {
+                    *connected_ref_disconnect.lock() = false;
+                    crate::safe_call!(Python::with_gil(|py| {
+                        let guard = cb_ref_disconnect.lock();
+                        if let Some(cb) = &*guard {
+                            let cb_clone = cb.clone_ref(py);
+                            drop(guard);
+                            let _ = cb_clone.call1(py, (false,));
+                        }
+                    }));
+                })
+                .exec()
+                .await;
+            match exec_result {
+                Ok(handle) => {
+                    *handle_slot.lock() = Some(handle);
                 }
-            }));
+                Err(e) => {
+                    crate::safe_warn!(
+                        target: "ophyd_epicsrs.pva",
+                        pv = %pvname,
+                        "connect watcher exec failed: {e}"
+                    );
+                }
+            }
         });
-        *self.connection_task.lock() = Some(handle);
+        *self.connection_setup_task.lock() = Some(setup);
+        let _ = py;
     }
 
     /// Access rights callback — PVA does not surface separate access
@@ -811,9 +947,14 @@ impl EpicsRsPvaPV {
         // slot empty and skips the Python call.
         *self.connection_callback.lock() = None;
         *self.access_callback.lock() = None;
-        // Abort spawned probe tasks to prevent post-finalize Python::with_gil
-        // panics. Same pattern as monitor_setup_task.
-        if let Some(handle) = self.connection_task.lock().take() {
+        // Drop the connect watcher — `ConnectHandle::Drop` cancels the
+        // underlying watcher task. Also abort any in-flight setup task
+        // (the ConnectBuilder::exec() future); otherwise a slow first
+        // search could land its handle into a freshly-disconnected
+        // wrapper. The access probe is a plain JoinHandle, abort it
+        // directly.
+        let _ = self.connection_task.lock().take();
+        if let Some(handle) = self.connection_setup_task.lock().take() {
             handle.abort();
         }
         if let Some(handle) = self.access_setup_task.lock().take() {
@@ -1252,9 +1393,12 @@ impl Drop for EpicsRsPvaPV {
         if let Some(h) = self.access_setup_task.lock().take() {
             h.abort();
         }
-        if let Some(h) = self.connection_task.lock().take() {
+        if let Some(h) = self.connection_setup_task.lock().take() {
             h.abort();
         }
+        // ConnectHandle's Drop cancels the watcher task — just take()
+        // and let it drop at end of scope.
+        let _ = self.connection_task.lock().take();
 
         // Decrement the parent context's live-PV counter — see
         // ``EpicsRsPvaContext::pv_count``.

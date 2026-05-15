@@ -432,6 +432,19 @@ impl EpicsRsPvaMetadata {
                     return Ok(ts.into_pyobject(py).unwrap().into_any().unbind());
                 }
             }
+            "client_timestamp" => {
+                // Fast path consistency: the materialised dict path sets
+                // `client_timestamp = True` when there is no IOC-side
+                // timestamp; expose the same marker on the lazy path so
+                // downstream code that branches on it (e.g. skipping
+                // client-stamped readings for time-critical metrics)
+                // works regardless of which path the caller reached.
+                let is_client = match &self.field {
+                    PvField::Structure(s) => s.get_timestamp().is_none(),
+                    _ => true,
+                };
+                return Ok(is_client.into_pyobject(py).unwrap().to_owned().into_any().unbind());
+            }
             "severity" => {
                 if let PvField::Structure(s) = &self.field
                     && let Some(alarm) = s.get_alarm()

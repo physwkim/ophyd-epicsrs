@@ -27,6 +27,15 @@ struct BulkGetCache {
 impl BulkGetCache {
     fn get_or_create(&mut self, client: &CaClient, pvname: &str) -> CaChannel {
         if let Some(channel) = self.channels.get(pvname) {
+            // Promote on hit so hot PVs stay resident. Without this the
+            // VecDeque tracks insertion order only — a frequently-read
+            // PV registered early would be evicted in favour of one-shot
+            // reads once the cache hits the BULK_GET_CACHE_LIMIT ceiling.
+            if let Some(idx) = self.order.iter().position(|n| n == pvname) {
+                if let Some(name) = self.order.remove(idx) {
+                    self.order.push_back(name);
+                }
+            }
             return channel.clone();
         }
 
@@ -280,12 +289,14 @@ impl EpicsRsContext {
                 .collect()
         };
 
-        // `future_into_py_fast` skips add_done_callback / Cancellable /
-        // outer-spawn / scope (~15-25µs/call savings vs the standard
-        // `future_into_py`). Same trade-offs as the per-PV
-        // ``get_value_async`` path: short-lived future, no asyncio
-        // cancellation, no contextvar propagation across the await.
-        pyo3_async_runtimes::tokio::future_into_py_fast(py, async move {
+        // Standard `future_into_py` (not `_fast`): bulk reads can be
+        // wrapped in `asyncio.wait_for` at the bluesky plan layer; the
+        // fast variant skips Cancellable wiring and would let the Rust
+        // futures keep running after the asyncio task is cancelled,
+        // pinning the runtime until `dur` expires. Per-PV
+        // `get_value_async` stays on the fast path because individual
+        // gets are short-lived.
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let results = run_bulk_get(client, snapshots, dur).await;
             Python::with_gil(|py| {
                 let dict = PyDict::new(py);

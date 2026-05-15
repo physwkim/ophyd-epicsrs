@@ -22,6 +22,13 @@ static SHARED_RUNTIME: OnceLock<Arc<Runtime>> = OnceLock::new();
 pub fn shared_runtime() -> Arc<Runtime> {
     SHARED_RUNTIME
         .get_or_init(|| {
+            // Install the panic-counting hook BEFORE any task is
+            // spawned. tokio worker threads inherit the process-wide
+            // hook; without this, a panic inside a spawned future body
+            // (outside `safe_call!` scope) would be invisible because
+            // we never `.await` the JoinHandle.
+            crate::safe_log::install_panic_hook();
+
             let rt = Arc::new(
                 tokio::runtime::Builder::new_multi_thread()
                     .enable_all()

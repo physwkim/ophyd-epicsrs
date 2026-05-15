@@ -55,6 +55,12 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
             self._write_pv_native = self._make_native_pv(write_pv)
         self._monitor_callback: Callback | None = None
         self._converter: Converter = make_converter(datatype)
+        # Cache of the write PV's value at connect-time. `put(None)` reads
+        # from this instead of issuing a fresh get — matches ophyd-async
+        # _aioca / _p4p semantics (the "restore to initial" use case must
+        # see the value the user observed at connect, not whatever the IOC
+        # happens to hold at put time).
+        self._initial_write_value: SignalDatatypeT | None = None
         super().__init__(datatype, read_pv, write_pv, options)
 
     def _make_native_pv(self, pv_name: str):
@@ -131,10 +137,27 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
         if md is not None:
             self._converter.update_metadata(md, source=self.source("", read=True))
 
+        # Snapshot the write PV's value for `put(None)`. Best-effort: if
+        # the read fails we leave the cache as None and `put(None)` will
+        # fall back to a runtime fetch with a helpful error.
+        try:
+            raw = await self._write_pv_native.get_value_async(timeout=phase_to)
+            self._initial_write_value = self._converter.to_python(raw)
+        except Exception:  # noqa: BLE001 — initial-value cache is best-effort
+            self._initial_write_value = None
+
     async def put(self, value: SignalDatatypeT | None):
         if value is None:
-            raw = await self._read_pv_native.get_value_async()
-            wire = self._converter.to_wire(self._converter.to_python(raw))
+            # ophyd-async semantics: `put(None)` restores the value the
+            # write PV held at connect time. Fall back to a runtime fetch
+            # only if the connect-time snapshot is missing — e.g. the
+            # write PV had not yet been put to and the IOC returned an
+            # error we logged in `_connect_inner`.
+            if self._initial_write_value is not None:
+                wire = self._converter.to_wire(self._initial_write_value)
+            else:
+                raw = await self._write_pv_native.get_value_async()
+                wire = self._converter.to_wire(self._converter.to_python(raw))
         else:
             wire = self._converter.to_wire(value)
 
@@ -215,31 +238,54 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
             "shape": shape,
             "dtype_numpy": dtype_numpy,
         }
-        if "units" in md:
+        # Skip rules match ophyd-async _aioca / _p4p: units make no
+        # sense for strings/booleans, precision for ints, limits for
+        # booleans. Emitting them anyway produces noisy schemas that
+        # downstream consumers (event-model) flag as inconsistent.
+        skip_units = self.datatype in (str, bool)
+        skip_precision = self.datatype is int
+        skip_limits = self.datatype is bool
+        if "units" in md and not skip_units:
             datakey["units"] = md["units"]
-        if "precision" in md:
+        if "precision" in md and not skip_precision:
             datakey["precision"] = md["precision"]
         if "enum_strs" in md:
             datakey["choices"] = list(md["enum_strs"])
-        limits: dict[str, dict[str, Any]] = {}
-        for source_lo, source_hi, target in (
-            ("lower_disp_limit", "upper_disp_limit", "display"),
-            ("lower_warning_limit", "upper_warning_limit", "warning"),
-            ("lower_alarm_limit", "upper_alarm_limit", "alarm"),
-            ("lower_ctrl_limit", "upper_ctrl_limit", "control"),
-        ):
-            if source_lo in md or source_hi in md:
-                limits[target] = {
-                    "low": md.get(source_lo, 0.0),
-                    "high": md.get(source_hi, 0.0),
-                }
-        if limits:
-            datakey["limits"] = limits  # type: ignore[typeddict-unknown-key]
+        if not skip_limits:
+            limits: dict[str, dict[str, Any]] = {}
+            for source_lo, source_hi, target in (
+                ("lower_disp_limit", "upper_disp_limit", "display"),
+                ("lower_warning_limit", "upper_warning_limit", "warning"),
+                ("lower_alarm_limit", "upper_alarm_limit", "alarm"),
+                ("lower_ctrl_limit", "upper_ctrl_limit", "control"),
+            ):
+                if source_lo in md or source_hi in md:
+                    limits[target] = {
+                        "low": md.get(source_lo, 0.0),
+                        "high": md.get(source_hi, 0.0),
+                    }
+            if limits:
+                datakey["limits"] = limits  # type: ignore[typeddict-unknown-key]
         return datakey
 
     def set_callback(
         self, callback: Callback[Reading[SignalDatatypeT]] | None
     ) -> None:
+        """Register (or clear) the monitor callback for this signal.
+
+        Sync method (per SignalBackend contract). Must be invoked from
+        inside a running asyncio context — the callback bridges Rust
+        monitor events through ``loop.call_soon_threadsafe`` and
+        ophyd-async's Signal cache mutates ``asyncio.Event`` from the
+        callback, which is unsafe to touch off the loop thread.
+
+        Raises
+        ------
+        RuntimeError
+            If no asyncio loop is running at registration time, OR if a
+            callback is already set on this backend (clear it first via
+            ``set_callback(None)`` to replace).
+        """
         if callback is None:
             self._read_pv_native.clear_monitors()
             self._monitor_callback = None
@@ -252,14 +298,29 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
 
         converter = self._converter
         # Capture the asyncio event loop at registration time. The Rust
-        # monitor dispatch fires _wrapped from a Rust-owned OS thread, but
-        # ophyd-async's Signal cache callback touches asyncio.Event /
+        # monitor dispatch fires _wrapped from a Rust-owned OS thread,
+        # but ophyd-async's Signal cache callback touches asyncio.Event /
         # asyncio.Queue, which are not thread-safe. Bridge via
-        # call_soon_threadsafe so the user callback runs on the loop thread.
+        # call_soon_threadsafe so the user callback runs on the loop
+        # thread.
         try:
             loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
+        except RuntimeError as exc:
+            # No running loop = no thread-safe path to deliver the
+            # callback. The earlier code silently routed events through
+            # a direct call on the Rust dispatch thread, but ophyd-async
+            # Signal cache mutates asyncio.Event from inside the
+            # callback — calling it off the loop thread is undefined.
+            # Fail loud at registration so the bug shows up here rather
+            # than as data-corruption later.
+            raise RuntimeError(
+                f"set_callback on {self.source('', read=True)} requires a "
+                "running asyncio loop — call it from inside an async "
+                "context (e.g. an ophyd-async plan running on a "
+                "RunEngine). Sync set_callback is not supported because "
+                "the ophyd-async monitor callback touches asyncio "
+                "primitives that are not thread-safe."
+            ) from exc
 
         # First-detection guard: when the captured loop closes mid-session
         # (typical: asyncio.run() exits while a monitor is still active),
@@ -280,18 +341,8 @@ class EpicsRsSignalBackend(EpicsSignalBackend[SignalDatatypeT]):
                 "timestamp": kwargs.get("timestamp", 0.0),
                 "alarm_severity": -1 if severity > 2 else severity,
             }
-            if loop is not None and not loop.is_closed():
+            if not loop.is_closed():
                 loop.call_soon_threadsafe(callback, reading)
-            elif loop is None:
-                # set_callback was called from a sync context — caller
-                # accepts that the callback runs on the Rust dispatch
-                # thread. Best-effort direct call.
-                try:
-                    callback(reading)
-                except Exception:  # noqa: BLE001
-                    _logger.exception(
-                        "monitor callback for %s raised", source
-                    )
             elif not loop_closed_handled:
                 loop_closed_handled = True
                 _logger.debug(

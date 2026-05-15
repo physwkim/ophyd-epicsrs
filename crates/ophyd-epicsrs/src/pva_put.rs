@@ -218,7 +218,12 @@ fn infer_dtype_from_list(lst: &Bound<'_, PyList>) -> PyResult<String> {
 }
 
 fn py_to_scalar(value: &Bound<'_, PyAny>) -> PyResult<ScalarValue> {
-    if let Ok(b) = value.extract::<bool>() {
+    // Strict bool check FIRST — `extract::<bool>()` succeeds for any
+    // Python int (pyo3 0.24 semantics), so a fallback-path scalar put
+    // of e.g. `42` would silently become `Boolean(true)`. Mirroring
+    // the same guard convert.rs uses on CA enum routing.
+    if value.is_instance_of::<PyBool>() {
+        let b: bool = value.extract()?;
         return Ok(ScalarValue::Boolean(b));
     }
     if let Ok(i) = value.extract::<i64>() {

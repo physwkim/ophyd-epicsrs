@@ -45,6 +45,15 @@ def use_epicsrs(*, logger=None):
     Replaces ``ophyd.cl`` with the Rust-backed shim. Must be called
     before importing or constructing any ophyd Signals/Devices, since
     they bind ``ophyd.cl.get_pv`` at construction time.
+
+    Idempotent. Calling a second time with the SAME backend already
+    installed re-uses the existing dispatcher (``_shim.setup`` returns
+    the cached instance). Calling AFTER a different backend has been
+    installed silently overwrites ``ophyd.cl``; this is intentional —
+    test suites flip backends mid-run via ``ophyd.set_cl(...)`` and
+    similar — but any pre-existing ``EpicsSignal`` instances will
+    keep their bound ``cl.get_pv`` from construction time and will not
+    pick up the new backend. Construct new Signals after the switch.
     """
     import ophyd
 

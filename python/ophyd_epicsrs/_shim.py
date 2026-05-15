@@ -29,6 +29,13 @@ _dispatcher = None
 _PVA_PREFIX = "pva://"
 _CA_PREFIX = "ca://"
 
+# pyepics `pv.put(timeout=None)` means "no timeout". The Rust put_*
+# methods take an f64 in seconds; ~10 years is functionally infinite
+# for any RunEngine while still inside `Duration::from_secs_f64`'s
+# representable range. Named so callers/reviewers don't wonder where
+# the 315569520 came from.
+_PUT_TIMEOUT_INFINITE = 315569520.0  # ≈ 10 years
+
 
 def _split_protocol(pvname):
     """Return (protocol, bare_name) for a possibly-prefixed PV name."""
@@ -135,6 +142,11 @@ class EpicsRsShimPV:
         self._conn_callbacks = []
         self.access_callbacks = []
         self.connection_callbacks = []
+        # `chid` / `context` are pyepics-CA-specific (CFFI channel handle
+        # and CA context pointer). Vanilla ophyd touches them only from
+        # `_pyepics_shim` itself; our shim path never reaches that code,
+        # so None is the honest value. Kept as attributes so duck-type
+        # `hasattr(pv, "chid")` checks in third-party code still pass.
         self.chid = None
         self.context = None
 
@@ -184,12 +196,15 @@ class EpicsRsShimPV:
                 _process_pending(_dispatcher)
         return result
 
-    def _resolve_string_value(self, value):
-        # Map enum index → enum label so ophyd Signals with string=True
-        # receive a real label, not str(int). DBR_TIME_ENUM monitors don't
-        # carry enum_strs, so we fall back to ctrlvars to populate the cache.
-        if isinstance(value, str) or value is None:
-            return value
+    def _ensure_enum_strs(self):
+        """Return cached enum_strs, fetching ctrlvars lazily if missing.
+
+        DBR_TIME_ENUM monitors don't carry enum_strs on the wire, so
+        the first read may not have populated the cache. Both the
+        string-resolve path (monitor → ophyd) and the put path (label →
+        index) need this fallback; keeping it in one helper avoids
+        drift between the two when behaviour evolves.
+        """
         enum_strs = self._args.get("enum_strs")
         if enum_strs is None:
             try:
@@ -197,6 +212,14 @@ class EpicsRsShimPV:
             except Exception:
                 pass
             enum_strs = self._args.get("enum_strs")
+        return enum_strs
+
+    def _resolve_string_value(self, value):
+        # Map enum index → enum label so ophyd Signals with string=True
+        # receive a real label, not str(int).
+        if isinstance(value, str) or value is None:
+            return value
+        enum_strs = self._ensure_enum_strs()
         if enum_strs and isinstance(value, int) and not isinstance(value, bool) \
                 and 0 <= value < len(enum_strs):
             return enum_strs[value]
@@ -269,20 +292,13 @@ class EpicsRsShimPV:
             use_complete = True
             callback = wrap_callback(_dispatcher, "get_put", callback)
         if timeout is None:
-            timeout = 315569520
+            timeout = _PUT_TIMEOUT_INFINITE
         effective_wait = wait or use_complete
-        # Resolve enum label → index. The Rust DBR_ENUM converter expects
-        # an integer; named labels (e.g. "Fixed") come in from ophyd when
-        # string=True. Look up via cached enum_strs, fetching ctrlvars
-        # lazily if needed.
+        # Resolve enum label → index. The Rust DBR_ENUM converter
+        # expects an integer; named labels (e.g. "Fixed") come in from
+        # ophyd when string=True.
         if isinstance(value, str):
-            enum_strs = self._args.get("enum_strs")
-            if enum_strs is None:
-                try:
-                    self.get_ctrlvars(timeout=1)
-                except Exception:
-                    pass
-                enum_strs = self._args.get("enum_strs")
+            enum_strs = self._ensure_enum_strs()
             if enum_strs and value in enum_strs:
                 value = enum_strs.index(value)
         self._pv.put(value, wait=effective_wait, timeout=timeout)

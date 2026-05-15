@@ -188,7 +188,14 @@ pub fn snapshot_to_pydict(py: Python<'_>, snapshot: &Snapshot) -> PyObject {
     dict.set_item("severity", snapshot.alarm.severity).unwrap();
     let ts = system_time_to_epoch(snapshot.timestamp);
     dict.set_item("timestamp", ts).unwrap();
-    dict.set_item("posixseconds", ts as u64).unwrap();
+    // posixseconds: clamp the f64→u64 cast for pre-epoch / clock-skew
+    // timestamps. Without the clamp, `ts < 0` wraps to a huge positive
+    // u64 (cast saturation behaviour in Rust returns 0 for negative,
+    // but historically older toolchains differed — pin the semantics
+    // explicitly so the value is monotonic and downstream code can
+    // safely treat it as "seconds since epoch").
+    let posix_secs: u64 = if ts >= 0.0 { ts as u64 } else { 0 };
+    dict.set_item("posixseconds", posix_secs).unwrap();
     let nanos = snapshot
         .timestamp
         .duration_since(UNIX_EPOCH)

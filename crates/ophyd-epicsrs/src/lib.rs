@@ -43,6 +43,7 @@ fn ophyd_epicsrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(reset_log_cache, m)?)?;
     m.add_function(wrap_pyfunction!(caught_panic_count, m)?)?;
     m.add_function(wrap_pyfunction!(_reset_panic_count_for_test, m)?)?;
+    m.add_function(wrap_pyfunction!(_trigger_panic_in_task_for_test, m)?)?;
     Ok(())
 }
 
@@ -80,4 +81,19 @@ fn caught_panic_count() -> u64 {
 #[pyfunction]
 fn _reset_panic_count_for_test() {
     safe_log::reset_panic_count_for_test();
+}
+
+/// Test-only: spawn a tokio task whose body panics OUTSIDE any
+/// `safe_call!` scope. Exercises the process-wide panic hook
+/// (`safe_log::install_panic_hook`) which catches panics that the
+/// existing `safe_call!`/`safe_call_or!` wrappers do not — without
+/// the hook these would be invisible because the JoinHandle is
+/// always `abort()`-ed, never `await`-ed. Returns immediately;
+/// callers should sleep briefly then check `caught_panic_count()`.
+#[pyfunction]
+fn _trigger_panic_in_task_for_test() {
+    let rt = runtime::shared_runtime();
+    rt.spawn(async {
+        panic!("ophyd-epicsrs test panic — should be caught by panic hook");
+    });
 }

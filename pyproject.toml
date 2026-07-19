@@ -10,7 +10,7 @@ version = "0.12.1"
 # against this build are still binary-compatible, but signal the
 # expected source-level minimum here.
 requires-python = ">=3.10"
-dependencies = ["ophyd>=1.9", "ophyd-async>=0.16", "bluesky>=1.13"]
+dependencies = ["ophyd==1.6.*", "ophyd-async>=0.16", "bluesky>=1.13"]
 readme = "README.md"
 
 [tool.maturin]

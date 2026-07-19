@@ -1,6 +1,8 @@
 import subprocess
 import sys
 
+import pytest
+
 from ophyd import __version__
 
 import ophyd  # noqa: E402  # isort:skip — version gate

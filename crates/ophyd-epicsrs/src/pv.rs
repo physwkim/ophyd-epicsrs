@@ -664,11 +664,7 @@ impl EpicsRsPV {
                     let _ = kwargs.set_item("value", epics_value_to_py(py, &snap.value));
 
                     // EPICS timestamp
-                    let ts = snap
-                        .timestamp
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs_f64();
+                    let ts = snap.timestamp.since_unix_epoch().as_secs_f64();
                     let _ = kwargs.set_item("timestamp", ts);
 
                     // Alarm status/severity
@@ -683,7 +679,7 @@ impl EpicsRsPV {
                         EpicsValue::Enum(idx) => {
                             if let Some(ref ei) = snap.enums {
                                 if let Some(label) = ei.strings.get(*idx as usize) {
-                                    let _ = kwargs.set_item("char_value", label.as_str());
+                                    let _ = kwargs.set_item("char_value", label.as_str_lossy());
                                 }
                             }
                             // else: omit char_value, Python shim uses cached enum_strs
@@ -823,9 +819,11 @@ impl EpicsRsPV {
                                 }
                             }));
                         }
-                        ConnectionEvent::Unresponsive => {
-                            // Echo timed out — TCP still up, no callback emitted
-                        }
+                        // epics-rs 0.24 folded the old `Unresponsive` variant
+                        // into `Disconnected` (CA's unresponsiveCircuitNotify
+                        // calls the same disconnectNotify as a socket close),
+                        // so an echo timeout now emits the `False` connection
+                        // callback above — matching C CA / pyepics.
                         ConnectionEvent::NativeTypeChanged { .. } => {
                             // Record was redefined on the IOC (e.g. `mbbi`
                             // replaced with `ai`) OR the channel

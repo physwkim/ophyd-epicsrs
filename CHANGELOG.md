@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.13.0 (2026-07-19)
+
+Bumps `epics-rs` 0.17.2 → 0.24.2 and pins the `ophyd` Python
+dependency to `1.6.*` (was `>=1.9`). Minor bump for the behavior
+changes inherited from upstream (see below).
+
+### Behavior changes (inherited from epics-rs 0.24)
+
+- **Unresponsive circuit now fires the connection callback.**
+  Upstream folded `ConnectionEvent::Unresponsive` into
+  `Disconnected` (CA's `unresponsiveCircuitNotify` calls the same
+  `disconnectNotify` as a socket close, `nciu.cpp:161-181`). An echo
+  timeout therefore now delivers `connection_callback(False)`, where
+  0.12.x silently swallowed it. This matches C CA / pyepics.
+- **`bounded_string` field-descriptor kind removed.** The PVA
+  decoder's Interop policy reads a wire bounded string (`0x83`) back
+  as a plain `string` scalar, so the `{"kind": "bounded_string",
+  "max_len": N}` introspection dict can no longer appear.
+- **PVA structure/union/variant array null elements surface as
+  `None`.** Upstream models a pvxs `0x00` null element as `Option::
+  None` (distinct from a present-but-empty element); previously it
+  was indistinguishable from an empty structure.
+- **Non-UTF-8 wire strings no longer error.** Upstream's new
+  `PvString` carries raw wire bytes with no UTF-8 guarantee; this
+  crate renders them to Python `str` via lossy UTF-8 (invalid bytes
+  → U+FFFD), matching pyepics' `errors='replace'` policy. Valid
+  UTF-8 values are byte-identical to 0.12.x.
+- **Windows timestamps keep full nanosecond precision.** Snapshot
+  timestamps are now `WallTime` (integer secs/nanos) instead of
+  `SystemTime`, which is 100 ns-granular on Windows. The
+  `timestamp` / `posixseconds` / `nanoseconds` dict keys are
+  unchanged.
+- New upstream `EpicsValue` / `DbFieldType` unsigned variants
+  (`UChar` / `UShort` / `ULong` / `UInt64` + array forms) and the
+  transient `EnumWithChoices` carrier are handled in the converters.
+  None of them are reachable from a CA client channel today
+  (CA promotes unsigned types to signed/double DBR types);
+  `EnumWithChoices` converts as its index, like `Enum`.
+
+### Dependencies
+
+- `epics-rs` 0.17.2 → 0.24.2 (transitive: `epics-base-rs`,
+  `epics-ca-rs`, `epics-pva-rs`, `epics-macros-rs` 0.24.2).
+- `ophyd` pinned to `1.6.*` (was `>=1.9`).
+- Crate `rust-version` corrected 1.85 → 1.88 to match the workspace
+  (let-chains in epics-base-rs; the workspace manifest already
+  declared 1.88).
+
 ## v0.12.1 (2026-05-15)
 
 Dependency-only patch: bumps `epics-rs` to 0.17.2, which fixes the

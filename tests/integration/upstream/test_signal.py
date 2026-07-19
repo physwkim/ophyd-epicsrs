@@ -13,12 +13,18 @@ from ophyd.areadetector.paths import EpicsPathSignal
 from ophyd.signal import (
     DerivedSignal,
     EpicsSignal,
-    EpicsSignalNoValidation,
     EpicsSignalRO,
-    InternalSignal,
-    InternalSignalError,
     Signal,
 )
+
+try:
+    from ophyd.signal import (
+        EpicsSignalNoValidation,
+        InternalSignal,
+        InternalSignalError,
+    )
+except ImportError:  # not available in ophyd 1.6.x (project pins ophyd==1.6.*)
+    EpicsSignalNoValidation = InternalSignal = InternalSignalError = None
 from ophyd.status import wait
 from ophyd.utils import AlarmSeverity, AlarmStatus, ReadOnlyError
 
@@ -35,6 +41,8 @@ def ro_signal(cleanup, signal_test_ioc):
 
 @pytest.fixture(scope="function")
 def nv_signal(cleanup, signal_test_ioc):
+    if EpicsSignalNoValidation is None:
+        pytest.skip("EpicsSignalNoValidation not available in ophyd 1.6.x")
     sig = EpicsSignalNoValidation(signal_test_ioc.pvs["pair_set"], name="pair_set")
     cleanup.add(sig)
     sig.wait_for_connection()
@@ -173,6 +181,9 @@ def test_signal_describe_fail():
     )
 
 
+@pytest.mark.skipif(
+    InternalSignal is None, reason="InternalSignal not available in ophyd 1.6.x"
+)
 def test_internalsignal_write_from_internal():
     test_signal = InternalSignal(name="test_signal")
     for value in range(10):
@@ -183,6 +194,9 @@ def test_internalsignal_write_from_internal():
         assert test_signal.get() == value
 
 
+@pytest.mark.skipif(
+    InternalSignal is None, reason="InternalSignal not available in ophyd 1.6.x"
+)
 def test_internalsignal_write_protection():
     test_signal = InternalSignal(name="test_signal")
     for value in range(10):

@@ -8,11 +8,15 @@ from ophyd.signal import EpicsSignalRO
 from ophyd.status import (
     DeviceStatus,
     MoveStatus,
-    StableSubscriptionStatus,
     StatusBase,
     SubscriptionStatus,
     UseNewProperty,
 )
+
+try:
+    from ophyd.status import StableSubscriptionStatus
+except ImportError:  # not available in ophyd 1.6.x (project pins ophyd==1.6.*)
+    StableSubscriptionStatus = None
 from ophyd.utils import (
     InvalidState,
     StatusTimeoutError,
@@ -161,6 +165,10 @@ def test_subscription_status_does_not_try_and_stop_ro_device():
     status.log.exception.assert_not_called()
 
 
+@pytest.mark.skipif(
+    StableSubscriptionStatus is None,
+    reason="StableSubscriptionStatus not available in ophyd 1.6.x",
+)
 def test_given_stability_time_greater_than_timeout_then_exception_on_initialisation():
     # Arbitrary device
     d = Device("Tst:Prefix", name="test")
@@ -171,6 +179,10 @@ def test_given_stability_time_greater_than_timeout_then_exception_on_initialisat
         )
 
 
+@pytest.mark.skipif(
+    StableSubscriptionStatus is None,
+    reason="StableSubscriptionStatus not available in ophyd 1.6.x",
+)
 def test_given_callback_stays_stable_then_stable_status_eventual_returns_done():
     # Arbitrary device
     d = Device("Tst:Prefix", name="test")
@@ -196,6 +208,10 @@ def test_given_callback_stays_stable_then_stable_status_eventual_returns_done():
     assert status.done and status.success
 
 
+@pytest.mark.skipif(
+    StableSubscriptionStatus is None,
+    reason="StableSubscriptionStatus not available in ophyd 1.6.x",
+)
 def test_given_callback_fluctuates_and_stabalises_then_stable_status_eventual_returns_done():
     # Arbitrary device
     d = Device("Tst:Prefix", name="test")

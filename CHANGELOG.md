@@ -48,6 +48,14 @@ changes inherited from upstream (see below).
   (let-chains in epics-base-rs; the workspace manifest already
   declared 1.88).
 
+### Tests
+
+- Vendored upstream test modules guard the five symbols that do not
+  exist in ophyd 1.6.x (`EpicsSignalNoValidation`, `InternalSignal`,
+  `InternalSignalError`, `FakeEpicsPathSignal`,
+  `StableSubscriptionStatus`): the affected tests/asserts skip under
+  the 1.6.* pin instead of failing collection.
+
 ## v0.12.1 (2026-05-15)
 
 Dependency-only patch: bumps `epics-rs` to 0.17.2, which fixes the

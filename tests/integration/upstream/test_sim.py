@@ -13,7 +13,6 @@ from ophyd.device import DynamicDeviceComponent as DDCpt
 from ophyd.device import FormattedComponent as FCpt
 from ophyd.signal import EpicsSignal, EpicsSignalRO, Signal
 from ophyd.sim import (
-    FakeEpicsPathSignal,
     FakeEpicsSignal,
     FakeEpicsSignalRO,
     FakeEpicsSignalWithRBV,
@@ -28,6 +27,12 @@ from ophyd.sim import (
     instantiate_fake_device,
     make_fake_device,
 )
+
+try:
+    from ophyd.sim import FakeEpicsPathSignal
+except ImportError:  # not available in ophyd 1.6.x (project pins ophyd==1.6.*)
+    FakeEpicsPathSignal = None
+
 from ophyd.utils import DisconnectedError, LimitError, ReadOnlyError
 
 
@@ -232,7 +237,8 @@ def test_make_fake_device():
     assert make_fake_device(EpicsSignal) == FakeEpicsSignal
     assert make_fake_device(EpicsSignalRO) == FakeEpicsSignalRO
     assert make_fake_device(EpicsSignalWithRBV) == FakeEpicsSignalWithRBV
-    assert make_fake_device(EpicsPathSignal) == FakeEpicsPathSignal
+    if FakeEpicsPathSignal is not None:  # not available in ophyd 1.6.x
+        assert make_fake_device(EpicsPathSignal) == FakeEpicsPathSignal
 
     FakeSample = make_fake_device(Sample)
     my_fake = FakeSample("KITCHEN", name="kitchen")

@@ -45,7 +45,14 @@ pub fn scalar_to_py(py: Python<'_>, val: &ScalarValue) -> PyObject {
         ScalarValue::Float(v) => unsafe {
             PyObject::from_owned_ptr(py, pyo3::ffi::PyFloat_FromDouble(*v as f64))
         },
-        ScalarValue::String(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
+        // PvString is raw wire bytes (no UTF-8 guarantee); lossy view at
+        // the Python boundary, same policy as the CA convert path.
+        ScalarValue::String(v) => v
+            .as_str_lossy()
+            .into_pyobject(py)
+            .unwrap()
+            .into_any()
+            .unbind(),
     }
 }
 
@@ -68,7 +75,10 @@ pub fn typed_array_to_py(py: Python<'_>, arr: &TypedScalarArray) -> PyObject {
         TypedScalarArray::ULong(a) => PyArray1::from_slice(py, a).into_any().unbind(),
         TypedScalarArray::Float(a) => PyArray1::from_slice(py, a).into_any().unbind(),
         TypedScalarArray::Double(a) => PyArray1::from_slice(py, a).into_any().unbind(),
-        TypedScalarArray::String(a) => PyList::new(py, a.iter()).unwrap().into_any().unbind(),
+        TypedScalarArray::String(a) => PyList::new(py, a.iter().map(|s| s.as_str_lossy()))
+            .unwrap()
+            .into_any()
+            .unbind(),
     }
 }
 
@@ -83,24 +93,41 @@ pub fn pvfield_to_py(py: Python<'_>, field: &PvField) -> PyObject {
             .unbind(),
         PvField::ScalarArrayTyped(arr) => typed_array_to_py(py, arr),
         PvField::Structure(s) => structure_to_py(py, s),
-        PvField::StructureArray(arr) => PyList::new(py, arr.iter().map(|s| structure_to_py(py, s)))
-            .unwrap()
-            .into_any()
-            .unbind(),
+        // epics-rs 0.24: structure/union/variant array elements are
+        // Option — a pvxs 0x00 null element decodes as None and surfaces
+        // as Python None (distinct from a present-but-empty element).
+        PvField::StructureArray(arr) => PyList::new(
+            py,
+            arr.iter().map(|s| match s {
+                Some(s) => structure_to_py(py, s),
+                None => py.None(),
+            }),
+        )
+        .unwrap()
+        .into_any()
+        .unbind(),
         PvField::Union { value, .. } => pvfield_to_py(py, value),
-        PvField::UnionArray(items) => {
-            PyList::new(py, items.iter().map(|it| pvfield_to_py(py, &it.value)))
-                .unwrap()
-                .into_any()
-                .unbind()
-        }
+        PvField::UnionArray(items) => PyList::new(
+            py,
+            items.iter().map(|it| match it {
+                Some(it) => pvfield_to_py(py, &it.value),
+                None => py.None(),
+            }),
+        )
+        .unwrap()
+        .into_any()
+        .unbind(),
         PvField::Variant(v) => pvfield_to_py(py, &v.value),
-        PvField::VariantArray(items) => {
-            PyList::new(py, items.iter().map(|it| pvfield_to_py(py, &it.value)))
-                .unwrap()
-                .into_any()
-                .unbind()
-        }
+        PvField::VariantArray(items) => PyList::new(
+            py,
+            items.iter().map(|it| match it {
+                Some(it) => pvfield_to_py(py, &it.value),
+                None => py.None(),
+            }),
+        )
+        .unwrap()
+        .into_any()
+        .unbind(),
         PvField::Null => py.None(),
     }
 }
@@ -156,7 +183,7 @@ fn struct_field_scalar<'a>(s: &'a PvStructure, name: &str) -> Option<&'a ScalarV
 
 fn struct_field_string(s: &PvStructure, name: &str) -> Option<String> {
     match s.get_field(name)? {
-        PvField::Scalar(ScalarValue::String(v)) => Some(v.clone()),
+        PvField::Scalar(ScalarValue::String(v)) => Some(v.as_str_lossy().into_owned()),
         _ => None,
     }
 }
@@ -190,11 +217,13 @@ fn extract_ntenum(s: &PvStructure) -> Option<(i32, Vec<String>)> {
     }
     let index = struct_field_scalar(enum_struct, "index").and_then(scalar_as_i64)? as i32;
     let choices = match enum_struct.get_field("choices")? {
-        PvField::ScalarArrayTyped(TypedScalarArray::String(arr)) => arr.iter().cloned().collect(),
+        PvField::ScalarArrayTyped(TypedScalarArray::String(arr)) => {
+            arr.iter().map(|s| s.as_str_lossy().into_owned()).collect()
+        }
         PvField::ScalarArray(arr) => arr
             .iter()
             .filter_map(|v| match v {
-                ScalarValue::String(s) => Some(s.clone()),
+                ScalarValue::String(s) => Some(s.as_str_lossy().into_owned()),
                 _ => None,
             })
             .collect(),
@@ -443,7 +472,12 @@ impl EpicsRsPvaMetadata {
                     PvField::Structure(s) => s.get_timestamp().is_none(),
                     _ => true,
                 };
-                return Ok(is_client.into_pyobject(py).unwrap().to_owned().into_any().unbind());
+                return Ok(is_client
+                    .into_pyobject(py)
+                    .unwrap()
+                    .to_owned()
+                    .into_any()
+                    .unbind());
             }
             "severity" => {
                 if let PvField::Structure(s) = &self.field

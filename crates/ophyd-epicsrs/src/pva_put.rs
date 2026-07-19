@@ -147,12 +147,16 @@ fn list_to_typed_array(lst: &Bound<'_, PyList>, hint: Option<&str>) -> PyResult<
     };
     match resolved.as_str() {
         "string" | "|S" | "|U" | "<U" | ">U" => {
-            let mut v: Vec<String> = Vec::with_capacity(len);
+            let mut v: Vec<epics_rs::base::types::PvString> = Vec::with_capacity(len);
             for item in lst.iter() {
-                v.push(item.extract::<String>().or_else(|_| {
-                    // Allow non-str via str() coercion
-                    item.str().map(|s| s.to_string())
-                })?);
+                v.push(
+                    item.extract::<String>()
+                        .or_else(|_| {
+                            // Allow non-str via str() coercion
+                            item.str().map(|s| s.to_string())
+                        })?
+                        .into(),
+                );
             }
             Ok(TypedScalarArray::String(Arc::from(v)))
         }
@@ -233,7 +237,7 @@ fn py_to_scalar(value: &Bound<'_, PyAny>) -> PyResult<ScalarValue> {
         return Ok(ScalarValue::Double(f));
     }
     if let Ok(s) = value.extract::<String>() {
-        return Ok(ScalarValue::String(s));
+        return Ok(ScalarValue::String(s.into()));
     }
     Err(PyTypeError::new_err(format!(
         "cannot convert {value:?} to PVA scalar"
@@ -245,7 +249,8 @@ fn py_to_scalar_with_hint(value: &Bound<'_, PyAny>, hint: &str) -> PyResult<Scal
         "string" | "|S" | "|U" | "<U" | ">U" => Ok(ScalarValue::String(
             value
                 .extract::<String>()
-                .or_else(|_| value.str().map(|s| s.to_string()))?,
+                .or_else(|_| value.str().map(|s| s.to_string()))?
+                .into(),
         )),
         "|b1" => Ok(ScalarValue::Boolean(value.extract()?)),
         "|i1" => Ok(ScalarValue::Byte(value.extract()?)),

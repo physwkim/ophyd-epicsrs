@@ -1,7 +1,5 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use epics_rs::base::server::snapshot::Snapshot;
-use epics_rs::base::types::EpicsValue;
+use epics_rs::base::types::{EpicsValue, WallTime};
 use numpy::PyArray1;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
@@ -23,7 +21,24 @@ pub fn epics_value_to_py(py: Python<'_>, val: &EpicsValue) -> PyObject {
         EpicsValue::Short(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
         EpicsValue::Char(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
         EpicsValue::Enum(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
-        EpicsValue::String(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
+        // Transient pvalink-server carrier; behaves exactly like Enum
+        // everywhere else (labels are for the IOC's put_field only).
+        EpicsValue::EnumWithChoices { index, .. } => {
+            index.into_pyobject(py).unwrap().into_any().unbind()
+        }
+        EpicsValue::UChar(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
+        EpicsValue::UShort(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
+        EpicsValue::ULong(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
+        EpicsValue::UInt64(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
+        // PvString carries raw wire bytes with no UTF-8 guarantee; the
+        // lossy view (U+FFFD for invalid bytes) matches pyepics'
+        // `errors='replace'` decode policy at the Python boundary.
+        EpicsValue::String(v) => v
+            .as_str_lossy()
+            .into_pyobject(py)
+            .unwrap()
+            .into_any()
+            .unbind(),
         EpicsValue::DoubleArray(v) => PyArray1::from_slice(py, v).into_any().unbind(),
         EpicsValue::FloatArray(v) => PyArray1::from_slice(py, v).into_any().unbind(),
         EpicsValue::LongArray(v) => PyArray1::from_slice(py, v).into_any().unbind(),
@@ -31,7 +46,14 @@ pub fn epics_value_to_py(py: Python<'_>, val: &EpicsValue) -> PyObject {
         EpicsValue::ShortArray(v) => PyArray1::from_slice(py, v).into_any().unbind(),
         EpicsValue::CharArray(v) => PyArray1::from_slice(py, v).into_any().unbind(),
         EpicsValue::EnumArray(v) => PyArray1::from_slice(py, v).into_any().unbind(),
-        EpicsValue::StringArray(v) => PyList::new(py, v.iter()).unwrap().into_any().unbind(),
+        EpicsValue::UCharArray(v) => PyArray1::from_slice(py, v).into_any().unbind(),
+        EpicsValue::UShortArray(v) => PyArray1::from_slice(py, v).into_any().unbind(),
+        EpicsValue::ULongArray(v) => PyArray1::from_slice(py, v).into_any().unbind(),
+        EpicsValue::UInt64Array(v) => PyArray1::from_slice(py, v).into_any().unbind(),
+        EpicsValue::StringArray(v) => PyList::new(py, v.iter().map(|s| s.as_str_lossy()))
+            .unwrap()
+            .into_any()
+            .unbind(),
     }
 }
 
@@ -96,6 +118,32 @@ pub fn py_to_epics_value(
             let v: u8 = obj.extract()?;
             Ok(EpicsValue::Char(v))
         }
+        // Unsigned internal types (epics-rs 0.24): no CA wire code exists
+        // for these — the IOC promotes them to signed/double DBR types —
+        // so a CA client channel never reports them as native_type. Kept
+        // total so the conversion is usable if a future wire path (PVA
+        // ioc-side) routes through here.
+        DbFieldType::UChar => {
+            if let Ok(s) = obj.extract::<String>() {
+                let mut bytes = s.into_bytes();
+                bytes.push(0);
+                return Ok(EpicsValue::UCharArray(bytes));
+            }
+            let v: u8 = obj.extract()?;
+            Ok(EpicsValue::UChar(v))
+        }
+        DbFieldType::UShort => {
+            let v: u16 = obj.extract()?;
+            Ok(EpicsValue::UShort(v))
+        }
+        DbFieldType::ULong => {
+            let v: u32 = obj.extract()?;
+            Ok(EpicsValue::ULong(v))
+        }
+        DbFieldType::UInt64 => {
+            let v: u64 = obj.extract()?;
+            Ok(EpicsValue::UInt64(v))
+        }
         DbFieldType::Enum => {
             // Try integer first, then parse string as integer.
             // Named enum strings (e.g. "Enable") are resolved in the Python shim
@@ -117,7 +165,7 @@ pub fn py_to_epics_value(
         }
         DbFieldType::String => {
             let v: String = obj.extract()?;
-            Ok(EpicsValue::String(v))
+            Ok(EpicsValue::String(v.into()))
         }
     }
 }
@@ -159,21 +207,44 @@ fn py_sequence_to_epics_array(
             let v: Vec<u8> = obj.extract()?;
             Ok(EpicsValue::CharArray(v))
         }
+        // Unsigned internal types — unreachable from a CA channel's
+        // native_type (see the scalar match above), kept total.
+        DbFieldType::UChar => {
+            if let Ok(s) = obj.extract::<String>() {
+                let mut bytes = s.into_bytes();
+                bytes.push(0);
+                return Ok(EpicsValue::UCharArray(bytes));
+            }
+            let v: Vec<u8> = obj.extract()?;
+            Ok(EpicsValue::UCharArray(v))
+        }
+        DbFieldType::UShort => {
+            let v: Vec<u16> = obj.extract()?;
+            Ok(EpicsValue::UShortArray(v))
+        }
+        DbFieldType::ULong => {
+            let v: Vec<u32> = obj.extract()?;
+            Ok(EpicsValue::ULongArray(v))
+        }
+        DbFieldType::UInt64 => {
+            let v: Vec<u64> = obj.extract()?;
+            Ok(EpicsValue::UInt64Array(v))
+        }
         DbFieldType::Enum => {
             let v: Vec<u16> = obj.extract()?;
             Ok(EpicsValue::EnumArray(v))
         }
         DbFieldType::String => {
             let v: Vec<String> = obj.extract()?;
-            Ok(EpicsValue::StringArray(v))
+            Ok(EpicsValue::StringArray(
+                v.into_iter().map(Into::into).collect(),
+            ))
         }
     }
 }
 
-fn system_time_to_epoch(t: SystemTime) -> f64 {
-    t.duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+fn wall_time_to_epoch(t: WallTime) -> f64 {
+    t.since_unix_epoch().as_secs_f64()
 }
 
 /// Convert a Snapshot to a Python dict with ophyd-compatible metadata keys.
@@ -186,7 +257,7 @@ pub fn snapshot_to_pydict(py: Python<'_>, snapshot: &Snapshot) -> PyObject {
         .unwrap();
     dict.set_item("status", snapshot.alarm.status).unwrap();
     dict.set_item("severity", snapshot.alarm.severity).unwrap();
-    let ts = system_time_to_epoch(snapshot.timestamp);
+    let ts = wall_time_to_epoch(snapshot.timestamp);
     dict.set_item("timestamp", ts).unwrap();
     // posixseconds: clamp the f64→u64 cast for pre-epoch / clock-skew
     // timestamps. Without the clamp, `ts < 0` wraps to a huge positive
@@ -196,11 +267,7 @@ pub fn snapshot_to_pydict(py: Python<'_>, snapshot: &Snapshot) -> PyObject {
     // safely treat it as "seconds since epoch").
     let posix_secs: u64 = if ts >= 0.0 { ts as u64 } else { 0 };
     dict.set_item("posixseconds", posix_secs).unwrap();
-    let nanos = snapshot
-        .timestamp
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
+    let nanos = snapshot.timestamp.subsec_nanos();
     dict.set_item("nanoseconds", nanos).unwrap();
 
     // char_value: string representation matching pyepics behavior.
@@ -210,7 +277,7 @@ pub fn snapshot_to_pydict(py: Python<'_>, snapshot: &Snapshot) -> PyObject {
             if let Some(ref ei) = snapshot.enums {
                 ei.strings
                     .get(*idx as usize)
-                    .cloned()
+                    .map(|s| s.as_str_lossy().into_owned())
                     .unwrap_or_else(|| idx.to_string())
             } else {
                 idx.to_string()
@@ -226,7 +293,7 @@ pub fn snapshot_to_pydict(py: Python<'_>, snapshot: &Snapshot) -> PyObject {
 
     if let Some(ref disp) = snapshot.display {
         dict.set_item("precision", disp.precision).unwrap();
-        dict.set_item("units", &disp.units).unwrap();
+        dict.set_item("units", disp.units.as_str_lossy()).unwrap();
         dict.set_item("upper_disp_limit", disp.upper_disp_limit)
             .unwrap();
         dict.set_item("lower_disp_limit", disp.lower_disp_limit)
@@ -249,7 +316,7 @@ pub fn snapshot_to_pydict(py: Python<'_>, snapshot: &Snapshot) -> PyObject {
     }
 
     if let Some(ref enums) = snapshot.enums {
-        let tuple = PyTuple::new(py, enums.strings.iter()).unwrap();
+        let tuple = PyTuple::new(py, enums.strings.iter().map(|s| s.as_str_lossy())).unwrap();
         dict.set_item("enum_strs", tuple).unwrap();
     }
 

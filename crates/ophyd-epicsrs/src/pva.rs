@@ -1465,11 +1465,10 @@ fn field_desc_to_py<'py>(py: Python<'py>, desc: &FieldDesc) -> Bound<'py, PyDict
         }
         FieldDesc::VariantArray => {
             let _ = dict.set_item("kind", "variant_array");
-        }
-        FieldDesc::BoundedString(max_len) => {
-            let _ = dict.set_item("kind", "bounded_string");
-            let _ = dict.set_item("max_len", *max_len);
-        }
+        } // epics-rs 0.24 removed FieldDesc::BoundedString: the decoder's
+          // Interop policy reads a wire bounded string (0x83) back as a
+          // plain `Scalar(String)`, so the "bounded_string" kind can no
+          // longer reach this introspection dict.
     }
     dict
 }

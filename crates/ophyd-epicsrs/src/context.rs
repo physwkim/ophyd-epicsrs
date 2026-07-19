@@ -108,7 +108,7 @@ async fn run_bulk_get(
 
     names
         .into_iter()
-        .zip(raw.into_iter())
+        .zip(raw)
         .map(|(name, res)| (name, res.ok().map(|(_dbr, val)| val)))
         .collect()
 }

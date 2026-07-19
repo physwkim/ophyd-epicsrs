@@ -6,6 +6,10 @@ import numpy as np
 import pytest
 
 from ophyd import Component, Device, FormattedComponent
+
+import ophyd  # noqa: E402  # isort:skip — version gate
+
+OPHYD_1_6 = ophyd.__version__.startswith("1.6.")
 from ophyd.device import (
     ComponentWalk,
     create_device_from_components,
@@ -931,6 +935,10 @@ def test_non_Divice_mixin_with_components():
         t.b
 
 
+@pytest.mark.skipif(
+    OPHYD_1_6,
+    reason="upstream ophyd changed this behavior after 1.6; project pins ophyd==1.6.*",
+)
 def test_annotated_device():
     class MyDevice(Device):
         cpt1 = Component[Signal](Signal)
@@ -948,6 +956,10 @@ def test_annotated_device():
     assert MyDevice.cpt4._get_class_from_annotation() is None
 
 
+@pytest.mark.skipif(
+    OPHYD_1_6,
+    reason="upstream ophyd changed this behavior after 1.6; project pins ophyd==1.6.*",
+)
 @pytest.mark.parametrize(
     "initial, after",
     [
@@ -973,6 +985,10 @@ def test_trigger_value(initial, after):
     assert d.strigger.get() == after
 
 
+@pytest.mark.skipif(
+    OPHYD_1_6,
+    reason="upstream ophyd changed this behavior after 1.6; project pins ophyd==1.6.*",
+)
 def test_child_separator():
     class Test(Device):
         a = Component(Signal)

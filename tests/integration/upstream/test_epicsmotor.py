@@ -9,6 +9,10 @@ from numpy.testing import assert_allclose
 
 from ophyd import Component as Cpt
 from ophyd import EpicsMotor, MotorBundle
+
+import ophyd  # noqa: E402  # isort:skip — version gate
+
+OPHYD_1_6 = ophyd.__version__.startswith("1.6.")
 from ophyd.utils import UnknownStatusFailure
 from ophyd.utils.epics_pvs import AlarmSeverity, AlarmStatus
 
@@ -261,6 +265,10 @@ def test_hints(motor):
     assert motor.hints == {"fields": list(motor.user_setpoint.read())}
 
 
+@pytest.mark.skipif(
+    OPHYD_1_6,
+    reason="upstream ophyd changed this behavior after 1.6; project pins ophyd==1.6.*",
+)
 @pytest.mark.motorsim
 def test_watchers(motor):
 

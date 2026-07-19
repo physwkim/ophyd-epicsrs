@@ -6,6 +6,10 @@ import numpy as np
 import pytest
 
 from ophyd import Signal
+
+import ophyd  # noqa: E402  # isort:skip — version gate
+
+OPHYD_1_6 = ophyd.__version__.startswith("1.6.")
 from ophyd.utils import epics_pvs as epics_utils
 from ophyd.utils import make_dir_tree, makedirs
 
@@ -45,6 +49,10 @@ def test_records_from_db():
     assert ("bo", "$(P)$(S)_calcEnable") in records
 
 
+@pytest.mark.skipif(
+    OPHYD_1_6,
+    reason="upstream ophyd changed this behavior after 1.6; project pins ophyd==1.6.*",
+)
 @pytest.mark.parametrize(
     "value, dtype, shape",
     [

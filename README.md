@@ -493,7 +493,7 @@ force re-check on the next event.
 ## Requirements
 
 - Python >= 3.10
-- ophyd >= 1.9 (vanilla PyPI — no fork required)
+- ophyd == 1.6.* (vanilla PyPI — no fork required)
 - ophyd-async >= 0.16 (only required if you use `ophyd_epicsrs.ophyd_async`)
 - bluesky >= 1.13
 - [epics-rs](https://github.com/epics-rs/epics-rs) >= 0.13 (bundled at build time)

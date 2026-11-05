@@ -728,13 +728,19 @@ impl EpicsRsPvaPV {
         let handle_slot = self.monitor_handle.clone();
         let setup = self.runtime.spawn(async move {
             match client
-                .pvmonitor_handle(&pvname_for_call, move |_desc, value| {
-                    let event = PvaMonitorEvent {
-                        pvname: pvname_for_event.clone(),
-                        field: value.clone(),
-                    };
-                    let _ = tx.send(event);
-                })
+                .pvmonitor_handle(
+                    &pvname_for_call,
+                    move |_desc, value| {
+                        let event = PvaMonitorEvent {
+                            pvname: pvname_for_event.clone(),
+                            field: value.clone(),
+                        };
+                        let _ = tx.send(event);
+                    },
+                    // Connection state is owned by the ConnectHandle
+                    // watcher installed in set_connection_callback.
+                    |_| {},
+                )
                 .await
             {
                 Ok(handle) => {

@@ -8,6 +8,7 @@ use pyo3::prelude::*;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
+use epics_rs::base::error::CaError;
 use epics_rs::base::server::snapshot::{ControlInfo, DbrClass, DisplayInfo, EnumInfo, Snapshot};
 use epics_rs::base::types::DbFieldType;
 use epics_rs::base::types::EpicsValue;
@@ -173,14 +174,12 @@ impl EpicsRsPV {
             // DBR_CTRL read: value + alarm + timestamp + units/precision/limits.
             // Fetching CTRL upfront eliminates the race where describe() runs
             // before the lazy CTRL fetch completes (EpicsSignalRO after copy()).
-            let snapshot = match tokio::time::timeout(
-                Duration::from_secs(2),
-                prefetch_ch.get_with_metadata(DbrClass::Ctrl),
-            )
-            .await
+            let snapshot = match prefetch_ch
+                .get_with_metadata(DbrClass::Ctrl, Duration::from_secs(2))
+                .await
             {
-                Ok(Ok(s)) => s,
-                _ => return None,
+                Ok(s) => s,
+                Err(_) => return None,
             };
             // Eagerly populate the CTRL cache so the very first
             // get_reading_async("time") (or anything else that lands on
@@ -395,9 +394,7 @@ impl EpicsRsPV {
             self.spawn_wait(async move {
                 channel.wait_connected(dur).await?;
                 let info = channel.info().await?;
-                let snapshot = tokio::time::timeout(dur, channel.get_with_metadata(DbrClass::Ctrl))
-                    .await
-                    .map_err(|_| epics_rs::base::error::CaError::Timeout)??;
+                let snapshot = channel.get_with_metadata(DbrClass::Ctrl, dur).await?;
                 Ok::<_, epics_rs::base::error::CaError>((info, snapshot))
             })
         })?;
@@ -477,13 +474,11 @@ impl EpicsRsPV {
         };
 
         let result = py.allow_threads(|| {
-            self.spawn_wait(async move {
-                tokio::time::timeout(dur, channel.get_with_metadata_count(class, count)).await
-            })
+            self.spawn_wait(async move { channel.get_with_metadata_count(class, count, dur).await })
         })?;
 
         match result {
-            Ok(Ok(mut snapshot)) => {
+            Ok(mut snapshot) => {
                 *self.native_type.lock() = Some(snapshot.value.dbr_type());
                 // DBR_TIME (the default form) ships value + alarm +
                 // timestamp only — no display/control/enums fields.
@@ -494,12 +489,12 @@ impl EpicsRsPV {
                 self.cached_ctrl.lock().enrich(&mut snapshot);
                 Ok(Some(snapshot_to_pydict(py, &snapshot)))
             }
-            Ok(Err(e)) => {
-                tracing::warn!(target: "ophyd_epicsrs.ca", pv = %self.pvname, "get_with_metadata failed: {e}");
+            Err(CaError::Timeout) => {
+                tracing::warn!(target: "ophyd_epicsrs.ca", pv = %self.pvname, "get_with_metadata timed out");
                 Ok(None)
             }
-            Err(_) => {
-                tracing::warn!(target: "ophyd_epicsrs.ca", pv = %self.pvname, "get_with_metadata timed out");
+            Err(e) => {
+                tracing::warn!(target: "ophyd_epicsrs.ca", pv = %self.pvname, "get_with_metadata failed: {e}");
                 Ok(None)
             }
         }
@@ -533,14 +528,12 @@ impl EpicsRsPV {
         if wait {
             // Blocking put — wait for write_notify response
             let result = py.allow_threads(|| {
-                self.spawn_wait(
-                    async move { tokio::time::timeout(dur, channel.put(&epics_val)).await },
-                )
+                self.spawn_wait(async move { channel.put_with_timeout(&epics_val, dur).await })
             })?;
             match result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => return Err(PyRuntimeError::new_err(format!("put failed: {e}"))),
-                Err(_) => return Err(PyRuntimeError::new_err("put timed out")),
+                Ok(()) => {}
+                Err(CaError::Timeout) => return Err(PyRuntimeError::new_err("put timed out")),
+                Err(e) => return Err(PyRuntimeError::new_err(format!("put failed: {e}"))),
             }
             // Completion callback after write confirmed
             if let Some(cb) = callback {
@@ -554,14 +547,14 @@ impl EpicsRsPV {
             // Pass success=True/False so the shim can propagate failure.
             let pvname = self.pvname.clone();
             self.runtime.spawn(async move {
-                let success = match tokio::time::timeout(dur, channel.put(&epics_val)).await {
-                    Ok(Ok(())) => true,
-                    Ok(Err(e)) => {
-                        crate::safe_warn!(target: "ophyd_epicsrs.ca", pv = %pvname, "put error: {e}");
+                let success = match channel.put_with_timeout(&epics_val, dur).await {
+                    Ok(()) => true,
+                    Err(CaError::Timeout) => {
+                        crate::safe_warn!(target: "ophyd_epicsrs.ca", pv = %pvname, "put timed out");
                         false
                     }
-                    Err(_) => {
-                        crate::safe_warn!(target: "ophyd_epicsrs.ca", pv = %pvname, "put timed out");
+                    Err(e) => {
+                        crate::safe_warn!(target: "ophyd_epicsrs.ca", pv = %pvname, "put error: {e}");
                         false
                     }
                 };
@@ -691,7 +684,8 @@ impl EpicsRsPV {
                             let _ = kwargs.set_item("char_value", s.as_ref());
                         }
                         other => {
-                            let _ = kwargs.set_item("char_value", format!("{other}"));
+                            let _ = kwargs
+                                .set_item("char_value", crate::convert::char_value_text(other));
                         }
                     }
 
@@ -994,8 +988,8 @@ impl EpicsRsPV {
         let cache = self.native_type.clone();
         let pvname = self.pvname.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            match tokio::time::timeout(dur, channel.get()).await {
-                Ok(Ok((_dbr, val))) => {
+            match channel.get_with_timeout(dur).await {
+                Ok((_dbr, val)) => {
                     *cache.lock() = Some(val.dbr_type());
                     crate::safe_call_or!(
                         Err(PyRuntimeError::new_err(format!(
@@ -1006,11 +1000,11 @@ impl EpicsRsPV {
                         ))
                     )
                 }
-                Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
-                    "get on {pvname} failed: {e}"
-                ))),
-                Err(_) => Err(pyo3::exceptions::PyTimeoutError::new_err(format!(
+                Err(CaError::Timeout) => Err(pyo3::exceptions::PyTimeoutError::new_err(format!(
                     "get on {pvname} timed out after {timeout}s"
+                ))),
+                Err(e) => Err(PyRuntimeError::new_err(format!(
+                    "get on {pvname} failed: {e}"
                 ))),
             }
         })
@@ -1035,8 +1029,8 @@ impl EpicsRsPV {
         let cached_ctrl = self.cached_ctrl.clone();
         let pvname = self.pvname.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            match tokio::time::timeout(dur, channel.get_with_metadata(class)).await {
-                Ok(Ok(mut snapshot)) => {
+            match channel.get_with_metadata(class, dur).await {
+                Ok(mut snapshot) => {
                     *cache.lock() = Some(snapshot.value.dbr_type());
                     // Capture if this read brought CTRL fields, then
                     // enrich any DBR_TIME read with the cache so the
@@ -1055,11 +1049,11 @@ impl EpicsRsPV {
                         ))
                     )
                 }
-                Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
-                    "get_reading on {pvname} failed: {e}"
-                ))),
-                Err(_) => Err(pyo3::exceptions::PyTimeoutError::new_err(format!(
+                Err(CaError::Timeout) => Err(pyo3::exceptions::PyTimeoutError::new_err(format!(
                     "get_reading on {pvname} timed out after {timeout}s"
+                ))),
+                Err(e) => Err(PyRuntimeError::new_err(format!(
+                    "get_reading on {pvname} failed: {e}"
                 ))),
             }
         })
@@ -1120,14 +1114,14 @@ impl EpicsRsPV {
                     "put on {pvname}: native-type resolution consumed the entire {timeout}s budget"
                 )));
             }
-            match tokio::time::timeout(remaining, channel.put(&epics_val)).await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
-                    "put on {pvname} failed: {e}"
-                ))),
-                Err(_) => Err(pyo3::exceptions::PyTimeoutError::new_err(format!(
+            match channel.put_with_timeout(&epics_val, remaining).await {
+                Ok(()) => Ok(()),
+                Err(CaError::Timeout) => Err(pyo3::exceptions::PyTimeoutError::new_err(format!(
                     "put on {pvname} timed out at the wire after {remaining:?} \
                      (total budget was {timeout}s)"
+                ))),
+                Err(e) => Err(PyRuntimeError::new_err(format!(
+                    "put on {pvname} failed: {e}"
                 ))),
             }
         })

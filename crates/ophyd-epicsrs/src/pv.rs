@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -6,6 +7,7 @@ use parking_lot::Mutex;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use tokio::runtime::Runtime;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use epics_rs::base::error::CaError;
@@ -20,6 +22,82 @@ use crate::convert::{epics_value_to_py, py_to_epics_value, snapshot_to_pydict};
 struct MonitorEvent {
     pvname: String,
     snapshot: Snapshot,
+}
+
+/// What the monitor task hands the Python dispatch thread.
+enum Dispatch {
+    Update(Box<MonitorEvent>),
+    /// Answered once every update queued before it has run its callback.
+    Barrier(oneshot::Sender<()>),
+}
+
+thread_local! {
+    /// Set on a dispatch thread: a reply awaited from inside a monitor
+    /// callback cannot wait for that same thread to drain.
+    static DISPATCHING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// What a CA reply waits on before reaching Python. libca runs a reply's
+/// callback after the monitor callbacks for the updates read before it
+/// (`tcpiiu.cpp:1263`); epics-rs settles a reply once those updates are in
+/// the subscription, and this carries them through the monitor task and
+/// the dispatch thread. With no live monitor there is nothing to wait for,
+/// and a monitor torn down meanwhile drops the barrier, releasing it.
+struct MonitorBarrier {
+    slot: Option<BarrierSlot>,
+    /// A monitor callback that never returns holds the reply no longer than
+    /// the call's own timeout, where libca's caller gives up too.
+    deadline: Option<tokio::time::Instant>,
+}
+
+/// The live monitor task's barrier queue, empty while no monitor runs.
+type BarrierSlot = Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<oneshot::Sender<()>>>>>;
+
+impl MonitorBarrier {
+    async fn pass(self) {
+        let Some(barriers) = self.slot.and_then(|slot| slot.lock().clone()) else {
+            return;
+        };
+        let (ack, acked) = oneshot::channel();
+        if barriers.send(ack).is_err() {
+            return;
+        }
+        match self.deadline {
+            Some(deadline) => {
+                let _ = tokio::time::timeout_at(deadline, acked).await;
+            }
+            None => {
+                let _ = acked.await;
+            }
+        }
+    }
+}
+
+/// The output of `fut` if it is ready on its first poll.
+async fn ready_now<F: std::future::Future>(fut: F) -> Option<F::Output> {
+    tokio::select! {
+        biased;
+        out = fut => Some(out),
+        () = std::future::ready(()) => None,
+    }
+}
+
+/// Run `fut`, passing barriers straight to the dispatch thread meanwhile:
+/// with no subscription there is nothing to drain ahead of them.
+async fn serving_barriers<F: std::future::Future>(
+    fut: F,
+    barriers: &mut tokio::sync::mpsc::UnboundedReceiver<oneshot::Sender<()>>,
+    tx: &std::sync::mpsc::Sender<Dispatch>,
+) -> F::Output {
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        tokio::select! {
+            out = &mut fut => return out,
+            Some(ack) = barriers.recv() => {
+                let _ = tx.send(Dispatch::Barrier(ack));
+            }
+        }
+    }
 }
 
 /// CTRL-class metadata captured at the first DBR_CTRL read so that
@@ -111,7 +189,9 @@ pub struct EpicsRsPV {
     access_callback: Arc<Mutex<Option<PyObject>>>,
     connection_task: Mutex<Option<JoinHandle<()>>>,
     /// Queue for monitor events (tokio → Python thread)
-    monitor_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<MonitorEvent>>>>,
+    monitor_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<Dispatch>>>>,
+    /// See [`MonitorBarrier`].
+    barrier_tx: BarrierSlot,
     /// Python dispatch thread handle
     dispatch_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Background prefetch: starts on PV creation, completes before Python asks
@@ -213,6 +293,7 @@ impl EpicsRsPV {
             access_callback: Arc::new(Mutex::new(None)),
             connection_task: Mutex::new(None),
             monitor_tx: Arc::new(Mutex::new(None)),
+            barrier_tx: Arc::new(Mutex::new(None)),
             dispatch_thread: Mutex::new(None),
             prefetch_handle: Mutex::new(Some(prefetch_handle)),
             cached_ctrl,
@@ -234,6 +315,14 @@ impl EpicsRsPV {
         });
         rx.recv()
             .map_err(|_| PyRuntimeError::new_err("runtime task failed"))
+    }
+
+    /// The barrier a reply read now passes before reaching Python.
+    fn monitor_barrier(&self, timeout: Duration) -> MonitorBarrier {
+        MonitorBarrier {
+            slot: (!DISPATCHING.get()).then(|| self.barrier_tx.clone()),
+            deadline: tokio::time::Instant::now().checked_add(timeout),
+        }
     }
 
     /// Resolve the PV's native DbFieldType, populating the cache if empty.
@@ -390,12 +479,14 @@ impl EpicsRsPV {
 
         // Fallback: synchronous fetch (prefetch failed or already consumed)
         let channel = self.channel.clone();
+        let barrier = self.monitor_barrier(dur);
         let result = py.allow_threads(|| {
             self.spawn_wait(async move {
                 channel.wait_connected(dur).await?;
                 let info = channel.info().await?;
-                let snapshot = channel.get_with_metadata(DbrClass::Ctrl, dur).await?;
-                Ok::<_, epics_rs::base::error::CaError>((info, snapshot))
+                let snapshot = channel.get_with_metadata(DbrClass::Ctrl, dur).await;
+                barrier.pass().await;
+                Ok::<_, epics_rs::base::error::CaError>((info, snapshot?))
             })
         })?;
 
@@ -473,8 +564,13 @@ impl EpicsRsPV {
             _ => DbrClass::Time,
         };
 
+        let barrier = self.monitor_barrier(dur);
         let result = py.allow_threads(|| {
-            self.spawn_wait(async move { channel.get_with_metadata_count(class, count, dur).await })
+            self.spawn_wait(async move {
+                let result = channel.get_with_metadata_count(class, count, dur).await;
+                barrier.pass().await;
+                result
+            })
         })?;
 
         match result {
@@ -525,10 +621,15 @@ impl EpicsRsPV {
         let channel = self.channel.clone();
         let dur = Duration::from_secs_f64(timeout);
 
+        let barrier = self.monitor_barrier(dur);
         if wait {
             // Blocking put — wait for write_notify response
             let result = py.allow_threads(|| {
-                self.spawn_wait(async move { channel.put_with_timeout(&epics_val, dur).await })
+                self.spawn_wait(async move {
+                    let result = channel.put_with_timeout(&epics_val, dur).await;
+                    barrier.pass().await;
+                    result
+                })
             })?;
             match result {
                 Ok(()) => {}
@@ -547,7 +648,9 @@ impl EpicsRsPV {
             // Pass success=True/False so the shim can propagate failure.
             let pvname = self.pvname.clone();
             self.runtime.spawn(async move {
-                let success = match channel.put_with_timeout(&epics_val, dur).await {
+                let result = channel.put_with_timeout(&epics_val, dur).await;
+                barrier.pass().await;
+                let success = match result {
                     Ok(()) => true,
                     Err(CaError::Timeout) => {
                         crate::safe_warn!(target: "ophyd_epicsrs.ca", pv = %pvname, "put timed out");
@@ -620,7 +723,7 @@ impl EpicsRsPV {
             + 1;
 
         // Create the event queue
-        let (tx, rx) = std::sync::mpsc::channel::<MonitorEvent>();
+        let (tx, rx) = std::sync::mpsc::channel::<Dispatch>();
         *self.monitor_tx.lock() = Some(tx.clone());
 
         // Start Python dispatch thread — reads from queue, calls Python callback
@@ -628,7 +731,15 @@ impl EpicsRsPV {
         let gen_ref = self.monitor_generation.clone();
         let cached_ctrl_ref = self.cached_ctrl.clone();
         let dispatch = std::thread::spawn(move || {
-            while let Ok(mut event) = rx.recv() {
+            DISPATCHING.set(true);
+            while let Ok(dispatch) = rx.recv() {
+                let mut event = match dispatch {
+                    Dispatch::Update(event) => event,
+                    Dispatch::Barrier(ack) => {
+                        let _ = ack.send(());
+                        continue;
+                    }
+                };
                 // Race guard: if a NEW set_callback ran while we still
                 // had pending events, the canonical generation has
                 // advanced past ours — the new dispatch thread owns
@@ -712,33 +823,77 @@ impl EpicsRsPV {
         // resubscribes instead of dying permanently.
         let channel = self.channel.clone();
         let pvname = self.pvname.clone();
+        let (barrier_tx, mut barriers) = tokio::sync::mpsc::unbounded_channel();
+        *self.barrier_tx.lock() = Some(barrier_tx);
 
         let handle = self.runtime.spawn(async move {
+            // false once the dispatch thread is gone
+            let forward = |result: Option<Result<Snapshot, CaError>>| match result {
+                Some(Ok(snapshot)) => tx
+                    .send(Dispatch::Update(Box::new(MonitorEvent {
+                        pvname: pvname.clone(),
+                        snapshot,
+                    })))
+                    .is_ok(),
+                _ => true,
+            };
             loop {
-                let monitor = match channel.subscribe().await {
+                let monitor = match serving_barriers(channel.subscribe(), &mut barriers, &tx).await
+                {
                     Ok(m) => m,
                     Err(e) => {
                         crate::safe_debug!("{pvname}: subscribe failed ({e}), retrying...");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        serving_barriers(
+                            tokio::time::sleep(Duration::from_secs(1)),
+                            &mut barriers,
+                            &tx,
+                        )
+                        .await;
                         continue;
                     }
                 };
 
                 let mut monitor = monitor;
-                while let Some(result) = monitor.recv().await {
-                    if let Ok(snapshot) = result {
-                        let event = MonitorEvent {
-                            pvname: pvname.clone(),
-                            snapshot,
-                        };
-                        if tx.send(event).is_err() {
-                            return; // dispatch thread gone — exit permanently
+                loop {
+                    tokio::select! {
+                        result = monitor.recv() => {
+                            if result.is_none() {
+                                break;
+                            }
+                            if !forward(result) {
+                                return; // dispatch thread gone — exit permanently
+                            }
+                        }
+                        Some(ack) = barriers.recv() => {
+                            // The reply settled once its updates were in the
+                            // subscription; they go to the dispatch thread first.
+                            let mut ended = false;
+                            while let Some(result) = ready_now(monitor.recv()).await {
+                                if result.is_none() {
+                                    ended = true;
+                                    break;
+                                }
+                                if !forward(result) {
+                                    return;
+                                }
+                            }
+                            if tx.send(Dispatch::Barrier(ack)).is_err() {
+                                return;
+                            }
+                            if ended {
+                                break;
+                            }
                         }
                     }
                 }
                 // Subscription ended (IOC restart, network blip) — resubscribe
                 crate::safe_debug!("{pvname}: monitor stream ended, resubscribing");
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                serving_barriers(
+                    tokio::time::sleep(Duration::from_millis(100)),
+                    &mut barriers,
+                    &tx,
+                )
+                .await;
             }
         });
 
@@ -850,6 +1005,7 @@ impl EpicsRsPV {
         *self.py_monitor_callback.lock() = None;
         // Drop the sender to unblock the dispatch thread
         *self.monitor_tx.lock() = None;
+        *self.barrier_tx.lock() = None;
         if let Some(handle) = self.monitor_task.lock().take() {
             handle.abort();
         }
@@ -987,8 +1143,11 @@ impl EpicsRsPV {
         let dur = Duration::from_secs_f64(timeout);
         let cache = self.native_type.clone();
         let pvname = self.pvname.clone();
+        let barrier = self.monitor_barrier(dur);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            match channel.get_with_timeout(dur).await {
+            let result = channel.get_with_timeout(dur).await;
+            barrier.pass().await;
+            match result {
                 Ok((_dbr, val)) => {
                     *cache.lock() = Some(val.dbr_type());
                     crate::safe_call_or!(
@@ -1028,8 +1187,11 @@ impl EpicsRsPV {
         let cache = self.native_type.clone();
         let cached_ctrl = self.cached_ctrl.clone();
         let pvname = self.pvname.clone();
+        let barrier = self.monitor_barrier(dur);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            match channel.get_with_metadata(class, dur).await {
+            let result = channel.get_with_metadata(class, dur).await;
+            barrier.pass().await;
+            match result {
                 Ok(mut snapshot) => {
                     *cache.lock() = Some(snapshot.value.dbr_type());
                     // Capture if this read brought CTRL fields, then
@@ -1072,6 +1234,7 @@ impl EpicsRsPV {
         let cache = self.native_type.clone();
         let channel = self.channel.clone();
         let pvname = self.pvname.clone();
+        let barrier = self.monitor_barrier(Duration::from_secs_f64(timeout));
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             // Deadline-based budget: total wall-clock time for resolve+put
             // must fit inside `timeout`. Without this, a cache miss could
@@ -1114,7 +1277,9 @@ impl EpicsRsPV {
                     "put on {pvname}: native-type resolution consumed the entire {timeout}s budget"
                 )));
             }
-            match channel.put_with_timeout(&epics_val, remaining).await {
+            let result = channel.put_with_timeout(&epics_val, remaining).await;
+            barrier.pass().await;
+            match result {
                 Ok(()) => Ok(()),
                 Err(CaError::Timeout) => Err(pyo3::exceptions::PyTimeoutError::new_err(format!(
                     "put on {pvname} timed out at the wire after {remaining:?} \
@@ -1205,6 +1370,7 @@ impl Drop for EpicsRsPV {
         *self.access_callback.lock() = None;
         *self.py_monitor_callback.lock() = None;
         *self.monitor_tx.lock() = None;
+        *self.barrier_tx.lock() = None;
 
         if let Some(h) = self.monitor_task.lock().take() {
             h.abort();

@@ -31,10 +31,10 @@ impl BulkGetCache {
             // VecDeque tracks insertion order only — a frequently-read
             // PV registered early would be evicted in favour of one-shot
             // reads once the cache hits the BULK_GET_CACHE_LIMIT ceiling.
-            if let Some(idx) = self.order.iter().position(|n| n == pvname) {
-                if let Some(name) = self.order.remove(idx) {
-                    self.order.push_back(name);
-                }
+            if let Some(idx) = self.order.iter().position(|n| n == pvname)
+                && let Some(name) = self.order.remove(idx)
+            {
+                self.order.push_back(name);
             }
             return channel.clone();
         }

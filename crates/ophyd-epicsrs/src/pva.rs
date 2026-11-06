@@ -1128,16 +1128,14 @@ impl EpicsRsPvaPV {
                             "pvget on {pvname}: panic in Python::with_gil during value conversion"
                         ))),
                         Python::with_gil(|py| {
-                            if is_nt {
-                                if let PvField::Structure(s) = &field {
-                                    if let Some((idx, _choices)) =
-                                        crate::pva_convert::try_extract_ntenum(s)
-                                    {
-                                        return Ok::<PyObject, PyErr>(
-                                            idx.into_pyobject(py).unwrap().into_any().unbind(),
-                                        );
-                                    }
-                                }
+                            if is_nt
+                                && let PvField::Structure(s) = &field
+                                && let Some((idx, _choices)) =
+                                    crate::pva_convert::try_extract_ntenum(s)
+                            {
+                                return Ok::<PyObject, PyErr>(
+                                    idx.into_pyobject(py).unwrap().into_any().unbind(),
+                                );
                             }
                             let value_field: &PvField = match &field {
                                 PvField::Structure(s) => s.get_field("value").unwrap_or(&field),

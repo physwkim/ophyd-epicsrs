@@ -601,12 +601,12 @@ impl EpicsRsPV {
 
         {
             let guard = self.monitor_task.lock();
-            if let Some(ref handle) = *guard {
-                if !handle.is_finished() {
-                    return; // still running
-                }
-                // task died — will restart below
+            if let Some(ref handle) = *guard
+                && !handle.is_finished()
+            {
+                return; // still running
             }
+            // no task yet, or it died — (re)start below
         }
 
         // Bump the generation BEFORE creating the new dispatch thread.
@@ -670,10 +670,10 @@ impl EpicsRsPV {
                     // without char_value — the Python shim resolves from cache.
                     match &snap.value {
                         EpicsValue::Enum(idx) => {
-                            if let Some(ref ei) = snap.enums {
-                                if let Some(label) = ei.strings.get(*idx as usize) {
-                                    let _ = kwargs.set_item("char_value", label.as_str_lossy());
-                                }
+                            if let Some(ref ei) = snap.enums
+                                && let Some(label) = ei.strings.get(*idx as usize)
+                            {
+                                let _ = kwargs.set_item("char_value", label.as_str_lossy());
                             }
                             // else: omit char_value, Python shim uses cached enum_strs
                         }
@@ -764,12 +764,12 @@ impl EpicsRsPV {
     /// reconnection cycle), the task resubscribes automatically.
     fn _start_event_task(&self) {
         let mut guard = self.connection_task.lock();
-        if let Some(ref handle) = *guard {
-            if !handle.is_finished() {
-                return; // still running
-            }
-            // task died — will restart below
+        if let Some(ref handle) = *guard
+            && !handle.is_finished()
+        {
+            return; // still running
         }
+        // no task yet, or it died — (re)start below
 
         let channel = self.channel.clone();
         let conn_cb_ref = self.connection_callback.clone();
@@ -949,17 +949,17 @@ impl EpicsRsPV {
                 return Ok(true);
             }
             // Try the prefetch first.
-            if let Some(handle) = prefetch {
-                if let Ok(Ok(Some(result))) = tokio::time::timeout(dur, handle).await {
-                    *cache.lock() = Some(result.native_type);
-                    // Capture the prefetch's CTRL fields too — without
-                    // this, the SignalBackend.connect path consumes
-                    // the prefetch (and its display/control/enums)
-                    // and then a second get_reading_async("ctrl") has
-                    // to round-trip the IOC again to recover them.
-                    cached_ctrl.lock().capture(&result.snapshot);
-                    return Ok(true);
-                }
+            if let Some(handle) = prefetch
+                && let Ok(Ok(Some(result))) = tokio::time::timeout(dur, handle).await
+            {
+                *cache.lock() = Some(result.native_type);
+                // Capture the prefetch's CTRL fields too — without
+                // this, the SignalBackend.connect path consumes
+                // the prefetch (and its display/control/enums)
+                // and then a second get_reading_async("ctrl") has
+                // to round-trip the IOC again to recover them.
+                cached_ctrl.lock().capture(&result.snapshot);
+                return Ok(true);
             }
             // Fallback: standalone channel.info() query.
             match tokio::time::timeout(dur, channel.info()).await {

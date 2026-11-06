@@ -10,7 +10,7 @@ Replaces pyepics (`Python → ctypes → libca.so`) with [epics-rs](https://gith
 pip install ophyd-epicsrs
 ```
 
-Building from source requires a Rust toolchain (1.85+):
+Building from source requires a Rust toolchain (1.98+):
 
 ```bash
 pip install maturin
@@ -497,7 +497,7 @@ force re-check on the next event.
 - ophyd-async >= 0.16 (only required if you use `ophyd_epicsrs.ophyd_async`)
 - bluesky >= 1.13
 - [epics-rs](https://github.com/epics-rs/epics-rs) >= 0.34 (bundled at build time)
-- Rust toolchain >= 1.88 (build-time only)
+- Rust toolchain >= 1.98 (build-time only)
 
 ## Related
 

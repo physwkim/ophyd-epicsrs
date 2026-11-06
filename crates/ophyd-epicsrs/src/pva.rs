@@ -23,6 +23,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use tokio::runtime::Runtime;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use epics_rs::pva::client_native::context::{ConnectHandle, PvaClient};
@@ -35,6 +36,49 @@ use crate::pva_convert::{EpicsRsPvaMetadata, pvfield_to_py};
 struct PvaMonitorEvent {
     pvname: String,
     field: PvField,
+}
+
+/// What the monitor callback hands the Python dispatch thread.
+enum PvaDispatch {
+    Update(PvaMonitorEvent),
+    /// Answered once every update queued before it has run its callback.
+    Barrier(oneshot::Sender<()>),
+}
+
+/// The live monitor's dispatch queue, empty while no monitor runs.
+type DispatchSlot = Arc<Mutex<Option<std::sync::mpsc::Sender<PvaDispatch>>>>;
+
+/// What a PVA reply waits on before reaching Python. pvxs runs a
+/// subscription's event callback and an op's result callback on one loop
+/// in wire order; epics-rs returns a reply once the updates read before it
+/// are in the dispatch queue, and this waits for the dispatch thread to
+/// run them. With no live monitor there is nothing to wait for, and a
+/// dispatch thread gone meanwhile drops the barrier, releasing it.
+struct MonitorBarrier {
+    slot: Option<DispatchSlot>,
+    /// A monitor callback that never returns holds the reply no longer than
+    /// the call's own timeout.
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl MonitorBarrier {
+    async fn pass(self) {
+        let Some(queue) = self.slot.and_then(|slot| slot.lock().clone()) else {
+            return;
+        };
+        let (ack, acked) = oneshot::channel();
+        if queue.send(PvaDispatch::Barrier(ack)).is_err() {
+            return;
+        }
+        match self.deadline {
+            Some(deadline) => {
+                let _ = tokio::time::timeout_at(deadline, acked).await;
+            }
+            None => {
+                let _ = acked.await;
+            }
+        }
+    }
 }
 
 /// Shared core for the sync and async ``bulk_get`` paths.
@@ -300,7 +344,7 @@ pub struct EpicsRsPvaPV {
     /// Python dispatch thread for monitor callbacks.
     dispatch_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Sender to dispatch thread; None = no monitor active.
-    monitor_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<PvaMonitorEvent>>>>,
+    monitor_tx: DispatchSlot,
     /// Single Python monitor callback (overwritten on re-register).
     py_monitor_callback: Arc<Mutex<Option<PyObject>>>,
     /// Generation token incremented per `add_monitor_callback`. Each
@@ -446,6 +490,14 @@ impl EpicsRsPvaPV {
     fn record_ntenum_shape(&self, field: &PvField) {
         record_ntenum_into(&self.is_ntenum, field);
     }
+
+    /// The barrier a reply read now passes before reaching Python.
+    fn monitor_barrier(&self, timeout: Duration) -> MonitorBarrier {
+        MonitorBarrier {
+            slot: (!crate::pv::DISPATCHING.get()).then(|| self.monitor_tx.clone()),
+            deadline: tokio::time::Instant::now().checked_add(timeout),
+        }
+    }
 }
 
 #[pymethods]
@@ -479,8 +531,13 @@ impl EpicsRsPvaPV {
         let client = self.client.clone();
         let name = self.pvname.clone();
         let dur = Duration::from_secs_f64(timeout);
+        let barrier = self.monitor_barrier(dur);
         let result = py.allow_threads(|| {
-            self.spawn_wait(async move { tokio::time::timeout(dur, client.pvget(&name)).await })
+            self.spawn_wait(async move {
+                let result = tokio::time::timeout(dur, client.pvget(&name)).await;
+                barrier.pass().await;
+                result
+            })
         })?;
         match result {
             Ok(Ok(field)) => {
@@ -585,8 +642,15 @@ impl EpicsRsPvaPV {
             }
         };
 
+        let barrier = self.monitor_barrier(dur);
         if wait {
-            let result = py.allow_threads(|| self.spawn_wait(do_put(client, name, value_str)))?;
+            let result = py.allow_threads(|| {
+                self.spawn_wait(async move {
+                    let result = do_put(client, name, value_str).await;
+                    barrier.pass().await;
+                    result
+                })
+            })?;
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => return Err(PyRuntimeError::new_err(format!("pvput failed: {e}"))),
@@ -598,7 +662,9 @@ impl EpicsRsPvaPV {
         } else if let Some(cb) = callback {
             let pvname = self.pvname.clone();
             self.runtime.spawn(async move {
-                let success = match do_put(client, pvname.clone(), value_str).await {
+                let result = do_put(client, pvname.clone(), value_str).await;
+                barrier.pass().await;
+                let success = match result {
                     Ok(Ok(())) => true,
                     Ok(Err(e)) => {
                         crate::safe_warn!(target: "ophyd_epicsrs.pva", pv = %pvname, "pvput error: {e}");
@@ -661,7 +727,7 @@ impl EpicsRsPvaPV {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1;
 
-        let (tx, rx) = std::sync::mpsc::channel::<PvaMonitorEvent>();
+        let (tx, rx) = std::sync::mpsc::channel::<PvaDispatch>();
         *self.monitor_tx.lock() = Some(tx.clone());
 
         // Python dispatch thread
@@ -669,7 +735,15 @@ impl EpicsRsPvaPV {
         let gen_ref = self.monitor_generation.clone();
         let is_ntenum_ref = self.is_ntenum.clone();
         let dispatch = std::thread::spawn(move || {
-            while let Ok(event) = rx.recv() {
+            crate::pv::DISPATCHING.set(true);
+            while let Ok(dispatch) = rx.recv() {
+                let event = match dispatch {
+                    PvaDispatch::Update(event) => event,
+                    PvaDispatch::Barrier(ack) => {
+                        let _ = ack.send(());
+                        continue;
+                    }
+                };
                 if gen_ref.load(std::sync::atomic::Ordering::SeqCst) != generation {
                     continue;
                 }
@@ -735,7 +809,7 @@ impl EpicsRsPvaPV {
                             pvname: pvname_for_event.clone(),
                             field: value.clone(),
                         };
-                        let _ = tx.send(event);
+                        let _ = tx.send(PvaDispatch::Update(event));
                     },
                     // Connection state is owned by the ConnectHandle
                     // watcher installed in set_connection_callback.
@@ -1108,13 +1182,16 @@ impl EpicsRsPvaPV {
         let pvname = name.clone();
         let dur = Duration::from_secs_f64(timeout);
         let is_ntenum = self.is_ntenum.clone();
+        let barrier = self.monitor_barrier(dur);
         // `future_into_py_fast` skips add_done_callback / Cancellable /
         // outer-spawn / scope (~15-25µs/call savings vs the standard
         // `future_into_py`). Safe here because the future is short-
         // lived, the caller does not cancel via asyncio, and we don't
         // use contextvars across the await.
         pyo3_async_runtimes::tokio::future_into_py_fast(py, async move {
-            match tokio::time::timeout(dur, client.pvget(&name)).await {
+            let result = tokio::time::timeout(dur, client.pvget(&name)).await;
+            barrier.pass().await;
+            match result {
                 Ok(Ok(field)) => {
                     let cached = is_ntenum.load(Ordering::Relaxed);
                     let is_nt = if cached != NTENUM_UNKNOWN {
@@ -1170,8 +1247,11 @@ impl EpicsRsPvaPV {
         let pvname = name.clone();
         let dur = Duration::from_secs_f64(timeout);
         let is_ntenum = self.is_ntenum.clone();
+        let barrier = self.monitor_barrier(dur);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            match tokio::time::timeout(dur, client.pvget(&name)).await {
+            let result = tokio::time::timeout(dur, client.pvget(&name)).await;
+            barrier.pass().await;
+            match result {
                 Ok(Ok(field)) => {
                     // Feed is_ntenum cache (same reason as get_value_async).
                     if is_ntenum.load(Ordering::Relaxed) == NTENUM_UNKNOWN {
@@ -1222,6 +1302,7 @@ impl EpicsRsPvaPV {
         let name = self.pvname.clone();
         let pvname = name.clone();
         let dur = Duration::from_secs_f64(timeout);
+        let barrier = self.monitor_barrier(dur);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let result = if route_ntenum_index {
                 tokio::time::timeout(dur, client.pvput_field(&name, "value.index", &value_str))
@@ -1229,6 +1310,7 @@ impl EpicsRsPvaPV {
             } else {
                 tokio::time::timeout(dur, client.pvput(&name, &value_str)).await
             };
+            barrier.pass().await;
             match result {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
@@ -1269,6 +1351,7 @@ impl EpicsRsPvaPV {
         let name = self.pvname.clone();
         let pvname = name.clone();
         let bound = Duration::from_secs(5);
+        let barrier = self.monitor_barrier(bound);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let result = if route_ntenum_index {
                 tokio::time::timeout(bound, client.pvput_field(&name, "value.index", &value_str))
@@ -1276,6 +1359,7 @@ impl EpicsRsPvaPV {
             } else {
                 tokio::time::timeout(bound, client.pvput(&name, &value_str)).await
             };
+            barrier.pass().await;
             match result {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
@@ -1325,8 +1409,11 @@ impl EpicsRsPvaPV {
         let name = self.pvname.clone();
         let pvname = name.clone();
         let dur = Duration::from_secs_f64(timeout);
+        let barrier = self.monitor_barrier(dur);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            match tokio::time::timeout(dur, client.pvput_pv_field(&name, &field)).await {
+            let result = tokio::time::timeout(dur, client.pvput_pv_field(&name, &field)).await;
+            barrier.pass().await;
+            match result {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
                     "pvput_pv_field on {pvname} failed: {e}"
@@ -1355,13 +1442,12 @@ impl EpicsRsPvaPV {
         let client = self.client.clone();
         let name = self.pvname.clone();
         let pvname = name.clone();
+        let bound = Duration::from_secs(5);
+        let barrier = self.monitor_barrier(bound);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            match tokio::time::timeout(
-                Duration::from_secs(5),
-                client.pvput_pv_field(&pvname, &field),
-            )
-            .await
-            {
+            let result = tokio::time::timeout(bound, client.pvput_pv_field(&pvname, &field)).await;
+            barrier.pass().await;
+            match result {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
                     "pvput_pv_field_nowait on {pvname} failed: {e}"

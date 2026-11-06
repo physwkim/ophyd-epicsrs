@@ -32,9 +32,9 @@ enum Dispatch {
 }
 
 thread_local! {
-    /// Set on a dispatch thread: a reply awaited from inside a monitor
-    /// callback cannot wait for that same thread to drain.
-    static DISPATCHING: Cell<bool> = const { Cell::new(false) };
+    /// Set on a CA or PVA dispatch thread: a reply awaited from inside a
+    /// monitor callback cannot wait for that same thread to drain.
+    pub(crate) static DISPATCHING: Cell<bool> = const { Cell::new(false) };
 }
 
 /// What a CA reply waits on before reaching Python. libca runs a reply's

@@ -194,6 +194,38 @@ def test_first_get_after_a_waited_put_reads_the_value_put(ca_ctx):
         writer.put(original, wait=True, timeout=2.0)
 
 
+@pytest.mark.parametrize("ctx_name", ["ca_ctx", "pva_ctx"])
+def test_waited_put_returns_after_another_pvs_callback(request, ctx_name):
+    """A waited put returns after the monitor callback its update runs on
+    another PV object of the same context, as libca and pvxs order them."""
+    ctx = request.getfixturevalue(ctx_name)
+    writer = ctx.create_pv("mini:ph:mtr.VELO")
+    assert writer.wait_for_connection(timeout=3.0)
+    original = writer.get_with_metadata(timeout=2.0)["value"]
+    reader = ctx.create_pv("mini:ph:mtr.VELO")
+    assert reader.wait_for_connection(timeout=3.0)
+    latest = [None]
+    seen = threading.Event()
+
+    def cb(**kw):
+        time.sleep(0.005)
+        latest[0] = kw["value"]
+        seen.set()
+
+    reader.set_monitor_callback(cb)
+    try:
+        assert seen.wait(3.0)
+        stale = 0
+        for i in range(40):
+            value = original + (1.0 if i % 2 else 0.5)
+            writer.put(value, wait=True, timeout=2.0)
+            stale += latest[0] != value
+        assert stale == 0, f"{stale}/40 puts returned before the reader's callback"
+    finally:
+        reader.clear_monitors()
+        writer.put(original, wait=True, timeout=2.0)
+
+
 # ---------- Disconnect callback on IOC restart simulation ----------
 
 

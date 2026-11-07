@@ -14,6 +14,7 @@ use epics_rs::ca::CaError;
 use epics_rs::ca::client::{CaChannel, CaClient};
 
 use crate::convert::epics_value_to_py;
+use crate::dispatch::MonitorHub;
 use crate::pv::EpicsRsPV;
 
 const BULK_GET_CACHE_LIMIT: usize = 4096;
@@ -128,6 +129,8 @@ async fn run_bulk_get(
 pub struct EpicsRsContext {
     pub(crate) runtime: Arc<Runtime>,
     pub(crate) client: Arc<CaClient>,
+    /// Runs every monitor callback of this context's PVs.
+    hub: Arc<MonitorHub>,
     /// Hidden channel cache for by-name ``bulk_get``.
     ///
     /// This is intentionally not a Python PV-object cache: ophyd still
@@ -172,9 +175,14 @@ impl EpicsRsContext {
                 .map_err(|e| PyRuntimeError::new_err(format!("failed to create CA client: {e}")))
         })?;
 
+        let hub = MonitorHub::new("epicsrs-ca-cb").map_err(|e| {
+            PyRuntimeError::new_err(format!("failed to start the CA callback thread: {e}"))
+        })?;
+
         Ok(Self {
             runtime,
             client: Arc::new(client),
+            hub,
             bulk_get_cache: Mutex::new(BulkGetCache::default()),
             pv_count: Arc::new(AtomicUsize::new(0)),
         })
@@ -196,6 +204,7 @@ impl EpicsRsContext {
             channel,
             pvname.to_string(),
             self.pv_count.clone(),
+            self.hub.clone(),
         )
     }
 

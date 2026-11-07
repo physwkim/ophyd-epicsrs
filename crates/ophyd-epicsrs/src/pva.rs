@@ -6,12 +6,12 @@
 //! - `EpicsRsPvaPV` wraps a PV name. Operations dispatch through the
 //!   client — channel caching is handled internally by `PvaClient`.
 //! - Monitor events flow via `pvmonitor_handle` returning a
-//!   `SubscriptionHandle`; we route events through the same Python
-//!   dispatch-thread pattern as the CA path so callbacks fire without
+//!   `SubscriptionHandle`; we route events through the context's
+//!   dispatch thread (see [`crate::dispatch`]) so callbacks fire without
 //!   GIL contention from the tokio task.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 const NTENUM_UNKNOWN: u8 = 0;
@@ -23,61 +23,55 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use tokio::runtime::Runtime;
-use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use epics_rs::pva::client_native::context::{ConnectHandle, PvaClient};
 use epics_rs::pva::client_native::ops_v2::SubscriptionHandle;
 use epics_rs::pva::pvdata::{FieldDesc, PvField, ScalarType};
 
+use crate::dispatch::MonitorHub;
 use crate::pva_convert::{EpicsRsPvaMetadata, pvfield_to_py};
 
-/// Monitor event queued from tokio task → Python thread.
-struct PvaMonitorEvent {
+/// One monitor subscription's callback, run on the context's dispatch thread.
+struct PvaMonitorSink {
     pvname: String,
-    field: PvField,
+    callback: Arc<Mutex<Option<PyObject>>>,
+    generation: Arc<AtomicU64>,
+    /// The generation this subscription was started under.
+    expected: u64,
+    is_ntenum: Arc<AtomicU8>,
 }
 
-/// What the monitor callback hands the Python dispatch thread.
-enum PvaDispatch {
-    Update(PvaMonitorEvent),
-    /// Answered once every update queued before it has run its callback.
-    Barrier(oneshot::Sender<()>),
-}
-
-/// The live monitor's dispatch queue, empty while no monitor runs.
-type DispatchSlot = Arc<Mutex<Option<std::sync::mpsc::Sender<PvaDispatch>>>>;
-
-/// What a PVA reply waits on before reaching Python. pvxs runs a
-/// subscription's event callback and an op's result callback on one loop
-/// in wire order; epics-rs returns a reply once the updates read before it
-/// are in the dispatch queue, and this waits for the dispatch thread to
-/// run them. With no live monitor there is nothing to wait for, and a
-/// dispatch thread gone meanwhile drops the barrier, releasing it.
-struct MonitorBarrier {
-    slot: Option<DispatchSlot>,
-    /// A monitor callback that never returns holds the reply no longer than
-    /// the call's own timeout.
-    deadline: Option<tokio::time::Instant>,
-}
-
-impl MonitorBarrier {
-    async fn pass(self) {
-        let Some(queue) = self.slot.and_then(|slot| slot.lock().clone()) else {
-            return;
-        };
-        let (ack, acked) = oneshot::channel();
-        if queue.send(PvaDispatch::Barrier(ack)).is_err() {
+impl PvaMonitorSink {
+    fn deliver(&self, field: PvField) {
+        if self.generation.load(Ordering::SeqCst) != self.expected {
             return;
         }
-        match self.deadline {
-            Some(deadline) => {
-                let _ = tokio::time::timeout_at(deadline, acked).await;
-            }
-            None => {
-                let _ = acked.await;
-            }
+        // Feed is_ntenum cache from monitor events too. An
+        // ophyd-async setup typically connects, subscribes,
+        // and only then puts — so the first read may already
+        // be a monitor delivery rather than an explicit
+        // get_value_async.
+        if self.is_ntenum.load(Ordering::Relaxed) == NTENUM_UNKNOWN {
+            record_ntenum_into(&self.is_ntenum, &field);
         }
+        crate::safe_call!(Python::with_gil(|py| {
+            let guard = self.callback.lock();
+            let callback = match &*guard {
+                Some(cb) => cb.clone_ref(py),
+                None => return,
+            };
+            drop(guard);
+            let kwargs = PyDict::new(py);
+            let md = crate::pva_convert::pvfield_to_metadata(py, &field, None);
+            let md_ref = md.downcast_bound::<PyDict>(py).unwrap();
+            // Spread metadata keys into kwargs
+            let _ = kwargs.set_item("pvname", &self.pvname);
+            for (k, v) in md_ref.iter() {
+                let _ = kwargs.set_item(k, v);
+            }
+            let _ = callback.call(py, (), Some(&kwargs));
+        }));
     }
 }
 
@@ -180,6 +174,8 @@ async fn run_bulk_get_pva(
 pub struct EpicsRsPvaContext {
     pub(crate) runtime: Arc<Runtime>,
     pub(crate) client: PvaClient,
+    /// Runs every monitor callback of this context's PVs.
+    hub: Arc<MonitorHub>,
     /// Live ``EpicsRsPvaPV`` wrapper count — same role as
     /// ``EpicsRsContext::pv_count``. Surfaces through ``is_unused()``
     /// so ``shutdown_all`` can refuse to drop the singleton while
@@ -200,9 +196,14 @@ impl EpicsRsPvaContext {
         let client = PvaClient::new()
             .map_err(|e| PyRuntimeError::new_err(format!("failed to create PVA client: {e}")))?;
 
+        let hub = MonitorHub::new("epicsrs-pva-cb").map_err(|e| {
+            PyRuntimeError::new_err(format!("failed to start the PVA callback thread: {e}"))
+        })?;
+
         Ok(Self {
             runtime,
             client,
+            hub,
             pv_count: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -215,6 +216,7 @@ impl EpicsRsPvaContext {
             self.client.clone(),
             pvname.to_string(),
             self.pv_count.clone(),
+            self.hub.clone(),
         )
     }
 
@@ -341,16 +343,14 @@ pub struct EpicsRsPvaPV {
     /// a duplicate setup. Aborted by disconnect/Drop so an unfinished
     /// builder can't later try to install into a torn-down wrapper.
     connection_setup_task: Mutex<Option<JoinHandle<()>>>,
-    /// Python dispatch thread for monitor callbacks.
-    dispatch_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
-    /// Sender to dispatch thread; None = no monitor active.
-    monitor_tx: DispatchSlot,
+    /// The parent context's monitor dispatcher.
+    hub: Arc<MonitorHub>,
     /// Single Python monitor callback (overwritten on re-register).
     py_monitor_callback: Arc<Mutex<Option<PyObject>>>,
-    /// Generation token incremented per `add_monitor_callback`. Each
-    /// dispatch thread captures its expected token at spawn time and
-    /// refuses to fire the callback once the canonical token has
-    /// advanced — same race-guard pattern as EpicsRsPV (see pv.rs).
+    /// Generation token incremented per subscription start. Each
+    /// subscription captures its token and its queued callbacks are
+    /// dropped once the canonical token has advanced — same race-guard
+    /// pattern as EpicsRsPV (see pv.rs).
     monitor_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Connection callback set from Python side.
     connection_callback: Arc<Mutex<Option<PyObject>>>,
@@ -444,6 +444,7 @@ impl EpicsRsPvaPV {
         client: PvaClient,
         pvname: String,
         pv_count: Arc<AtomicUsize>,
+        hub: Arc<MonitorHub>,
     ) -> Self {
         Self {
             runtime,
@@ -453,8 +454,7 @@ impl EpicsRsPvaPV {
             monitor_setup_task: Mutex::new(None),
             access_setup_task: Mutex::new(None),
             connection_setup_task: Mutex::new(None),
-            dispatch_thread: Mutex::new(None),
-            monitor_tx: Arc::new(Mutex::new(None)),
+            hub,
             py_monitor_callback: Arc::new(Mutex::new(None)),
             monitor_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             connection_callback: Arc::new(Mutex::new(None)),
@@ -490,14 +490,6 @@ impl EpicsRsPvaPV {
     fn record_ntenum_shape(&self, field: &PvField) {
         record_ntenum_into(&self.is_ntenum, field);
     }
-
-    /// The barrier a reply read now passes before reaching Python.
-    fn monitor_barrier(&self, timeout: Duration) -> MonitorBarrier {
-        MonitorBarrier {
-            slot: (!crate::pv::DISPATCHING.get()).then(|| self.monitor_tx.clone()),
-            deadline: tokio::time::Instant::now().checked_add(timeout),
-        }
-    }
 }
 
 #[pymethods]
@@ -531,7 +523,7 @@ impl EpicsRsPvaPV {
         let client = self.client.clone();
         let name = self.pvname.clone();
         let dur = Duration::from_secs_f64(timeout);
-        let barrier = self.monitor_barrier(dur);
+        let barrier = self.hub.barrier(dur);
         let result = py.allow_threads(|| {
             self.spawn_wait(async move {
                 let result = tokio::time::timeout(dur, client.pvget(&name)).await;
@@ -642,7 +634,7 @@ impl EpicsRsPvaPV {
             }
         };
 
-        let barrier = self.monitor_barrier(dur);
+        let barrier = self.hub.barrier(dur);
         if wait {
             let result = py.allow_threads(|| {
                 self.spawn_wait(async move {
@@ -718,74 +710,24 @@ impl EpicsRsPvaPV {
             return;
         }
 
-        // Bump generation BEFORE installing the new dispatch thread —
-        // an OLD thread still draining its rx will see its captured
-        // generation differ and bail before invoking the (potentially
-        // new) callback. Same race-guard pattern as EpicsRsPV.
+        // Bump generation BEFORE starting the new subscription —
+        // updates an OLD subscription left in the dispatch queue carry
+        // the old generation and are dropped before invoking the
+        // (potentially new) callback. Same race-guard pattern as EpicsRsPV.
         let generation = self
             .monitor_generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1;
-
-        let (tx, rx) = std::sync::mpsc::channel::<PvaDispatch>();
-        *self.monitor_tx.lock() = Some(tx.clone());
-
-        // Python dispatch thread
-        let cb_ref = self.py_monitor_callback.clone();
-        let gen_ref = self.monitor_generation.clone();
-        let is_ntenum_ref = self.is_ntenum.clone();
-        let dispatch = std::thread::spawn(move || {
-            crate::pv::DISPATCHING.set(true);
-            while let Ok(dispatch) = rx.recv() {
-                let event = match dispatch {
-                    PvaDispatch::Update(event) => event,
-                    PvaDispatch::Barrier(ack) => {
-                        let _ = ack.send(());
-                        continue;
-                    }
-                };
-                if gen_ref.load(std::sync::atomic::Ordering::SeqCst) != generation {
-                    continue;
-                }
-                // Feed is_ntenum cache from monitor events too. An
-                // ophyd-async setup typically connects, subscribes,
-                // and only then puts — so the first read may already
-                // be a monitor delivery rather than an explicit
-                // get_value_async.
-                if is_ntenum_ref.load(Ordering::Relaxed) == NTENUM_UNKNOWN {
-                    record_ntenum_into(&is_ntenum_ref, &event.field);
-                }
-                crate::safe_call!(Python::with_gil(|py| {
-                    let guard = cb_ref.lock();
-                    let callback = match &*guard {
-                        Some(cb) => cb.clone_ref(py),
-                        None => return,
-                    };
-                    drop(guard);
-                    let kwargs = PyDict::new(py);
-                    let md = crate::pva_convert::pvfield_to_metadata(py, &event.field, None);
-                    let md_ref = md.downcast_bound::<PyDict>(py).unwrap();
-                    // Spread metadata keys into kwargs
-                    let _ = kwargs.set_item("pvname", &event.pvname);
-                    for (k, v) in md_ref.iter() {
-                        let _ = kwargs.set_item(k, v);
-                    }
-                    let _ = callback.call(py, (), Some(&kwargs));
-                }));
-            }
+        let sink = Arc::new(PvaMonitorSink {
+            pvname: self.pvname.clone(),
+            callback: self.py_monitor_callback.clone(),
+            generation: self.monitor_generation.clone(),
+            expected: generation,
+            is_ntenum: self.is_ntenum.clone(),
         });
-        // Reap any previous dispatch thread on a background join — the
-        // OLD thread will exit naturally when its rx Senders are gone.
-        if let Some(old) = self.dispatch_thread.lock().take() {
-            let _ = std::thread::Builder::new()
-                .name("ophyd-epicsrs-dispatch-join".into())
-                .spawn(move || {
-                    let _ = old.join();
-                });
-        }
-        *self.dispatch_thread.lock() = Some(dispatch);
+        let hub = self.hub.clone();
 
-        // Tokio monitor task — fire callback by sending events through the queue.
+        // Tokio monitor task — queue each update on the dispatch thread.
         let client = self.client.clone();
         let pvname = self.pvname.clone();
         let connected_ref = self.connected.clone();
@@ -798,18 +740,15 @@ impl EpicsRsPvaPV {
         // indefinitely. The handle slot uses Arc so the spawned task
         // can write to it without lifetime gymnastics.
         let pvname_for_call = pvname.clone();
-        let pvname_for_event = pvname.clone();
         let handle_slot = self.monitor_handle.clone();
         let setup = self.runtime.spawn(async move {
             match client
                 .pvmonitor_handle(
                     &pvname_for_call,
                     move |_desc, value| {
-                        let event = PvaMonitorEvent {
-                            pvname: pvname_for_event.clone(),
-                            field: value.clone(),
-                        };
-                        let _ = tx.send(PvaDispatch::Update(event));
+                        let sink = sink.clone();
+                        let field = value.clone();
+                        hub.run(move || sink.deliver(field));
                     },
                     // Connection state is owned by the ConnectHandle
                     // watcher installed in set_connection_callback.
@@ -1007,7 +946,6 @@ impl EpicsRsPvaPV {
 
     fn clear_monitors(&self) {
         *self.py_monitor_callback.lock() = None;
-        *self.monitor_tx.lock() = None;
         // Abort the spawned subscribe task before it can install a
         // SubscriptionHandle (or fire the connection callback) — this
         // prevents a teardown race where pvmonitor_handle resolves
@@ -1017,7 +955,6 @@ impl EpicsRsPvaPV {
         }
         // Drop any installed SubscriptionHandle to stop the subscription.
         let _ = self.monitor_handle.lock().take();
-        // Dispatch thread will exit when rx sender is dropped.
     }
 
     fn disconnect(&self) {
@@ -1182,7 +1119,7 @@ impl EpicsRsPvaPV {
         let pvname = name.clone();
         let dur = Duration::from_secs_f64(timeout);
         let is_ntenum = self.is_ntenum.clone();
-        let barrier = self.monitor_barrier(dur);
+        let barrier = self.hub.barrier(dur);
         // `future_into_py_fast` skips add_done_callback / Cancellable /
         // outer-spawn / scope (~15-25µs/call savings vs the standard
         // `future_into_py`). Safe here because the future is short-
@@ -1247,7 +1184,7 @@ impl EpicsRsPvaPV {
         let pvname = name.clone();
         let dur = Duration::from_secs_f64(timeout);
         let is_ntenum = self.is_ntenum.clone();
-        let barrier = self.monitor_barrier(dur);
+        let barrier = self.hub.barrier(dur);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let result = tokio::time::timeout(dur, client.pvget(&name)).await;
             barrier.pass().await;
@@ -1302,7 +1239,7 @@ impl EpicsRsPvaPV {
         let name = self.pvname.clone();
         let pvname = name.clone();
         let dur = Duration::from_secs_f64(timeout);
-        let barrier = self.monitor_barrier(dur);
+        let barrier = self.hub.barrier(dur);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let result = if route_ntenum_index {
                 tokio::time::timeout(dur, client.pvput_field(&name, "value.index", &value_str))
@@ -1351,7 +1288,7 @@ impl EpicsRsPvaPV {
         let name = self.pvname.clone();
         let pvname = name.clone();
         let bound = Duration::from_secs(5);
-        let barrier = self.monitor_barrier(bound);
+        let barrier = self.hub.barrier(bound);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let result = if route_ntenum_index {
                 tokio::time::timeout(bound, client.pvput_field(&name, "value.index", &value_str))
@@ -1409,7 +1346,7 @@ impl EpicsRsPvaPV {
         let name = self.pvname.clone();
         let pvname = name.clone();
         let dur = Duration::from_secs_f64(timeout);
-        let barrier = self.monitor_barrier(dur);
+        let barrier = self.hub.barrier(dur);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let result = tokio::time::timeout(dur, client.pvput_pv_field(&name, &field)).await;
             barrier.pass().await;
@@ -1443,7 +1380,7 @@ impl EpicsRsPvaPV {
         let name = self.pvname.clone();
         let pvname = name.clone();
         let bound = Duration::from_secs(5);
-        let barrier = self.monitor_barrier(bound);
+        let barrier = self.hub.barrier(bound);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let result = tokio::time::timeout(bound, client.pvput_pv_field(&pvname, &field)).await;
             barrier.pass().await;
@@ -1465,7 +1402,7 @@ impl EpicsRsPvaPV {
 }
 
 impl Drop for EpicsRsPvaPV {
-    /// Abort every spawned task and drop monitor channels — same
+    /// Abort every spawned task and drop the subscription — same
     /// rationale as `EpicsRsPV::drop` (see pv.rs). Critical because
     /// PVA wrappers can be created freely and the connection_task /
     /// monitor task self-heal loops would otherwise outlive the wrapper
@@ -1474,7 +1411,6 @@ impl Drop for EpicsRsPvaPV {
         *self.connection_callback.lock() = None;
         *self.access_callback.lock() = None;
         *self.py_monitor_callback.lock() = None;
-        *self.monitor_tx.lock() = None;
 
         let _ = self.monitor_handle.lock().take();
         if let Some(h) = self.monitor_setup_task.lock().take() {

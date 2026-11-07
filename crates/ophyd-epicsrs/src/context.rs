@@ -244,9 +244,11 @@ impl EpicsRsContext {
                 .collect()
         };
 
+        let barrier = self.hub.barrier(dur);
         let (tx, rx) = std::sync::mpsc::channel();
         self.runtime.spawn(async move {
             let results = run_bulk_get(client, snapshots, dur).await;
+            barrier.pass().await;
             let _ = tx.send(results);
         });
 
@@ -305,8 +307,10 @@ impl EpicsRsContext {
         // pinning the runtime until `dur` expires. Per-PV
         // `get_value_async` stays on the fast path because individual
         // gets are short-lived.
+        let barrier = self.hub.barrier(dur);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let results = run_bulk_get(client, snapshots, dur).await;
+            barrier.pass().await;
             Python::with_gil(|py| {
                 let dict = PyDict::new(py);
                 for (pvname, maybe_val) in results {

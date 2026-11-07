@@ -226,6 +226,47 @@ def test_waited_put_returns_after_another_pvs_callback(request, ctx_name):
         writer.put(original, wait=True, timeout=2.0)
 
 
+@pytest.mark.parametrize("ctx_name", ["ca_ctx", "pva_ctx"])
+@pytest.mark.parametrize("use_async", [False, True])
+def test_bulk_get_returns_after_a_running_callback(request, ctx_name, use_async):
+    """A bulk_get returns after the callbacks for the updates read before its
+    reply. A server may send a read reply ahead of the update for the same
+    change (RSRV does), so the update here is one whose callback is running."""
+    ctx = request.getfixturevalue(ctx_name)
+    name = "mini:ph:mtr.VELO"
+    writer = ctx.create_pv(name)
+    assert writer.wait_for_connection(timeout=3.0)
+    original = writer.get_with_metadata(timeout=2.0)["value"]
+    reader = ctx.create_pv(name)
+    assert reader.wait_for_connection(timeout=3.0)
+    marker = original + 0.5
+    started = threading.Event()
+    finished = threading.Event()
+
+    def cb(**kw):
+        if kw["value"] == marker:
+            started.set()
+            time.sleep(0.3)
+            finished.set()
+
+    reader.set_monitor_callback(cb)
+    try:
+        writer.put(marker, wait=False)
+        assert started.wait(3.0)
+        if use_async:
+
+            async def bulk_get():
+                return await ctx.bulk_get_async([name], timeout=2.0)
+
+            asyncio.run(bulk_get())
+        else:
+            ctx.bulk_get([name], timeout=2.0)
+        assert finished.is_set(), "bulk_get returned while the callback ran"
+    finally:
+        reader.clear_monitors()
+        writer.put(original, wait=True, timeout=2.0)
+
+
 # ---------- Disconnect callback on IOC restart simulation ----------
 
 

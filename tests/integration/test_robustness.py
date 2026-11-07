@@ -174,6 +174,26 @@ def test_concurrent_get_and_monitor(ca_ctx):
     assert monitor_count[0] >= 3, "gets succeeded but monitor never fired — monitor is blocked"
 
 
+# ---------- Reads after a waited put ----------
+
+
+def test_first_get_after_a_waited_put_reads_the_value_put(ca_ctx):
+    """The first get on a new PV reads anew, not the value its background
+    prefetch read before the put."""
+    writer = ca_ctx.create_pv("mini:ph:mtr.VELO")
+    assert writer.wait_for_connection(timeout=3.0)
+    original = writer.get_with_metadata(timeout=2.0)["value"]
+    try:
+        reader = ca_ctx.create_pv("mini:ph:mtr.VELO")
+        assert reader.wait_for_connection(timeout=3.0)
+        time.sleep(0.5)  # the prefetch reads right after the connect
+        writer.put(original + 1.0, wait=True, timeout=2.0)
+        md = reader.get_with_metadata(timeout=2.0)
+        assert md is not None and md["value"] == original + 1.0
+    finally:
+        writer.put(original, wait=True, timeout=2.0)
+
+
 # ---------- Disconnect callback on IOC restart simulation ----------
 
 

@@ -537,11 +537,10 @@ impl EpicsRsPV {
         form: &str,
         count: u32,
     ) -> PyResult<Option<PyObject>> {
-        // If background prefetch is still pending, await it first.
-        // Prefetch uses DBR_CTRL (superset of TIME), so it satisfies any form.
-        // This avoids starting a fresh CA read when the prefetch is about to
-        // complete — critical for copy() where get_ctrlvars(timeout=1) races
-        // against channel connection.
+        let deadline = std::time::Instant::now() + Duration::from_secs_f64(timeout);
+        // A pending prefetch is still connecting the channel — copy()'s
+        // get_ctrlvars(timeout=1) races that — so wait it out and keep its
+        // CTRL fields, but read anew: its value predates this call.
         if count == 0 {
             let handle = self.prefetch_handle.lock().take();
             if let Some(handle) = handle {
@@ -552,13 +551,12 @@ impl EpicsRsPV {
                 if let Ok(Ok(Some(prefetch))) = result {
                     *self.native_type.lock() = Some(prefetch.native_type);
                     self.cached_ctrl.lock().capture(&prefetch.snapshot);
-                    return Ok(Some(snapshot_to_pydict(py, &prefetch.snapshot)));
                 }
             }
         }
 
         let channel = self.channel.clone();
-        let dur = Duration::from_secs_f64(timeout);
+        let dur = deadline.saturating_duration_since(std::time::Instant::now());
         let class = match form {
             "ctrl" | "control" => DbrClass::Ctrl,
             _ => DbrClass::Time,

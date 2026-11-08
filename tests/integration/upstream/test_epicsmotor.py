@@ -189,13 +189,13 @@ def test_homing_forward(motor):
     # homing forward
     motor.wait_for_connection(all_signals=True, timeout=2)
     motor.move(-1, wait=True)
-    res = motor.home("forward", timeout=2, wait=False)
+    res = motor.home("forward", timeout=5, wait=False)
 
     while not res.done:
         time.sleep(0.1)
 
-    # MotorSim (C EPICS) is unable to execute homing, but epics-rs
-    # SimMotor supports homing and succeeds.
+    # epics-rs SimMotor homes as motorSim does since epics-rs 0.32: it jogs
+    # past the home sensor and returns, ~2.6 s from +/-1 at HVEL 1.
     if os.environ.get("TEST_CL") == "epicsrs":
         assert res.success
     else:
@@ -208,7 +208,7 @@ def test_homing_forward(motor):
 def test_homing_reverse(motor):
     # homing reverse
     motor.move(1, wait=True)
-    res = motor.home("reverse", timeout=2, wait=False)
+    res = motor.home("reverse", timeout=5, wait=False)
 
     while not res.done:
         time.sleep(0.1)

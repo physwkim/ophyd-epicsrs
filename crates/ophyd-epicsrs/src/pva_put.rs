@@ -21,13 +21,12 @@
 //!    default; Double is widely accepted across PVA servers).
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 
-use epics_rs::pva::pvdata::{PvField, PvStructure, ScalarValue, TypedScalarArray};
+use epics_rs::pva::pvdata::{PvArray, PvField, PvStructure, ScalarValue, TypedScalarArray};
 
 /// Convert a Python value to a `PvField`, optionally guided by dtype
 /// hints (column → numpy dtype string / "string").
@@ -78,7 +77,7 @@ pub(crate) fn py_to_pvfield(
     if let Ok(b) = value.downcast::<PyBytes>() {
         let bytes: Vec<u8> = b.as_bytes().to_vec();
         return Ok(PvField::ScalarArrayTyped(TypedScalarArray::UByte(
-            Arc::from(bytes),
+            bytes.into(),
         )));
     }
 
@@ -158,14 +157,14 @@ fn list_to_typed_array(lst: &Bound<'_, PyList>, hint: Option<&str>) -> PyResult<
                         .into(),
                 );
             }
-            Ok(TypedScalarArray::String(Arc::from(v)))
+            Ok(TypedScalarArray::String(v.into()))
         }
         "|b1" => {
             let mut v: Vec<bool> = Vec::with_capacity(len);
             for item in lst.iter() {
                 v.push(item.extract()?);
             }
-            Ok(TypedScalarArray::Boolean(Arc::from(v)))
+            Ok(TypedScalarArray::Boolean(v.into()))
         }
         "|i1" => extract_into_typed_array::<i8>(lst, TypedScalarArray::Byte),
         "|u1" => extract_into_typed_array::<u8>(lst, TypedScalarArray::UByte),
@@ -186,16 +185,16 @@ fn list_to_typed_array(lst: &Bound<'_, PyList>, hint: Option<&str>) -> PyResult<
 
 fn extract_into_typed_array<T>(
     lst: &Bound<'_, PyList>,
-    ctor: fn(Arc<[T]>) -> TypedScalarArray,
+    ctor: fn(PvArray<T>) -> TypedScalarArray,
 ) -> PyResult<TypedScalarArray>
 where
-    T: for<'a> FromPyObject<'a>,
+    T: for<'a> FromPyObject<'a> + Send + Sync + 'static,
 {
     let mut v: Vec<T> = Vec::with_capacity(lst.len());
     for item in lst.iter() {
         v.push(item.extract::<T>()?);
     }
-    Ok(ctor(Arc::from(v)))
+    Ok(ctor(v.into()))
 }
 
 /// Sniff the dtype of a non-empty Python list. Empty list → "<f8"

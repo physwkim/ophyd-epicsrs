@@ -174,6 +174,99 @@ def test_concurrent_get_and_monitor(ca_ctx):
     assert monitor_count[0] >= 3, "gets succeeded but monitor never fired — monitor is blocked"
 
 
+# ---------- Reads after a waited put ----------
+
+
+def test_first_get_after_a_waited_put_reads_the_value_put(ca_ctx):
+    """The first get on a new PV reads anew, not the value its background
+    prefetch read before the put."""
+    writer = ca_ctx.create_pv("mini:ph:mtr.VELO")
+    assert writer.wait_for_connection(timeout=3.0)
+    original = writer.get_with_metadata(timeout=2.0)["value"]
+    try:
+        reader = ca_ctx.create_pv("mini:ph:mtr.VELO")
+        assert reader.wait_for_connection(timeout=3.0)
+        time.sleep(0.5)  # the prefetch reads right after the connect
+        writer.put(original + 1.0, wait=True, timeout=2.0)
+        md = reader.get_with_metadata(timeout=2.0)
+        assert md is not None and md["value"] == original + 1.0
+    finally:
+        writer.put(original, wait=True, timeout=2.0)
+
+
+@pytest.mark.parametrize("ctx_name", ["ca_ctx", "pva_ctx"])
+def test_waited_put_returns_after_another_pvs_callback(request, ctx_name):
+    """A waited put returns after the monitor callback its update runs on
+    another PV object of the same context, as libca and pvxs order them."""
+    ctx = request.getfixturevalue(ctx_name)
+    writer = ctx.create_pv("mini:ph:mtr.VELO")
+    assert writer.wait_for_connection(timeout=3.0)
+    original = writer.get_with_metadata(timeout=2.0)["value"]
+    reader = ctx.create_pv("mini:ph:mtr.VELO")
+    assert reader.wait_for_connection(timeout=3.0)
+    latest = [None]
+    seen = threading.Event()
+
+    def cb(**kw):
+        time.sleep(0.005)
+        latest[0] = kw["value"]
+        seen.set()
+
+    reader.set_monitor_callback(cb)
+    try:
+        assert seen.wait(3.0)
+        stale = 0
+        for i in range(40):
+            value = original + (1.0 if i % 2 else 0.5)
+            writer.put(value, wait=True, timeout=2.0)
+            stale += latest[0] != value
+        assert stale == 0, f"{stale}/40 puts returned before the reader's callback"
+    finally:
+        reader.clear_monitors()
+        writer.put(original, wait=True, timeout=2.0)
+
+
+@pytest.mark.parametrize("ctx_name", ["ca_ctx", "pva_ctx"])
+@pytest.mark.parametrize("use_async", [False, True])
+def test_bulk_get_returns_after_a_running_callback(request, ctx_name, use_async):
+    """A bulk_get returns after the callbacks for the updates read before its
+    reply. A server may send a read reply ahead of the update for the same
+    change (RSRV does), so the update here is one whose callback is running."""
+    ctx = request.getfixturevalue(ctx_name)
+    name = "mini:ph:mtr.VELO"
+    writer = ctx.create_pv(name)
+    assert writer.wait_for_connection(timeout=3.0)
+    original = writer.get_with_metadata(timeout=2.0)["value"]
+    reader = ctx.create_pv(name)
+    assert reader.wait_for_connection(timeout=3.0)
+    marker = original + 0.5
+    started = threading.Event()
+    finished = threading.Event()
+
+    def cb(**kw):
+        if kw["value"] == marker:
+            started.set()
+            time.sleep(0.3)
+            finished.set()
+
+    reader.set_monitor_callback(cb)
+    try:
+        writer.put(marker, wait=False)
+        assert started.wait(3.0)
+        if use_async:
+
+            async def bulk_get():
+                return await ctx.bulk_get_async([name], timeout=2.0)
+
+            asyncio.run(bulk_get())
+        else:
+            ctx.bulk_get([name], timeout=2.0)
+        assert finished.is_set(), "bulk_get returned while the callback ran"
+    finally:
+        reader.clear_monitors()
+        writer.put(original, wait=True, timeout=2.0)
+
+
 # ---------- Disconnect callback on IOC restart simulation ----------
 
 

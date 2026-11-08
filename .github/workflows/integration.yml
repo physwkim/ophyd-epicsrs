@@ -36,7 +36,7 @@ jobs:
       - name: Setup Rust
         # No `toolchain` pin — track stable so transitive deps that
         # bump their MSRV don't break us out of nowhere. Cargo.toml's
-        # rust-version = "1.88" still rejects too-old local toolchains.
+        # rust-version = "1.98" still rejects too-old local toolchains.
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry + epics-rs target dir
@@ -102,7 +102,7 @@ jobs:
           # supply a stdin. `tail -f /dev/null | ...` pipes a stream
           # that never ends so iocsh blocks instead of exiting.
           tail -f /dev/null \
-            | ./target/release/mini_ioc examples/mini-beamline/ioc/st.cmd \
+            | ./target/release/mini-ioc examples/mini-beamline/ioc/st.cmd \
               > /tmp/mini_ioc.log 2>&1 &
           IOC_PID=$!
           echo "$IOC_PID" > /tmp/mini_ioc.pid

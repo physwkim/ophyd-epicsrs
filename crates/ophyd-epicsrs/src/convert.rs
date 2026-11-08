@@ -113,7 +113,7 @@ pub fn py_to_epics_value(
             if let Ok(s) = obj.extract::<String>() {
                 let mut bytes = s.into_bytes();
                 bytes.push(0);
-                return Ok(EpicsValue::CharArray(bytes));
+                return Ok(EpicsValue::CharArray(bytes.into()));
             }
             let v: u8 = obj.extract()?;
             Ok(EpicsValue::Char(v))
@@ -127,7 +127,7 @@ pub fn py_to_epics_value(
             if let Ok(s) = obj.extract::<String>() {
                 let mut bytes = s.into_bytes();
                 bytes.push(0);
-                return Ok(EpicsValue::UCharArray(bytes));
+                return Ok(EpicsValue::UCharArray(bytes.into()));
             }
             let v: u8 = obj.extract()?;
             Ok(EpicsValue::UChar(v))
@@ -179,33 +179,33 @@ fn py_sequence_to_epics_array(
     match native_type {
         DbFieldType::Double => {
             let v: Vec<f64> = obj.extract()?;
-            Ok(EpicsValue::DoubleArray(v))
+            Ok(EpicsValue::DoubleArray(v.into()))
         }
         DbFieldType::Float => {
             let v: Vec<f32> = obj.extract()?;
-            Ok(EpicsValue::FloatArray(v))
+            Ok(EpicsValue::FloatArray(v.into()))
         }
         DbFieldType::Long => {
             let v: Vec<i32> = obj.extract()?;
-            Ok(EpicsValue::LongArray(v))
+            Ok(EpicsValue::LongArray(v.into()))
         }
         DbFieldType::Int64 => {
             let v: Vec<i64> = obj.extract()?;
-            Ok(EpicsValue::Int64Array(v))
+            Ok(EpicsValue::Int64Array(v.into()))
         }
         DbFieldType::Short => {
             let v: Vec<i16> = obj.extract()?;
-            Ok(EpicsValue::ShortArray(v))
+            Ok(EpicsValue::ShortArray(v.into()))
         }
         DbFieldType::Char => {
             // Accept string → bytes for char waveforms (null terminated)
             if let Ok(s) = obj.extract::<String>() {
                 let mut bytes = s.into_bytes();
                 bytes.push(0);
-                return Ok(EpicsValue::CharArray(bytes));
+                return Ok(EpicsValue::CharArray(bytes.into()));
             }
             let v: Vec<u8> = obj.extract()?;
-            Ok(EpicsValue::CharArray(v))
+            Ok(EpicsValue::CharArray(v.into()))
         }
         // Unsigned internal types — unreachable from a CA channel's
         // native_type (see the scalar match above), kept total.
@@ -213,26 +213,26 @@ fn py_sequence_to_epics_array(
             if let Ok(s) = obj.extract::<String>() {
                 let mut bytes = s.into_bytes();
                 bytes.push(0);
-                return Ok(EpicsValue::UCharArray(bytes));
+                return Ok(EpicsValue::UCharArray(bytes.into()));
             }
             let v: Vec<u8> = obj.extract()?;
-            Ok(EpicsValue::UCharArray(v))
+            Ok(EpicsValue::UCharArray(v.into()))
         }
         DbFieldType::UShort => {
             let v: Vec<u16> = obj.extract()?;
-            Ok(EpicsValue::UShortArray(v))
+            Ok(EpicsValue::UShortArray(v.into()))
         }
         DbFieldType::ULong => {
             let v: Vec<u32> = obj.extract()?;
-            Ok(EpicsValue::ULongArray(v))
+            Ok(EpicsValue::ULongArray(v.into()))
         }
         DbFieldType::UInt64 => {
             let v: Vec<u64> = obj.extract()?;
-            Ok(EpicsValue::UInt64Array(v))
+            Ok(EpicsValue::UInt64Array(v.into()))
         }
         DbFieldType::Enum => {
             let v: Vec<u16> = obj.extract()?;
-            Ok(EpicsValue::EnumArray(v))
+            Ok(EpicsValue::EnumArray(v.into()))
         }
         DbFieldType::String => {
             let v: Vec<String> = obj.extract()?;
@@ -241,6 +241,19 @@ fn py_sequence_to_epics_array(
             ))
         }
     }
+}
+
+/// `char_value` text for a non-enum, non-char-waveform value: the whole
+/// value, floats in Rust's shortest round-trip spelling (epics-rs 0.34
+/// dropped `Display for EpicsValue`; its `text_g` would switch to C `%g`).
+pub(crate) fn char_value_text(v: &EpicsValue) -> String {
+    v.text_with(usize::MAX, |x, is_double| {
+        if is_double {
+            x.to_string()
+        } else {
+            (x as f32).to_string()
+        }
+    })
 }
 
 fn wall_time_to_epoch(t: WallTime) -> f64 {
@@ -287,7 +300,7 @@ pub fn snapshot_to_pydict(py: Python<'_>, snapshot: &Snapshot) -> PyObject {
             let end = v.iter().position(|&b| b == 0).unwrap_or(v.len());
             String::from_utf8_lossy(&v[..end]).into_owned()
         }
-        other => format!("{other}"),
+        other => char_value_text(other),
     };
     dict.set_item("char_value", char_value).unwrap();
 

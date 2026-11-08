@@ -14,6 +14,7 @@ use epics_rs::ca::CaError;
 use epics_rs::ca::client::{CaChannel, CaClient};
 
 use crate::convert::epics_value_to_py;
+use crate::dispatch::MonitorHub;
 use crate::pv::EpicsRsPV;
 
 const BULK_GET_CACHE_LIMIT: usize = 4096;
@@ -31,10 +32,10 @@ impl BulkGetCache {
             // VecDeque tracks insertion order only — a frequently-read
             // PV registered early would be evicted in favour of one-shot
             // reads once the cache hits the BULK_GET_CACHE_LIMIT ceiling.
-            if let Some(idx) = self.order.iter().position(|n| n == pvname) {
-                if let Some(name) = self.order.remove(idx) {
-                    self.order.push_back(name);
-                }
+            if let Some(idx) = self.order.iter().position(|n| n == pvname)
+                && let Some(name) = self.order.remove(idx)
+            {
+                self.order.push_back(name);
             }
             return channel.clone();
         }
@@ -128,6 +129,8 @@ async fn run_bulk_get(
 pub struct EpicsRsContext {
     pub(crate) runtime: Arc<Runtime>,
     pub(crate) client: Arc<CaClient>,
+    /// Runs every monitor callback of this context's PVs.
+    hub: Arc<MonitorHub>,
     /// Hidden channel cache for by-name ``bulk_get``.
     ///
     /// This is intentionally not a Python PV-object cache: ophyd still
@@ -172,9 +175,14 @@ impl EpicsRsContext {
                 .map_err(|e| PyRuntimeError::new_err(format!("failed to create CA client: {e}")))
         })?;
 
+        let hub = MonitorHub::new("epicsrs-ca-cb").map_err(|e| {
+            PyRuntimeError::new_err(format!("failed to start the CA callback thread: {e}"))
+        })?;
+
         Ok(Self {
             runtime,
             client: Arc::new(client),
+            hub,
             bulk_get_cache: Mutex::new(BulkGetCache::default()),
             pv_count: Arc::new(AtomicUsize::new(0)),
         })
@@ -196,6 +204,7 @@ impl EpicsRsContext {
             channel,
             pvname.to_string(),
             self.pv_count.clone(),
+            self.hub.clone(),
         )
     }
 
@@ -235,9 +244,11 @@ impl EpicsRsContext {
                 .collect()
         };
 
+        let barrier = self.hub.barrier(dur);
         let (tx, rx) = std::sync::mpsc::channel();
         self.runtime.spawn(async move {
             let results = run_bulk_get(client, snapshots, dur).await;
+            barrier.pass().await;
             let _ = tx.send(results);
         });
 
@@ -296,8 +307,10 @@ impl EpicsRsContext {
         // pinning the runtime until `dur` expires. Per-PV
         // `get_value_async` stays on the fast path because individual
         // gets are short-lived.
+        let barrier = self.hub.barrier(dur);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let results = run_bulk_get(client, snapshots, dur).await;
+            barrier.pass().await;
             Python::with_gil(|py| {
                 let dict = PyDict::new(py);
                 for (pvname, maybe_val) in results {
